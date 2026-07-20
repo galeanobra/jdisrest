@@ -1,0 +1,24 @@
+# Normalize line endings across OSes: store everything as LF in the repo,
+# let git convert to the native EOL on checkout on Windows (core.autocrlf=true)
+# and keep LF on Linux/Mac.
+* text=auto eol=lf
+
+# Explicitly text with LF endings (safe for scripts that must run on Linux)
+*.java  text eol=lf
+*.xml   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+
+# Windows-native scripts keep CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary assets (add as needed)
+*.jar   binary
+*.png   binary
+*.jpg   binary
+*.gml   binary

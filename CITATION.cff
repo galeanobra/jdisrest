@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "jdisrest: distributed REST-based master/worker framework for jMetal-encoded optimization problems"
+type: software
+authors:
+  - family-names: "Galeano Brajones"
+    given-names: "Jesús"
+    orcid: "https://orcid.org/0000-0001-8691-8944"
+    affiliation: "Universidad de Extremadura"
+  - family-names: "Luna"
+    given-names: "Francisco"
+    orcid: "https://orcid.org/0000-0002-0455-7223"
+    affiliation: "Universidad de Málaga"
+license: AGPL-3.0-or-later
+repository-code: "https://github.com/galeanobra/jdisrest"
+keywords:
+  - evolutionary computation
+  - multi-objective optimization
+  - distributed computing
+  - jMetal
+  - master-worker
+  - REST

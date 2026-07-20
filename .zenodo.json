@@ -1,0 +1,26 @@
+{
+    "title": "jdisrest: distributed REST-based master/worker framework for jMetal-encoded optimization problems",
+    "description": "Distributed REST-based master/worker framework for jMetal-encoded optimization problems. A Spring WebFlux master dispatches solution evaluations to remote workers implemented in Java or Python.",
+    "upload_type": "software",
+    "license": "AGPL-3.0",
+    "creators": [
+        {
+            "name": "Galeano Brajones, Jesús",
+            "affiliation": "Universidad de Extremadura",
+            "orcid": "0000-0001-8691-8944"
+        },
+        {
+            "name": "Luna, Francisco",
+            "affiliation": "Universidad de Málaga",
+            "orcid": "0000-0002-0455-7223"
+        }
+    ],
+    "keywords": [
+        "evolutionary computation",
+        "multi-objective optimization",
+        "distributed computing",
+        "jMetal",
+        "master-worker",
+        "REST"
+    ]
+}
