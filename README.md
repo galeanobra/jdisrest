@@ -4,6 +4,7 @@
 ![Java](https://img.shields.io/badge/Java-25-orange)
 ![Python](https://img.shields.io/badge/Python-%E2%89%A53.11-blue)
 [![GitHub release](https://img.shields.io/github/v/release/galeanobra/jdisrest)](https://github.com/galeanobra/jdisrest/releases)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21454186.svg)](https://doi.org/10.5281/zenodo.21454186)
 
 Distributed REST-based master/worker framework for jMetal-encoded
 optimization problems.
@@ -178,7 +179,10 @@ patterns and internals.
 
 If you use jdisrest in academic work, please cite it. See
 [`CITATION.cff`](CITATION.cff) (also exposed through GitHub's "Cite this
-repository" button). A versioned, citable DOI is archived on Zenodo.
+repository" button). Each release is archived on Zenodo with its own
+versioned DOI; the concept DOI below always resolves to the latest one:
+
+[10.5281/zenodo.21454186](https://doi.org/10.5281/zenodo.21454186)
 
 ## Publications using jdisrest
 
