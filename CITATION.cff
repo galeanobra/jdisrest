@@ -13,6 +13,10 @@ authors:
     affiliation: "Universidad de Málaga"
 license: AGPL-3.0-or-later
 repository-code: "https://github.com/galeanobra/jdisrest"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21454186"
+    description: "Concept DOI (always resolves to the latest archived version)"
 keywords:
   - evolutionary computation
   - multi-objective optimization
