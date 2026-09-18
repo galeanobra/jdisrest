@@ -2,7 +2,6 @@ package es.unex.jdisrest.util;
 
 import org.uma.jmetal.solution.Solution;
 import org.uma.jmetal.solution.compositesolution.CompositeSolution;
-import org.uma.jmetal.solution.integersolution.IntegerSolution;
 import org.uma.jmetal.util.errorchecking.JMetalException;
 import org.uma.jmetal.util.fileoutput.FileOutputContext;
 import org.uma.jmetal.util.fileoutput.impl.DefaultFileOutputContext;
@@ -14,15 +13,19 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * Output writer for {@link CompositeSolution}s composed of two integer segments
- * (e.g. DU + CU in the vRAN problem). The standard jMetal
- * {@code SolutionListOutput} does not serialize composite variables correctly
- * (it falls back to {@code Solution.toString()} which prints the inner
- * components' metadata), so this class flattens both segments back into a
- * single space-separated row plus the outer composite's objectives/constraints.
+ * Output writer for {@link CompositeSolution}s with any number of segments of
+ * any supported encoding (integer or real, see {@link SolutionVariables}). The
+ * standard jMetal {@code SolutionListOutput} does not serialize composite
+ * variables correctly (it falls back to {@code Solution.toString()} which prints
+ * the inner components' metadata), so this class flattens all segments in
+ * declaration order into a single space-separated row plus the outer
+ * composite's objectives/constraints. Flat solutions in the list are written
+ * the same way.
  *
  * <p>VAR row format: {@code "v0 v1 ... vN-1,[obj0  obj1 ...],[con0  con1 ...]"}.
  * <p>FUN row format: standard jMetal — separator-joined objective values.
+ *
+ * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public class CompositeSolutionListOutput {
     private FileOutputContext varFileContext;
@@ -53,7 +56,7 @@ public class CompositeSolutionListOutput {
     private void printVariablesToFile(FileOutputContext context, List<? extends Solution<?>> solutionList) {
         try (BufferedWriter bw = context.getFileWriter()) {
             for (Solution<?> solution : solutionList) {
-                bw.write(formatSolution((CompositeSolution) solution));
+                bw.write(formatSolution(solution));
                 bw.newLine();
             }
         } catch (IOException e) {
@@ -78,12 +81,20 @@ public class CompositeSolutionListOutput {
         }
     }
 
-    public static String formatSolution(CompositeSolution solution) {
-        String du = Arrays.stream(((IntegerSolution) solution.variables().get(0)).variables().toArray())
+    /**
+     * Formats one solution as a VAR row: all scalar variables (segments
+     * concatenated in declaration order) separated by spaces, then the
+     * objectives and constraints arrays.
+     *
+     * @param solution a composite or flat solution
+     * @return the VAR row
+     * @throws IllegalArgumentException if the solution (or one component) has an
+     *                                  encoding {@link SolutionVariables} does not support
+     */
+    public static String formatSolution(Solution<?> solution) {
+        String vars = SolutionVariables.flatten(solution).stream()
                 .map(String::valueOf).collect(Collectors.joining(" "));
-        String cu = Arrays.stream(((IntegerSolution) solution.variables().get(1)).variables().toArray())
-                .map(String::valueOf).collect(Collectors.joining(" "));
-        return du + " " + cu
+        return vars
                 + "," + Arrays.toString(solution.objectives()).replace(",", " ")
                 + "," + Arrays.toString(solution.constraints()).replace(",", " ");
     }

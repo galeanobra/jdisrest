@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import numbers
 import socket
 import threading
 import time
@@ -11,7 +13,7 @@ from typing import Callable, Union
 
 import requests
 
-from ._types import EvalResult, Evaluator
+from ._types import EvalResult, Evaluator, Variables
 
 log = logging.getLogger("jdisrest")
 
@@ -117,14 +119,17 @@ class Worker:
 
     # ── Main entry point ───────────────────────────────────────────────────
 
-    def run(self, evaluate: Union[Evaluator, Callable[[list[int]], EvalResult]]):
+    def run(self, evaluate: Union[Evaluator, Callable[[Variables], EvalResult]]):
         """
         Start the worker. Blocks until the master signals completion or the
         master is detected as dead (too many consecutive errors).
 
         Args:
             evaluate: Either an :class:`Evaluator` instance or a plain callable
-                      ``(variables: list[int]) -> EvalResult``.
+                      ``(variables) -> EvalResult``. ``variables`` is a list of
+                      ints for integer-encoded problems and of floats for
+                      real-encoded ones (a mix for composite problems whose
+                      segments differ).
                       The callable can also return a plain number (single objective)
                       or a dict with ``"objectives"`` and optional ``"constraints"``.
 
@@ -181,6 +186,10 @@ class Worker:
                 t0 = time.time()
                 try:
                     result = _coerce(evaluator.evaluate(variables))
+                    # Validate here so a NaN/inf objective or a non-numeric
+                    # variable is reported as an evaluation error (the master
+                    # requeues the task) instead of as an unreadable request.
+                    body = _result_body(self.worker_id, result, int((time.time() - t0) * 1000))
                 except Exception as eval_err:
                     elapsed_ms = int((time.time() - t0) * 1000)
                     log.error(f"[task-{task_id}] evaluation failed after {elapsed_ms}ms: {eval_err}")
@@ -194,31 +203,23 @@ class Worker:
                         pass  # best-effort
                     continue
 
-                elapsed_ms = int((time.time() - t0) * 1000)
+                elapsed_ms = body["evaluationTimeMs"]
                 elapsed_str = f"{elapsed_ms}ms" if elapsed_ms < 60_000 else f"{elapsed_ms/60000:.1f}min"
-                log.info(f"[task-{task_id}] evaluated in {elapsed_str} → {result.objectives}")
+                log.info(f"[task-{task_id}] evaluated in {elapsed_str} → {body['objectives']}")
 
-                body = {
-                    "workerId":        self.worker_id,
-                    "objectives":      result.objectives,
-                    "constraints":     result.constraints or [],
-                    "evaluationTimeMs": elapsed_ms,
-                }
-                # Only send variables when the evaluator wants the master to
-                # replace the original decision (e.g. Lamarckian repair).
-                # Workers that do not modify variables omit the field, keeping
-                # the wire format backwards-compatible with old masters.
-                if result.variables is not None:
-                    body["variables"] = list(result.variables)
                 post_resp = self._session.post(
                     f"{self.master_url}/api/v1/tasks/{task_id}/result",
                     json=body,
                     timeout=15,
                 )
                 # 404 = master already requeued the task (watchdog kicked in mid-eval).
-                # That's expected; anything else 4xx/5xx is a bug we want to know about.
+                # 400/422 = master could not apply the result and has requeued the task;
+                # its body says why. Neither is a network problem, so neither counts
+                # towards the dead-master threshold. Anything else 4xx/5xx is a bug.
                 if post_resp.status_code == 404:
                     log.warning(f"[task-{task_id}] master rejected result (already requeued)")
+                elif post_resp.status_code in (400, 422):
+                    log.error(f"[task-{task_id}] master rejected result: {post_resp.text}")
                 else:
                     post_resp.raise_for_status()
 
@@ -282,7 +283,7 @@ def _wrap(fn_or_evaluator: Union[Evaluator, Callable]) -> Evaluator:
     fn = fn_or_evaluator
 
     class _FnEvaluator(Evaluator):
-        def evaluate(self, variables: list[int]) -> EvalResult:
+        def evaluate(self, variables: Variables) -> EvalResult:
             return _coerce(fn(variables))
 
     return _FnEvaluator()
@@ -292,7 +293,8 @@ def _coerce(result) -> EvalResult:
     """Convert various return types to EvalResult."""
     if isinstance(result, EvalResult):
         return result
-    if isinstance(result, (int, float)):
+    if isinstance(result, numbers.Real) and not isinstance(result, bool):
+        # Plain or numpy scalar: a single objective.
         return EvalResult(objectives=[float(result)])
     if isinstance(result, dict):
         return EvalResult(
@@ -301,9 +303,68 @@ def _coerce(result) -> EvalResult:
             variables=result.get("variables"),
         )
     if hasattr(result, "objectives"):
+        # `is not None` rather than truthiness: numpy arrays have no truth value.
+        constraints = getattr(result, "constraints", None)
+        variables = getattr(result, "variables", None)
         return EvalResult(
             objectives=list(result.objectives),
-            constraints=list(result.constraints) if getattr(result, "constraints", None) else None,
-            variables=list(result.variables) if getattr(result, "variables", None) else None,
+            constraints=list(constraints) if constraints is not None else None,
+            variables=list(variables) if variables is not None else None,
         )
     raise TypeError(f"Cannot convert {type(result).__name__} to EvalResult")
+
+
+def _result_body(worker_id: str, result: EvalResult, elapsed_ms: int) -> dict:
+    """
+    Build the JSON body for POST /result, validating and normalizing numbers.
+
+    Objectives and constraints are converted to plain floats and must be
+    finite; variables keep their kind (ints stay ints, everything else becomes
+    a float) so the master sees JSON integers for integer-encoded problems.
+    numpy scalars are accepted (they register as numbers.Integral / numbers.Real).
+
+    Raises:
+        ValueError: on a NaN/inf/None value or a non-numeric element; the
+                    message names the field and index.
+    """
+    body = {
+        "workerId":         worker_id,
+        "objectives":       _finite_floats("objectives", result.objectives),
+        "constraints":      _finite_floats("constraints", [] if result.constraints is None else result.constraints),
+        "evaluationTimeMs": int(elapsed_ms),
+    }
+    # Only send variables when the evaluator wants the master to replace the
+    # original decision (e.g. Lamarckian repair). Workers that do not modify
+    # variables omit the field, keeping the wire format backwards-compatible.
+    if result.variables is not None:
+        body["variables"] = _wire_numbers("variables", result.variables)
+    return body
+
+
+def _finite_floats(field: str, values) -> list[float]:
+    """Convert to a list of finite floats; raise ValueError naming the offender."""
+    out: list[float] = []
+    for i, v in enumerate(values):
+        if v is None or isinstance(v, bool) or not isinstance(v, numbers.Real):
+            raise ValueError(f"{field}[{i}] is not a number: {v!r}")
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError(f"{field}[{i}] is not finite: {f}")
+        out.append(f)
+    return out
+
+
+def _wire_numbers(field: str, values) -> list:
+    """Ints stay ints, other reals become finite floats; raise ValueError otherwise."""
+    out: list = []
+    for i, v in enumerate(values):
+        if v is None or isinstance(v, bool) or not isinstance(v, numbers.Real):
+            raise ValueError(f"{field}[{i}] is not a number: {v!r}")
+        if isinstance(v, numbers.Integral):
+            out.append(int(v))
+        else:
+            f = float(v)
+            if not math.isfinite(f):
+                raise ValueError(f"{field}[{i}] is not finite: {f}")
+            out.append(f)
+    return out

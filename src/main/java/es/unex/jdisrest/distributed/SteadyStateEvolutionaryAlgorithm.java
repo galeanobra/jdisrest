@@ -15,8 +15,8 @@ import org.uma.jmetal.util.archive.impl.BestSolutionsArchive;
 import org.uma.jmetal.util.archive.impl.NonDominatedSolutionListArchive;
 import org.uma.jmetal.util.observable.impl.DefaultObservable;
 import org.uma.jmetal.util.pseudorandom.JMetalRandom;
-import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import es.unex.jdisrest.util.Log;
+import es.unex.jdisrest.util.SolutionVariables;
 import es.unex.jdisrest.util.TraceWriter;
 
 import java.io.File;
@@ -105,22 +105,20 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
     /**
      * Canonical key for a solution used as the HashSet element.
      *
-     * <p>For {@code IntegerSolution}, {@code variables()} already returns {@code List<Integer>}
-     * which has value-based equality — usable directly.
-     * <p>For {@code CompositeSolution}, {@code variables()} returns {@code List<Solution<?>>}
-     * whose elements use identity equality (jMetal does not override equals/hashCode), so we
-     * flatten the component variables into a single {@code List<Integer>} instead.
+     * <p>The key is a defensive copy of the flat decision vector produced by
+     * {@link SolutionVariables#flatten}: for {@code CompositeSolution} the component
+     * variables are concatenated (jMetal's inner solutions use identity equality, so
+     * {@code variables()} itself is not usable as a key), and for flat solutions the
+     * copy avoids storing a reference to the live variable list inside the set.
+     *
+     * <p>Equality is exact, element by element. With integer encodings this catches
+     * every duplicate. With real encodings two independently generated vectors are
+     * practically never bit-identical, so the filter only catches exact clones —
+     * offspring on which neither crossover nor mutation acted — which is what real-coded
+     * evolution actually produces as duplicates.
      */
-    @SuppressWarnings("unchecked")
-    protected List<Integer> solutionKey(S sol) {
-        if (sol instanceof CompositeSolution composite) {
-            List<Integer> flat = new ArrayList<>();
-            for (Object component : composite.variables()) {
-                flat.addAll(((Solution<Integer>) component).variables());
-            }
-            return flat;
-        }
-        return (List<Integer>) sol.variables();
+    protected List<Number> solutionKey(S sol) {
+        return SolutionVariables.flatten(sol);
     }
 
     /** Rebuilds populationSignatures to match the current population. Call inside synchronized(population). */
@@ -242,6 +240,10 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
 
     @Override
     public void run() {
+        // Fail before dispatching anything if the problem's encoding cannot travel
+        // over the wire (see SolutionVariables): a clear exception here beats one
+        // 500 per task later.
+        SolutionVariables.wireEncoding(problem.createSolution());
         initTime = System.currentTimeMillis();
         super.run();
     }

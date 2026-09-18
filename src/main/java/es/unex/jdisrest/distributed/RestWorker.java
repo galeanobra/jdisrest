@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.solution.Solution;
 import es.unex.jdisrest.util.Log;
+import es.unex.jdisrest.util.SolutionVariables;
 import es.unex.jdisrest.util.Timings;
 
 import java.io.Closeable;
@@ -95,20 +96,34 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
                 }
 
                 long taskId = ((Number) task.get("taskId")).longValue();
-                List<Integer> variables = (List<Integer>) task.get("variables");
-
-                // Build the solution and copy in the variables sent by the master.
-                S solution = problem.createSolution();
-                List<Object> solutionVars = (List<Object>) (List<?>) solution.variables();
-                for (int i = 0; i < variables.size(); i++) {
-                    solutionVars.set(i, variables.get(i));
+                Object rawVariables = task.get("variables");
+                if (!(rawVariables instanceof List<?>)) {
+                    throw new IllegalStateException("Task " + taskId + " has no 'variables' list");
                 }
+                // Jackson binds JSON numbers to Integer/Long/Double/BigInteger/BigDecimal
+                // depending on the text; SolutionVariables.apply() converts each value to
+                // the type of the destination variable, so the runtime type is irrelevant.
+                @SuppressWarnings("unchecked")
+                List<Number> variables = (List<Number>) rawVariables;
 
-                // Evaluate (may take minutes or hours — the heartbeat runs independently).
+                // Build the solution (flat or composite) and copy in the variables sent
+                // by the master, splitting by component for CompositeSolution. Then
+                // evaluate (may take minutes or hours — the heartbeat runs independently).
+                // A failure in either step is an evaluation error, not a master problem:
+                // report it so the master requeues the task, and move on.
+                S solution = problem.createSolution();
                 long start = System.currentTimeMillis();
-                Log.info("Worker " + workerId + " evaluating task " + taskId);
-                problem.evaluate(solution);
-                long elapsed = System.currentTimeMillis() - start;
+                long elapsed;
+                try {
+                    SolutionVariables.apply(solution, variables);
+                    Log.info("Worker " + workerId + " evaluating task " + taskId);
+                    problem.evaluate(solution);
+                    elapsed = System.currentTimeMillis() - start;
+                } catch (RuntimeException evalError) {
+                    Log.warn("Worker " + workerId + " task " + taskId + " failed: " + evalError);
+                    reportError(taskId, evalError.toString());
+                    continue;
+                }
                 Log.info("Worker " + workerId + " task " + taskId + " evaluated in " + elapsed + "ms");
 
                 if (masterDead) {
@@ -208,10 +223,33 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
             // The master no longer expects this result (the watchdog already requeued it).
             Log.warn("Master rejected result for taskId " + taskId
                     + " (already requeued by watchdog)");
+        } else if (response.statusCode() == 400 || response.statusCode() == 422) {
+            // The master could not apply the result (e.g. a NaN objective) and has
+            // requeued the task. This is an evaluation problem, not a dead master:
+            // log the reason and carry on with the next task.
+            Log.warn("Master rejected result for taskId " + taskId + ": " + response.body());
         } else if (response.statusCode() != 200) {
             throw new RuntimeException("Unexpected status " + response.statusCode()
                     + " from POST /tasks/result");
         }
+    }
+
+    /**
+     * POST /api/v1/tasks/{taskId}/error
+     * Tells the master the evaluation failed so it requeues the task at once.
+     */
+    private void reportError(long taskId, String message) throws Exception {
+        String body = mapper.writeValueAsString(Map.of(
+                "workerId", workerId,
+                "errorMessage", message
+        ));
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(masterUrl + "/api/v1/tasks/" + taskId + "/error"))
+                .timeout(Duration.ofSeconds(15))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+        httpClient.send(request, HttpResponse.BodyHandlers.discarding());
     }
 
     // ── Heartbeat (separate thread) ───────────────────────────────────────────

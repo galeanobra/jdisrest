@@ -62,7 +62,7 @@ language capable of making HTTP requests).
 1. The master starts Spring Boot in a daemon thread and waits for workers.
 2. Each worker starts, sends `POST /heartbeat` to register itself, and enters its loop.
 3. The worker requests a task: `GET /tasks/next` with long-polling of up to 30 s.
-4. The master responds with a `taskId` + vector of integer variables.
+4. The master responds with a `taskId` + the decision vector (integers, reals, or both for composite problems).
 5. The worker evaluates the objective function (this can take minutes or hours).
 6. The worker returns the result: `POST /tasks/{id}/result` with objectives and constraints.
 7. The master integrates the result into the population and generates the next task.
@@ -112,18 +112,43 @@ Possible responses:
   410 Gone → algorithm finished, the worker must stop
 ```
 
-Body of the 200 response (JSON):
+Body of the 200 response (JSON). Integer problem:
 
 ```json
 {
   "taskId": 42,
-  "variables": [3, -17, 55, 0, 81, ...],
-  "segmentSizes": [3249, 3249, 3249]
+  "variables": [3, -17, 55, 0, 81, ...]
 }
 ```
 
-- `variables`: flat vector of integers. For `CompositeSolution` it is the concatenation of the segments `[seg0 | seg1 | ...]`.
-- `segmentSizes`: **only present for composite problems** (`CompositeSolution`): number of variables in each segment, so the worker can reconstruct the boundaries. For `IntegerSolution` the field is omitted from the JSON.
+Real-coded problem (`DoubleSolution`):
+
+```json
+{
+  "taskId": 43,
+  "variables": [0.25, -1.5, 3.0, ...],
+  "encoding": "double"
+}
+```
+
+Composite problem with an integer segment and a real segment:
+
+```json
+{
+  "taskId": 44,
+  "variables": [3, -17, 55, 0.25, -1.5],
+  "segmentSizes": [3, 2],
+  "encoding": "mixed",
+  "segmentEncodings": ["int", "double"]
+}
+```
+
+- `variables`: flat vector of numbers. Integer variables travel as JSON integers (`5`), real variables as JSON floats (`5.0`). For `CompositeSolution` it is the concatenation of the segments `[seg0 | seg1 | ...]`.
+- `segmentSizes`: **only present for composite problems**: number of variables in each segment, so the worker can reconstruct the boundaries.
+- `encoding`: `"double"` when every variable is real, `"mixed"` when a composite mixes integer and real segments. **Absent means every variable is an integer.**
+- `segmentEncodings`: only for composites that are not all-integer: `"int"` or `"double"` per segment, aligned with `segmentSizes`.
+
+The three optional fields are omitted for integer problems, so the JSON of an integer problem is byte for byte the one sent by jdisrest 1.0. A worker that hands the whole vector to a simulator can ignore all three; JSON parsers already deliver ints and floats with the right type.
 
 The client timeout must be **greater than 30 s** (40 s is the project standard).
 
@@ -144,16 +169,22 @@ Content-Type: application/json
 }
 
 Possible responses:
-  200 OK        → result accepted
-  404 Not Found → the watchdog already requeued this task (worker took too long)
+  200 OK                     → result accepted
+  404 Not Found              → the watchdog already requeued this task (worker took too long)
+  422 Unprocessable Content  → the result is invalid (see below); the task has been requeued
+  400 Bad Request            → the body is not valid JSON (e.g. a bare NaN); the task has been requeued
 ```
 
-- `objectives`: list of **doubles** with the value of each objective. jMetal minimizes; to maximize, negate.
-- `constraints`: list of doubles. jMetal convention: `<= 0` satisfied, `> 0` violated. Empty list if there are no constraints.
+- `objectives`: list of **doubles**, exactly one per objective of the problem. jMetal minimizes; to maximize, negate.
+- `constraints`: list of doubles, exactly one per constraint of the problem. jMetal convention: `>= 0` satisfied, `< 0` violated. Empty list (or omitted) if the problem has no constraints.
 - `evaluationTimeMs`: optional, for statistics.
-- `variables`: **optional**. If the evaluator "repairs" the solution (Lamarckian search), it can return the repaired vector here and the master will overwrite the original solution before archiving the result. Omit if the variables are not modified.
+- `variables`: **optional**. If the evaluator "repairs" the solution (Lamarckian search), it can return the repaired vector here and the master will overwrite the original solution before archiving the result. Omit it (or send an empty list, which means the same) if the variables are not modified. Same layout as the vector received. The JSON number type does not matter: the master converts each value to the type of the destination variable, so `2` is accepted for a real variable and `2.0` for an integer one. `2.7` for an integer variable is rejected.
 
-> The 404 is not a critical error — it means the watchdog requeued the task due to a timeout. The worker should log a warning and continue.
+The master validates the whole body before writing anything into the solution. It rejects with `422`: a wrong number of objectives or constraints, any `null`, `NaN`, `Infinity` or `-Infinity`, a `variables` vector whose length differs from the solution's, and a non-integral value for an integer variable. The body of the `422` (and of the `400`) is `{"taskId": 42, "reason": "objectives[1] is not finite: NaN"}`.
+
+A rejected result is treated exactly like `POST /error`: the task goes back to the pending queue and the same solution will be evaluated again by whichever worker claims it. An evaluator that produces `NaN` for some inputs must therefore map it to a finite penalty itself — the master has no way to choose one. Note that Python's `json.dumps` emits `NaN` as a bare token (invalid JSON, answered with `400`) and MATLAB's `jsonencode` turns `NaN` into `null` (answered with `422`); the bundled Python client validates finiteness before sending and reports the problem through `/error` instead.
+
+> The 404 is not a critical error — it means the watchdog requeued the task due to a timeout. The worker should log a warning and continue. The 400 and 422 are not network errors either: log the reason and move on to the next task.
 
 ### 2.4 `POST /api/v1/tasks/{taskId}/error`
 
@@ -205,7 +236,40 @@ public class SphereProblem extends AbstractIntegerProblem {
 }
 ```
 
-> Extend `AbstractIntegerProblem` because jdisrest works with integer variables. For multi-objective: `numberOfObjectives(2)` and fill in `solution.objectives()[0]` and `[1]`.
+> For multi-objective: `numberOfObjectives(2)` and fill in `solution.objectives()[0]` and `[1]`.
+
+jdisrest accepts three encodings: `IntegerSolution` (`AbstractIntegerProblem`), `DoubleSolution` (`AbstractDoubleProblem`) and `CompositeSolution` whose segments are any mix of the two. The real-coded version of the same problem:
+
+```java
+package es.unex.example;
+
+import org.uma.jmetal.problem.doubleproblem.impl.AbstractDoubleProblem;
+import org.uma.jmetal.solution.doublesolution.DoubleSolution;
+import java.util.Collections;
+
+public class SphereRealProblem extends AbstractDoubleProblem {
+
+    public SphereRealProblem(int numberOfVariables) {
+        numberOfObjectives(1);
+        numberOfConstraints(0);
+        name("SphereReal");
+        variableBounds(
+            Collections.nCopies(numberOfVariables, -5.12),
+            Collections.nCopies(numberOfVariables, 5.12)
+        );
+    }
+
+    @Override
+    public DoubleSolution evaluate(DoubleSolution solution) {
+        double f = 0;
+        for (double x : solution.variables()) f += x * x;
+        solution.objectives()[0] = f;
+        return solution;
+    }
+}
+```
+
+The workers receive its variables as JSON floats and the task payload carries `"encoding": "double"` (section 2.2). Operators must match the encoding: `SBXCrossover` + `PolynomialMutation` (or the variants in `es.unex.jdisrest.operator`) for `DoubleSolution`, `IntegerSBXCrossover` + `IntegerPolynomialMutation` (or `IntegerSimpleRandomMutation`) for `IntegerSolution`.
 
 ### Strategy B: evaluation on the worker (external problem)
 
@@ -244,7 +308,7 @@ The algorithm invokes `createInitialPopulationFromFile(populationSize)` instead 
 
 ### Composite problems
 
-For problems with heterogeneous segments (e.g. three independent sets of variables with different bounds), implement `Problem<CompositeSolution>` directly. jMetal provides `CompositeCrossover` and `CompositeMutation`, but there is a latent aliasing bug — use the defensive wrapper `es.unex.jdisrest.operator.SafeCompositeCrossover` (drop-in replacement).
+For problems with heterogeneous segments (e.g. three independent sets of variables with different bounds, or an integer segment next to a real one), implement `Problem<CompositeSolution>` directly. Segments may be `IntegerSolution`, `DoubleSolution` or any mix; the master flattens them in declaration order and tells the worker where each segment starts (`segmentSizes`) and how it is encoded (`segmentEncodings`, section 2.2). jMetal provides `CompositeCrossover` and `CompositeMutation`, but there is a latent aliasing bug — use the defensive wrapper `es.unex.jdisrest.operator.SafeCompositeCrossover` (drop-in replacement).
 
 ---
 
@@ -280,6 +344,9 @@ public class SphereWorker {
 - A heartbeat thread every 15 s in parallel with evaluation.
 - Dead-master detection: 5 consecutive errors in the main loop or 3 failed heartbeats in a row → the worker shuts down cleanly.
 - Network retries with a fixed 10 s wait between attempts.
+- Any supported encoding: the received vector is written into `problem.createSolution()` through `SolutionVariables.apply()`, which splits composite solutions by segment and converts every value to the type of the destination variable.
+- Evaluation failures: an exception thrown by `problem.evaluate()` (or a vector that does not fit the solution) is reported through `POST /error`, so the master requeues the task, and the worker moves on.
+- Rejected results (`400`/`422`): logged with the master's reason and skipped; they do not count towards dead-master detection.
 
 ### 4.2 Python worker
 
@@ -288,7 +355,8 @@ The `jdisrest` package (installable with `pip install -e <path-to-jdisrest>/pyth
 ```python
 from jdisrest import Worker, EvalResult
 
-def evaluate(variables: list[int]) -> EvalResult:
+def evaluate(variables) -> EvalResult:
+    # ints for an integer-encoded problem, floats for a real-encoded one
     f = sum(x ** 2 for x in variables)
     return EvalResult(objectives=[float(f)])
 
@@ -323,6 +391,8 @@ Worker.from_endpoint().run(MyEvaluator("config.json"))
 - A `dict` with `objectives` / `constraints` / `variables` keys
 - A scalar (treated as a single objective)
 - Any object with an `.objectives` attribute
+
+Before posting, the client converts objectives and constraints to plain floats (numpy scalars included) and checks that every value is finite. A `NaN` or `inf` is reported to the master through `/error`, with the field and index in the message, so the task is requeued and the log points at the evaluator. Repaired `variables` keep their kind: Python ints are sent as JSON integers and floats as JSON floats.
 
 ### 4.3 MATLAB worker
 
@@ -359,7 +429,7 @@ function sphere_worker(masterUrl, workerId)
                     taskId = task.taskId;
                     variables = double(task.variables);
                     t0 = tic;
-                    objectives = sum(variables .^ 2);     % f(x) = Σxᵢ²
+                    objectives = sum(variables .^ 2);     % f(x) = Σxᵢ², one value per objective
                     elapsedMs = round(toc(t0) * 1000);
                     submit_result(masterUrl, workerId, taskId, objectives, elapsedMs);
                 otherwise
@@ -387,11 +457,22 @@ end
 
 function submit_result(masterUrl, workerId, taskId, objectives, elapsedMs)
     import matlab.net.http.*, import matlab.net.http.field.*, import matlab.net.*
-    payload = struct('workerId', workerId, 'objectives', objectives, ...
+    % num2cell forces a JSON array even for a single objective: jsonencode
+    % would emit a bare scalar for a 1x1 double, and the master rejects it.
+    payload = struct('workerId', workerId, 'objectives', {num2cell(objectives(:)')}, ...
                      'constraints', [], 'evaluationTimeMs', elapsedMs);
     uri = URI([masterUrl '/api/v1/tasks/' num2str(taskId) '/result']);
     req = RequestMessage('POST', ContentTypeField('application/json'), MessageBody(payload));
-    req.send(uri, HTTPOptions('ResponseTimeout', 15));
+    resp = req.send(uri, HTTPOptions('ResponseTimeout', 15));
+    code = double(resp.StatusCode);
+    if code == 404
+        fprintf('[%s] task %d already requeued by the watchdog\n', workerId, taskId);
+    elseif code == 400 || code == 422
+        % The master could not apply the result and has requeued the task.
+        fprintf('[%s] task %d rejected: %s\n', workerId, taskId, resp.Body.Data.reason);
+    elseif code ~= 200
+        error('Unexpected HTTP status %d from POST /result', code);
+    end
 end
 
 function send_heartbeat(masterUrl, workerId)
@@ -417,6 +498,8 @@ Or as a non-interactive script:
 ```bash
 matlab -nodisplay -nosplash -r "sphere_worker('http://10.0.0.1:55000','worker-matlab-01'); exit"
 ```
+
+`double(task.variables)` works for every encoding: `jsondecode` already delivers integers and reals as doubles. Two things to watch: `jsonencode` turns `NaN` into `null`, which the master rejects with `422` (map non-finite objectives to a finite penalty before `submit_result`), and a `422`/`400` response means the task was requeued — `submit_result` above logs the reason and returns, so the loop continues with the next task instead of counting it as a connection error.
 
 ---
 
@@ -467,9 +550,10 @@ public class SphereMaster {
 
 Under `es.unex.jdisrest.operator.*`:
 
-- `IntegerSimpleRandomMutation`, `IntegerGaussianMutation`, `IntegerBLXCrossover`, `PolynomialMutationRandomProbability`, `RandomMutationWithRandomProbability`: variants specific to integer variables.
+- `IntegerSimpleRandomMutation`, `IntegerGaussianMutation`, `IntegerBLXCrossover`: operators for `IntegerSolution`.
+- `PolynomialMutationRandomProbability`, `RandomMutationWithRandomProbability`: mutations for `DoubleSolution` with a per-call randomized probability.
 - `NaryTournamentSelection`: n-ary tournament selection.
-- `DifferentialEvolutionSelection`: usable with MOEA/D-DE on `DoubleSolution` problems (not compatible with `IntegerSolution`).
+- `DifferentialEvolutionSelection`: DE parent selection for `DoubleSolution` populations. **Not wired into any algorithm of this release**: it needs `setIndex(i)` before every `execute()` and a DE crossover fed with the current solution, and neither the steady-state base class nor MOEA/D does that (MOEA/D builds its parents itself and ignores the selection operator). Usable only from a custom algorithm.
 - `SafeCompositeCrossover`: wrapper around `CompositeCrossover` that avoids a latent aliasing bug in jMetal — drop-in replacement, same constructor signature.
 
 ---
@@ -583,7 +667,8 @@ claimNextTask(workerId)
 
 TaskController.submitResult():
   ← inFlightTasks.get(taskId)
-  → writes objectives into solution
+  → validates the payload (422 + requeue if invalid)
+  → writes variables (optional), objectives and constraints into solution
   → MasterFacade.submitResult()
      → inFlightTasks.remove(taskId)
      → completedTaskQueue.add(task)
@@ -670,6 +755,19 @@ public class MyAlgo<S extends Solution<?>> extends SteadyStateEvolutionaryAlgori
     }
 }
 ```
+
+### 7.7 Variable encodings and the wire
+
+`es.unex.jdisrest.util.SolutionVariables` is the only place where a jMetal solution becomes a flat numeric vector or is rebuilt from one. `TaskController`, `RestWorker`, `PythonSolutionListEvaluator`, the duplicate filter (`solutionKey()`) and the composite trace writer all go through it.
+
+- `flatten(solution)` copies the variables into a new `List<Number>`, concatenating composite segments in declaration order and keeping `Integer`/`Double` element types, so Jackson emits `5` for integer variables and `5.0` for real ones.
+- `apply(solution, values)` writes a vector back. Each value is converted to the type of the destination variable (`intValue()` / `doubleValue()`), never trusting the type Jackson chose from the JSON text (`5` → `Integer`, `5.0` → `Double`, big values → `Long`). It validates first and writes afterwards, so a rejected vector leaves the solution untouched: wrong length, `null`, non-finite, non-integral for an integer variable (tolerance `1e-9`) and `int` overflow all raise `IllegalArgumentException` with the offending index.
+- `wireEncoding(solution)` / `segmentEncodings(solution)` produce the `encoding` and `segmentEncodings` fields of section 2.2. The controller omits both for all-integer solutions.
+- Supported types: `IntegerSolution`, `DoubleSolution`, `CompositeSolution` of those. Any other solution is accepted only if its variables are `Integer` or `Double` at runtime (integer permutations); otherwise `IllegalArgumentException` names the class. `SteadyStateEvolutionaryAlgorithm.run()` performs this check on one `problem.createSolution()` before dispatching anything, so an unsupported encoding fails at start-up rather than once per task.
+
+**Duplicate filter.** `SteadyStateEvolutionaryAlgorithm.solutionKey()` returns `flatten(solution)` and `populationSignatures` compares keys element by element. With integer encodings this rejects every duplicate offspring. With real encodings two independently generated vectors are practically never bit-identical, so the filter only catches exact clones — offspring on which neither crossover nor mutation acted, which are the duplicates real-coded evolution actually produces. The retry loop in `createNewTask()` therefore exits on the first iteration for most real-coded offspring and `MAX_DUPLICATE_RETRIES` is never reached. Nothing else changes; a tolerance-based comparison was deliberately not added because it would need a per-variable scale.
+
+**Traces.** `CompositeSolutionListOutput` writes any number of segments of any supported encoding, one VAR row per solution: `v0 v1 ... vN-1,[obj...],[con...]`. Flat solutions still go through jMetal's `SolutionListOutput`.
 
 ---
 

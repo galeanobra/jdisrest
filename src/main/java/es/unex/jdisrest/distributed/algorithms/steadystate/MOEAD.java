@@ -108,7 +108,7 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
         List<ParallelTask<S>> list = new ArrayList<>();
         // Track already-created initial solutions locally; populationSignatures is empty at this
         // point (solutions are not yet evaluated), so we cannot use solutionInThePopulation().
-        Set<List<Integer>> seen = new HashSet<>();
+        Set<List<?>> seen = new HashSet<>();
         for (int i = 0; i < populationSize; i++) {
             S s;
             int retries = 0;
