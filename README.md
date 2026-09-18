@@ -20,6 +20,11 @@ simulators, trained models, or legacy code, across a cluster (including
 SLURM-managed HPC nodes) without coupling the algorithm implementation
 to the evaluation language.
 
+Problems may use integer variables (`IntegerSolution`), real variables
+(`DoubleSolution`) or a `CompositeSolution` that mixes both; the decision
+vector travels to the workers as a flat list of JSON numbers whatever the
+encoding.
+
 The algorithmic core (NSGA-II, MOEA/D, SMS-EMOA, solution encodings,
 and several operators) is built on top of
 [**jMetal**](https://github.com/jMetal/jMetal). jdisrest does not
@@ -93,7 +98,7 @@ Consumers reference it via:
 <dependency>
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -128,7 +133,8 @@ A matching Python worker:
 ```python
 from jdisrest import Worker, EvalResult
 
-def evaluate(variables: list[int]) -> EvalResult:
+def evaluate(variables) -> EvalResult:
+    # ints for an integer-encoded problem, floats for a real-encoded one
     return EvalResult(objectives=[float(sum(x ** 2 for x in variables))])
 
 Worker("http://localhost:8080").run(evaluate)
@@ -138,15 +144,17 @@ Worker("http://localhost:8080").run(evaluate)
 
 ```
 jdisrest/
-├── pom.xml                       # Maven library (es.unex:jdisrest:1.0.0)
+├── pom.xml                       # Maven library (es.unex:jdisrest:1.1.0)
 ├── src/main/java/es/unex/jdisrest/
 │   ├── distributed/              # Master, algorithms, REST controllers
 │   ├── local/                    # Sequential (non-REST) mode for debugging
 │   ├── operator/                 # Custom jMetal operators
-│   └── util/                     # Logging, protocol timings, trace output
+│   └── util/                     # Logging, timings, variable encodings, trace output
+├── src/test/java/                # JUnit tests (encodings, wire format, result validation)
 ├── python/
 │   ├── pyproject.toml            # PEP 621 metadata
-│   └── jdisrest/                 # Worker-side Python package
+│   ├── jdisrest/                 # Worker-side Python package
+│   └── tests/                    # pytest suite for the client
 └── docs/
     └── DEVELOPER_MANUAL.md       # Developer manual
 ```
@@ -163,6 +171,10 @@ jdisrest/
   running master over REST (heartbeats, retries, and shutdown handled for you).
 - `es.unex.jdisrest.distributed.WarmStartCapable`: optional interface implemented
   by problems that can seed the initial population from disk.
+- `es.unex.jdisrest.util.SolutionVariables`: flattens `IntegerSolution`,
+  `DoubleSolution` and `CompositeSolution` variables into the wire vector and
+  writes results back, converting each value to the type of the destination
+  variable.
 - `es.unex.jdisrest.distributed.rest.MasterSpringApp`: embedded Spring Boot entry
   point (auto-loaded by the master).
 - `es.unex.jdisrest.local.algorithms.NSGAII`: sequential local variant (no REST)

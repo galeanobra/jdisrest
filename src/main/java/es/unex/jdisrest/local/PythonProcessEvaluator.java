@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
@@ -18,16 +21,26 @@ import java.util.concurrent.atomic.AtomicLong;
  * for the local/sequential mode. Communicates over the child's stdin/stdout
  * with a line-delimited JSON protocol; the child's stderr is inherited.
  *
- * <p>Protocol (matches {@code worker/local_eval.py}):
+ * <p>Protocol:
  * <ul>
- *   <li>request:  {@code {"id": <long>, "vars": [<int>, ...]}}</li>
- *   <li>response: {@code {"id": <long>, "objectives": [...], "constraints": [...]}}</li>
+ *   <li>request:  {@code {"id": <long>, "vars": [<number>, ...]}} — integer
+ *       variables are written as JSON integers, real ones as JSON floats</li>
+ *   <li>response: {@code {"id": <long>, "objectives": [...], "constraints": [...],
+ *       "variables": [...]}} ({@code constraints} and {@code variables} optional)</li>
  *   <li>error:    {@code {"id": <long>, "error": "<msg>"}}</li>
  *   <li>EOF on stdin terminates the loop.</li>
  * </ul>
  *
- * <p>Not thread-safe: {@link #evaluate(int[])} must be called from a single
+ * <p>Objectives and constraints must be finite numbers; a {@code null},
+ * {@code NaN} or infinite value is reported as an {@link IOException}, the
+ * same way the REST master rejects such results. The numeric type of the
+ * returned {@code variables} is irrelevant: the caller converts each value to
+ * the type of the destination variable.
+ *
+ * <p>Not thread-safe: {@link #evaluate(List)} must be called from a single
  * thread. The stock jMetal NSGA-II is single-threaded, so this is sufficient.
+ *
+ * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public final class PythonProcessEvaluator implements AutoCloseable {
 
@@ -37,6 +50,7 @@ public final class PythonProcessEvaluator implements AutoCloseable {
     private final ObjectMapper json = new ObjectMapper();
     private final AtomicLong nextId = new AtomicLong(0);
 
+    /** One evaluation result as reported by the Python child. */
     public static final class Result {
         public final double[] objectives;
         public final double[] constraints;
@@ -45,12 +59,15 @@ public final class PythonProcessEvaluator implements AutoCloseable {
          * {@code variables} field of the REST {@code TaskResultPayload}.
          * {@code null} (the common case) means the evaluator did not modify
          * the decision and the caller should keep the original variables.
+         * Elements keep the numeric type produced by the JSON parser; use
+         * {@link es.unex.jdisrest.util.SolutionVariables#apply} to write them
+         * back with the conversion the destination requires.
          */
-        public final int[] variables;
+        public final List<Number> variables;
         public Result(double[] objectives, double[] constraints) {
             this(objectives, constraints, null);
         }
-        public Result(double[] objectives, double[] constraints, int[] variables) {
+        public Result(double[] objectives, double[] constraints, List<Number> variables) {
             this.objectives = objectives;
             this.constraints = constraints;
             this.variables = variables;
@@ -80,7 +97,27 @@ public final class PythonProcessEvaluator implements AutoCloseable {
         Log.info("PythonProcessEvaluator ready (pid=" + process.pid() + ", script=" + scriptPath + ")");
     }
 
+    /**
+     * Convenience overload for integer decision vectors.
+     *
+     * @param decision the decision vector
+     * @return the evaluation result
+     * @throws IOException on protocol or process failure
+     */
     public Result evaluate(int[] decision) throws IOException {
+        return evaluate(Arrays.stream(decision).boxed().toList());
+    }
+
+    /**
+     * Sends one decision vector to the child and waits for its result.
+     *
+     * @param decision flat decision vector; {@link Integer} elements are written as
+     *                 JSON integers and {@link Double} elements as JSON floats
+     * @return the evaluation result
+     * @throws IOException if the child crashed, answered out of order, reported an
+     *                     error, or returned a non-finite objective or constraint
+     */
+    public Result evaluate(List<? extends Number> decision) throws IOException {
         long id = nextId.getAndIncrement();
         Map<String, Object> req = Map.of("id", id, "vars", decision);
         stdin.write(json.writeValueAsString(req));
@@ -103,31 +140,46 @@ public final class PythonProcessEvaluator implements AutoCloseable {
             throw new IOException("Python evaluator error: " + error);
         }
 
+        Object objRaw = resp.get("objectives");
+        if (!(objRaw instanceof List<?>)) {
+            throw new IOException("Python evaluator response has no 'objectives' list (line: " + line + ")");
+        }
         Object consRaw = resp.get("constraints");
         List<?> consList = (consRaw instanceof List<?>) ? (List<?>) consRaw : List.of();
-        double[] o = toDoubleArray((List<?>) resp.get("objectives"));
-        double[] c = toDoubleArray(consList);
+        double[] o = toFiniteDoubleArray("objectives", (List<?>) objRaw);
+        double[] c = toFiniteDoubleArray("constraints", consList);
 
         // Optional repaired decision; absent for evaluators that don't modify variables.
         Object varsRaw = resp.get("variables");
-        int[] v = (varsRaw instanceof List<?>) ? toIntArray((List<?>) varsRaw) : null;
+        List<Number> v = (varsRaw instanceof List<?>) ? toNumberList((List<?>) varsRaw) : null;
         return new Result(o, c, v);
     }
 
-    private static double[] toDoubleArray(List<?> list) {
+    private static double[] toFiniteDoubleArray(String field, List<?> list) throws IOException {
         double[] out = new double[list.size()];
         for (int i = 0; i < out.length; i++) {
-            out[i] = ((Number) list.get(i)).doubleValue();
+            Object e = list.get(i);
+            if (!(e instanceof Number n)) {
+                throw new IOException("Python evaluator returned " + field + "[" + i + "] = " + e + " (not a number)");
+            }
+            out[i] = n.doubleValue();
+            if (!Double.isFinite(out[i])) {
+                throw new IOException("Python evaluator returned non-finite " + field + "[" + i + "] = " + e);
+            }
         }
         return out;
     }
 
-    private static int[] toIntArray(List<?> list) {
-        int[] out = new int[list.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = ((Number) list.get(i)).intValue();
+    private static List<Number> toNumberList(List<?> list) throws IOException {
+        List<Number> out = new ArrayList<>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            Object e = list.get(i);
+            if (!(e instanceof Number n)) {
+                throw new IOException("Python evaluator returned variables[" + i + "] = " + e + " (not a number)");
+            }
+            out.add(n);
         }
-        return out;
+        return Collections.unmodifiableList(out);
     }
 
     @Override

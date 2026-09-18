@@ -51,8 +51,8 @@ Monitor progress (from a separate terminal)
           f"({status['progress']*100:.1f}%) — ETA {status['estimatedSecondsRemaining']}s")
 """
 
-from ._types import EvalResult, Evaluator
+from ._types import EvalResult, Evaluator, Variables
 from ._worker import Worker
 
-__all__ = ["Worker", "EvalResult", "Evaluator"]
-__version__ = "1.0.0"
+__all__ = ["Worker", "EvalResult", "Evaluator", "Variables"]
+__version__ = "1.1.0"

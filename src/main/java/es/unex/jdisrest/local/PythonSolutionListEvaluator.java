@@ -1,8 +1,8 @@
 package es.unex.jdisrest.local;
 
+import es.unex.jdisrest.util.SolutionVariables;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.solution.Solution;
-import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.util.evaluator.SolutionListEvaluator;
 
 import java.io.IOException;
@@ -17,22 +17,45 @@ import java.util.function.Function;
  * {@code SequentialSolutionListEvaluator} when the problem evaluation lives
  * outside the JVM.
  *
- * <p>The decision-vector extractor is injected so this class stays
- * problem-agnostic; vRAN-specific flattening lives at the call site.
+ * <p>By default the decision vector sent to Python is
+ * {@link SolutionVariables#flatten}, which handles {@code IntegerSolution},
+ * {@code DoubleSolution} and {@code CompositeSolution} (segments concatenated
+ * in declaration order). A custom extractor can be injected for other layouts.
  *
  * <p>If the Python evaluator returns a {@code variables} array (Lamarckian
  * repair / local search), the new decision is written back into the solution
- * before returning so that the master-side population stays consistent with
- * the reported objectives.
+ * before returning — converting each value to the type of the destination
+ * variable — so the population stays consistent with the reported objectives.
  *
- * @param <S> jMetal solution type (typically {@code CompositeSolution} for vRAN)
+ * <p>The number of objectives and constraints returned must match the
+ * solution's; a mismatch is reported as an {@link IllegalStateException}
+ * instead of being silently truncated.
+ *
+ * @param <S> jMetal solution type
+ * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public final class PythonSolutionListEvaluator<S extends Solution<?>> implements SolutionListEvaluator<S> {
 
     private final PythonProcessEvaluator python;
-    private final Function<S, int[]> decisionExtractor;
+    private final Function<S, List<? extends Number>> decisionExtractor;
 
-    public PythonSolutionListEvaluator(PythonProcessEvaluator python, Function<S, int[]> decisionExtractor) {
+    /**
+     * Evaluator using {@link SolutionVariables#flatten} as the decision extractor.
+     *
+     * @param python the Python child process
+     */
+    public PythonSolutionListEvaluator(PythonProcessEvaluator python) {
+        this(python, SolutionVariables::flatten);
+    }
+
+    /**
+     * Evaluator with a custom decision extractor.
+     *
+     * @param python            the Python child process
+     * @param decisionExtractor maps a solution to the flat vector sent to Python
+     */
+    public PythonSolutionListEvaluator(PythonProcessEvaluator python,
+                                       Function<S, List<? extends Number>> decisionExtractor) {
         this.python = python;
         this.decisionExtractor = decisionExtractor;
     }
@@ -42,13 +65,19 @@ public final class PythonSolutionListEvaluator<S extends Solution<?>> implements
         for (S sol : solutionList) {
             try {
                 PythonProcessEvaluator.Result r = python.evaluate(decisionExtractor.apply(sol));
-                if (r.variables != null && r.variables.length > 0) {
-                    applyVariables(sol, r.variables);
+                if (r.objectives.length != sol.objectives().length) {
+                    throw new IllegalStateException("Python evaluator returned " + r.objectives.length
+                        + " objectives but the problem defines " + sol.objectives().length);
                 }
-                int oN = Math.min(r.objectives.length, sol.objectives().length);
-                for (int i = 0; i < oN; i++) sol.objectives()[i] = r.objectives[i];
-                int cN = Math.min(r.constraints.length, sol.constraints().length);
-                for (int i = 0; i < cN; i++) sol.constraints()[i] = r.constraints[i];
+                if (r.constraints.length != sol.constraints().length) {
+                    throw new IllegalStateException("Python evaluator returned " + r.constraints.length
+                        + " constraints but the problem defines " + sol.constraints().length);
+                }
+                if (r.variables != null && !r.variables.isEmpty()) {
+                    SolutionVariables.apply(sol, r.variables);
+                }
+                System.arraycopy(r.objectives, 0, sol.objectives(), 0, r.objectives.length);
+                System.arraycopy(r.constraints, 0, sol.constraints(), 0, r.constraints.length);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -59,30 +88,5 @@ public final class PythonSolutionListEvaluator<S extends Solution<?>> implements
     @Override
     public void shutdown() {
         python.close();
-    }
-
-    /**
-     * Writes a flat decision vector back into a solution, splitting by
-     * component when the solution is a {@link CompositeSolution} (mirroring
-     * the layout the master sent over the wire). Excess elements on either
-     * side are silently ignored.
-     */
-    @SuppressWarnings("unchecked")
-    private static void applyVariables(Solution<?> solution, int[] variables) {
-        if (solution instanceof CompositeSolution composite) {
-            int idx = 0;
-            for (Object component : composite.variables()) {
-                List<Integer> segVars = ((Solution<Integer>) component).variables();
-                int n = segVars.size();
-                for (int i = 0; i < n && idx < variables.length; i++, idx++) {
-                    segVars.set(i, variables[idx]);
-                }
-            }
-            return;
-        }
-        List<Integer> solVars = ((Solution<Integer>) solution).variables();
-        for (int i = 0; i < solVars.size() && i < variables.length; i++) {
-            solVars.set(i, variables[i]);
-        }
     }
 }
