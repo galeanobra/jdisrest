@@ -1,5 +1,6 @@
 package es.unex.jdisrest.local.algorithms;
 
+import es.unex.jdisrest.distributed.WarmStart;
 import es.unex.jdisrest.distributed.WarmStartCapable;
 import es.unex.jdisrest.util.Log;
 
@@ -18,8 +19,6 @@ import org.uma.jmetal.util.evaluator.SolutionListEvaluator;
 import es.unex.jdisrest.util.TraceWriter;
 
 import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -36,7 +35,8 @@ import java.util.stream.Collectors;
  *       from the current population. Both pairs unfiltered (feasibility
  *       filtering is reserved for the final result).</li>
  *   <li>{@code iVAR.csv} warm-start when the problem implements
- *       {@link WarmStartCapable}.</li>
+ *       {@link WarmStartCapable}, with a copy of the file in {@code tracesFolder}
+ *       (see {@link WarmStart}).</li>
  *   <li>{@link #result()} returning the feasible non-dominated subset of the
  *       archive, downsampled with
  *       {@link SolutionListUtils#distanceBasedSubsetSelection} to at most
@@ -84,18 +84,15 @@ public class NSGAII<S extends Solution<?>> extends org.uma.jmetal.algorithm.mult
         return new BinaryTournamentSelection<>();
     }
 
+    /**
+     * Starts from the warm-start population of {@link WarmStart#load} when there is one, and
+     * from jMetal's random initial population otherwise.
+     */
     @Override
-    @SuppressWarnings("unchecked")
     protected List<S> createInitialPopulation() {
-        boolean existsIVAR = Files.exists(Path.of("iVAR.csv"));
-        if (existsIVAR && getProblem() instanceof WarmStartCapable<?> ws) {
-            Log.info("Initial population loaded from iVAR.csv file");
-            return ((WarmStartCapable<S>) ws).createInitialPopulationFromFile(populationSize);
-        }
-        if (existsIVAR) {
-            Log.warn("iVAR.csv found but problem does not implement WarmStartCapable — using random initialization");
-        }
-        return super.createInitialPopulation();
+        List<S> loaded = WarmStart.load(getProblem(), populationSize, WarmStart.FILE,
+                tracesFolder == null ? null : tracesFolder.toPath());
+        return loaded != null ? loaded : super.createInitialPopulation();
     }
 
     @Override

@@ -6,7 +6,7 @@
 
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.1.1-SNAPSHOT</version>
+    <version>1.2.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <licenses>
@@ -29,8 +29,10 @@
     <description>
         Distributed REST-based master/worker framework for jMetal-encoded
         optimization problems. Provides an embedded Spring Boot master that
-        exposes a task API consumed by remote workers, plus steady-state
-        and generational algorithm variants (NSGA-II, MOEA/D, SMS-EMOA).
+        exposes a task API consumed by remote workers; steady-state NSGA-II,
+        MOEA/D, SMS-EMOA and PAES; a base class for generational masters;
+        configuration files and a launcher for real-coded problems; and a
+        Java worker.
     </description>
 
     <properties>

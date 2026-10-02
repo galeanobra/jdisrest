@@ -17,8 +17,9 @@ import java.util.List;
  * exactly {@code problem.numberOfConstraints()} finite values (an empty list or
  * {@code null} when the problem has none), and every value of {@code variables},
  * when present, must be representable by the destination variable. A payload
- * that fails validation is answered with {@code 422} and the task is requeued
- * as if the worker had reported an evaluation error.
+ * that fails validation is answered with {@code 422} and the task is handled
+ * as if the worker had reported an evaluation error: requeued, or discarded
+ * after the failure limit.
  *
  * <p>The {@code evaluationTimeMs} field is optional and informational only:
  * the master does not use it for scheduling or selection decisions. It is a

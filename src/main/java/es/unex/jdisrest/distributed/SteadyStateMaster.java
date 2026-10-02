@@ -5,6 +5,7 @@ import org.uma.jmetal.problem.Problem;
 import es.unex.jdisrest.util.Log;
 import es.unex.jdisrest.util.Timings;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
@@ -37,6 +38,13 @@ import java.util.concurrent.*;
   * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends AbstractMaster<T, R> implements SteadyStateAlgorithm<T, R> {
+
+    /**
+     * How often {@link #waitForComputedTask()} checks whether a stop has been requested
+     * ({@link #requestStop()}): the algorithm thread notices a stop at most this long after it
+     * arrives, at the cost of waking up five times a second while it waits for results.
+     */
+    private static final Duration STOP_CHECK_INTERVAL = Duration.ofMillis(200);
 
     /**
      * Singleton reference shared with Spring beans. {@code volatile} to ensure safe
@@ -109,6 +117,13 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      *       worker's registry entry.</li>
      * </ol>
      *
+     * <p>Once a stop has been requested ({@link #requestStop()}) it hands out nothing: it
+     * returns {@code null} at once, and a task obtained during the long-poll is dropped
+     * instead of being put in flight. {@code TaskController} checks {@link #isFinished()}
+     * before calling this method, so the worker gets {@code 410 Gone} on its next request.
+     * A stop that lands between the last check and the dispatch still lets that one task
+     * out; its result is then refused by {@link #submitResult}.
+     *
      * @param workerId       the unique identifier of the requesting worker
      * @param timeoutSeconds maximum time in seconds to wait for a task if none is
      *                       immediately available (long-poll window)
@@ -118,6 +133,9 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * @throws InterruptedException if the thread is interrupted while waiting
      */
     public T claimNextTask(String workerId, int timeoutSeconds) throws InterruptedException {
+        if (isStopRequested()) {
+            return null;  // the worker gets 410 Gone on its next request
+        }
         T task = pendingTaskQueue.poll();
 
         if (task == null && stoppingConditionIsNotMet()) {
@@ -133,6 +151,9 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
         // Long-poll fallback: wait if the algorithm is still running but produced nothing
         if (task == null) {
             task = pendingTaskQueue.poll(timeoutSeconds, TimeUnit.SECONDS);
+        }
+        if (task != null && isStopRequested()) {
+            task = null;  // a stop arrived while the worker was waiting: hand nothing out
         }
 
         final T finalTask = task;
@@ -168,16 +189,23 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * {@code POST /api/v1/tasks/{id}/result}, which moves the task to
      * {@link #completedTaskQueue}.
      *
-     * <p>Returns {@code null} (and restores the interrupt flag) if the thread is
-     * interrupted while waiting.
+     * <p>Returns {@code null} once a stop has been requested ({@link #requestStop()}),
+     * which it notices within 200 ms, discarding any result that arrives from then on (even
+     * one already waiting in the queue). It also returns {@code null}, restoring the
+     * interrupt flag, if the thread is interrupted while waiting. Either way the default
+     * {@link SteadyStateAlgorithm#run()} loop ends.
+     *
+     * <p>Subclasses that override this method must keep returning {@code null} after a stop:
+     * no result arrives once the stop is requested, so a plain {@code take()} would block
+     * {@code run()} forever.
      *
      * @return the completed task with objectives and constraints populated, or
-     *         {@code null} if interrupted
+     *         {@code null} if stopped or interrupted
      */
     @Override
     public T waitForComputedTask() {
         try {
-            return completedTaskQueue.take();
+            return stopRequest.takeUnlessStopped(completedTaskQueue, STOP_CHECK_INTERVAL);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;

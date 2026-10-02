@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jdisrest"
-version = "1.1.0"
+version = "1.2.0.dev0"
 description = "Python client for the jdisrest distributed evolutionary optimization framework"
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
@@ -13,6 +13,9 @@ authors = [{ name = "Jesús Galeano Brajones", email = "jgaleanobra@unex.es" }]
 dependencies = [
     "requests>=2.31",
 ]
+
+[project.scripts]
+jdisrest-worker = "jdisrest._cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "responses"]

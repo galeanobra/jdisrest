@@ -28,7 +28,8 @@ import reactor.core.publisher.Mono;
  *   "estimatedSecondsRemaining": 4322,
  *   "aliveWorkers":             23,
  *   "inFlightTasks":            15,
- *   "pendingTasks":             8
+ *   "pendingTasks":             8,
+ *   "discardedTasks":           0
  * }
  * }</pre>
  *
@@ -48,7 +49,8 @@ public class StatusController {
      *       still executing; {@code false} once it has finished. Inverse of
      *       {@code finished}.</li>
      *   <li><strong>{@code finished}</strong> — {@code true} once the algorithm has
-     *       completed all evaluations or met its stopping criterion.</li>
+     *       completed all evaluations or met its stopping criterion, or a stop has been
+     *       requested ({@code POST /api/v1/stop}, see {@link StopController}).</li>
      *   <li><strong>{@code evaluations}</strong> — cumulative number of evaluations
      *       successfully completed and recorded by the master since startup.</li>
      *   <li><strong>{@code maxEvaluations}</strong> — the total number of evaluations
@@ -69,6 +71,11 @@ public class StatusController {
      *       claimed by workers and awaiting a result or error response.</li>
      *   <li><strong>{@code pendingTasks}</strong> — number of tasks sitting in
      *       {@code pendingTaskQueue} waiting to be dispatched to a worker.</li>
+     *   <li><strong>{@code discardedTasks}</strong> — number of tasks discarded since
+     *       startup because their evaluation failed too many times (see
+     *       {@link es.unex.jdisrest.distributed.AbstractMaster#setMaxTaskFailures}). A
+     *       steadily growing value usually means a misconfigured evaluator, not bad
+     *       luck.</li>
      * </ul>
      *
      * <p>This endpoint runs on the Netty event-loop thread; all reads from

@@ -188,7 +188,8 @@ class Worker:
                     result = _coerce(evaluator.evaluate(variables))
                     # Validate here so a NaN/inf objective or a non-numeric
                     # variable is reported as an evaluation error (the master
-                    # requeues the task) instead of as an unreadable request.
+                    # requeues the task, or discards it after the failure limit)
+                    # instead of as an unreadable request.
                     body = _result_body(self.worker_id, result, int((time.time() - t0) * 1000))
                 except Exception as eval_err:
                     elapsed_ms = int((time.time() - t0) * 1000)
@@ -212,10 +213,12 @@ class Worker:
                     json=body,
                     timeout=15,
                 )
-                # 404 = master already requeued the task (watchdog kicked in mid-eval).
-                # 400/422 = master could not apply the result and has requeued the task;
-                # its body says why. Neither is a network problem, so neither counts
-                # towards the dead-master threshold. Anything else 4xx/5xx is a bug.
+                # 404 = master already requeued the task (watchdog kicked in mid-eval),
+                # or the run was stopped (POST /api/v1/stop) and late results are dropped.
+                # 400/422 = master could not apply the result and has requeued the task
+                # (or discarded it after the failure limit); its body says why. Neither is
+                # a network problem, so neither counts towards the dead-master threshold.
+                # Anything else 4xx/5xx is a bug.
                 if post_resp.status_code == 404:
                     log.warning(f"[task-{task_id}] master rejected result (already requeued)")
                 elif post_resp.status_code in (400, 422):

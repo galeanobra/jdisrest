@@ -18,8 +18,8 @@ import java.util.List;
  * <ol>
  *   <li>Generate and submit an initial set of tasks.</li>
  *   <li>Initialize progress tracking.</li>
- *   <li>While the stopping condition is not met: block until any worker returns a result,
- *       process it, and update progress.</li>
+ *   <li>While no stop has been requested and the stopping condition is not met: block
+ *       until any worker returns a result, process it, and update progress.</li>
  * </ol>
  * Concrete implementations provide the domain-specific logic (crossover, mutation, archive
  * management, etc.) through the abstract methods below.
@@ -55,7 +55,13 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
      * indefinitely if no result arrives, so the watchdog mechanism must ensure that tasks
      * assigned to dead workers are eventually re-evaluated and re-delivered.
      *
-     * @return the completed task, whose solution already has objectives and constraints set
+     * <p>Returning {@code null} ends the {@link #run()} loop. Implementations must do so once
+     * a stop has been requested ({@link #isStopRequested()}), since no result arrives after
+     * that, and may do so when the waiting thread is interrupted (restoring its interrupt
+     * flag).
+     *
+     * @return the completed task, whose solution already has objectives and constraints set,
+     *         or {@code null} if the wait ended without a result
      */
     T waitForComputedTask();
 
@@ -63,9 +69,9 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
      * Integrates a completed task result into the algorithm state (population, archive, etc.).
      *
      * <p>Called in the main algorithm thread immediately after {@link #waitForComputedTask()}
-     * returns. Implementations typically add the solution to an archive, perform environmental
-     * selection to maintain population size, and generate the next offspring task via
-     * {@link #createNewTask()}.
+     * returns. Implementations typically add the solution to an archive and perform environmental
+     * selection to maintain population size. They do not create the next task: tasks are created
+     * on demand, when a worker asks for one ({@link SteadyStateMaster#claimNextTask}).
      *
      * @param task the completed task returned by {@link #waitForComputedTask()}
      */
@@ -109,6 +115,20 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
     boolean stoppingConditionIsNotMet();
 
     /**
+     * Returns whether the run has been asked to finish before its stopping criterion
+     * ({@code POST /api/v1/stop}). The loop in {@link #run()} exits as soon as this method
+     * returns {@code true}, whatever {@link #stoppingConditionIsNotMet()} says.
+     *
+     * <p>{@code false} by default, for implementations that cannot be stopped;
+     * {@link AbstractMaster#isStopRequested()} overrides it for every master.
+     *
+     * @return {@code true} once a stop has been requested
+     */
+    default boolean isStopRequested() {
+        return false;
+    }
+
+    /**
      * Initializes algorithm progress counters and notifies observers before the main loop
      * starts. Called once, immediately after {@link #submitInitialTasks(List)}.
      */
@@ -142,14 +162,22 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
      * <ol>
      *   <li>Create and enqueue initial tasks.</li>
      *   <li>Initialize progress tracking.</li>
-     *   <li>Repeat until the stopping condition is met:
+     *   <li>Repeat until a stop is requested ({@link #isStopRequested()}) or the stopping
+     *       condition is met:
      *     <ol>
-     *       <li>Block until a worker returns a result ({@link #waitForComputedTask()}).</li>
+     *       <li>Block until a worker returns a result ({@link #waitForComputedTask()}); stop
+     *           if it returns {@code null}.</li>
      *       <li>Process the result ({@link #processComputedTask(ParallelTask)}).</li>
      *       <li>Update progress counters ({@link #updateProgress()}).</li>
      *     </ol>
      *   </li>
      * </ol>
+     *
+     * <p>A {@code null} from {@link #waitForComputedTask()} ends the loop like a normal
+     * finish. After a stop that is the intended outcome; after an interrupt of the algorithm
+     * thread the caller can tell the difference only through
+     * {@code Thread.currentThread().isInterrupted()}, and the master keeps serving tasks
+     * unless {@link #stoppingConditionIsNotMet()} has become {@code false}.
      *
      * <p>Concrete classes may override this method to inject additional logic (e.g., recording
      * the wall-clock start time), but must call {@code super.run()} or replicate this loop.
@@ -159,8 +187,11 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
         submitInitialTasks(initialTasks);
 
         initProgress();
-        while (stoppingConditionIsNotMet()) {
+        while (!isStopRequested() && stoppingConditionIsNotMet()) {
             T computedTask = waitForComputedTask();
+            if (computedTask == null) {
+                break;  // stopped or interrupted while waiting: nothing to process
+            }
             processComputedTask(computedTask);
             updateProgress();
         }

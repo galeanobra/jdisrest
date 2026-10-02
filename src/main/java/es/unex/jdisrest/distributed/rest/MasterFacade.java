@@ -57,7 +57,8 @@ public class MasterFacade {
      * Total number of evaluations that have been successfully completed and
      * accepted since the master started. Incremented by {@link #submitResult}
      * only when the underlying master confirms the result was accepted (i.e. the
-     * task had not already been requeued by the watchdog).
+     * task had not already been requeued by the watchdog, and no stop had been
+     * requested), so it stops growing once the run is stopped.
      */
     private static final AtomicLong totalEvaluations    = new AtomicLong(0);
 
@@ -77,6 +78,15 @@ public class MasterFacade {
      * {@link #writeStatusFile()} to compute {@code progress} and ETA.
      */
     private static final AtomicInteger maxEvaluations  = new AtomicInteger(-1);
+
+    /**
+     * Reads and changes the configuration of the running algorithm for
+     * {@link ConfigController}. {@code null} until the program registers one with
+     * {@link #setConfigurationHandler}; while it is {@code null}, {@code /api/v1/config}
+     * answers {@code 501 Not Implemented}. {@code volatile} because it is set by the
+     * program's thread and read by REST threads.
+     */
+    private static volatile ConfigurationHandler configurationHandler;
 
     /**
      * The {@link Instant} at which {@link #init} was called, i.e. the moment
@@ -216,7 +226,8 @@ public class MasterFacade {
                 etaSeconds,
                 aliveWorkerCount(Timings.WORKER_TIMEOUT_S),
                 inFlightCount(),
-                pendingTasks
+                pendingTasks,
+                discardedTaskCount()
         );
     }
 
@@ -311,7 +322,8 @@ public class MasterFacade {
      * inside the active master, unblocking the algorithm thread that is waiting
      * for computed results. The evaluation counter is incremented only if the
      * master confirms the result was accepted (i.e. the task had not already been
-     * requeued by the watchdog while the worker was evaluating).
+     * requeued by the watchdog while the worker was evaluating, and no stop had been
+     * requested).
      *
      * <p><strong>Important:</strong> the caller ({@link TaskController#submitResult})
      * must write the objectives and constraints directly into the
@@ -323,7 +335,8 @@ public class MasterFacade {
      * @param workerId the identifier of the submitting worker (for logging)
      * @return {@code true} if the result was accepted; {@code false} if the task
      *         was no longer in {@code inFlightTasks} (watchdog had already
-     *         requeued it)
+     *         requeued it) or a stop has been requested, in which case the result is
+     *         dropped and not counted
      * @throws IllegalStateException if neither master instance is available
      */
     public static boolean submitResult(long taskId, String workerId) {
@@ -341,9 +354,11 @@ public class MasterFacade {
      * before calling {@link #submitResult}.
      *
      * <p>The solution object stays on the master throughout the entire evaluation
-     * cycle — workers never send variables back, only objectives and constraints.
-     * Writing directly into the map entry avoids an extra copy and keeps the
-     * solution reference stable across the three-stage pipeline.
+     * cycle: workers receive a copy of its variables and send back objectives,
+     * constraints and, optionally, a repaired decision vector, which
+     * {@link TaskController} copies into it. Writing directly into the map entry avoids
+     * an extra copy and keeps the solution reference stable across the three-stage
+     * pipeline.
      *
      * @return the live {@link ConcurrentHashMap} mapping task id to in-flight task
      * @throws IllegalStateException if neither master instance is available
@@ -460,21 +475,52 @@ public class MasterFacade {
     }
 
     /**
-     * Immediately requeues an in-flight task back to {@code pendingTaskQueue}.
+     * Returns how many tasks the active master has discarded after too many failed
+     * evaluations (see {@link es.unex.jdisrest.distributed.AbstractMaster#failInFlightTask}).
      *
-     * <p>Called by {@link TaskController#reportError} when a worker explicitly
-     * reports an evaluation failure. This is faster than waiting for the
-     * {@link WatchdogScheduler} to detect the problem after its 45-second
-     * timeout. If the {@code taskId} is not present in {@code inFlightTasks}
-     * (e.g. already requeued by a concurrent watchdog cycle) the call is a
-     * no-op.
-     *
-     * @param taskId the identifier of the task to requeue
+     * @return discarded tasks; {@code 0} if no master is set
      */
-    public static void requeueInFlightTask(long taskId) {
-        if (ss() != null) { ss().requeueInFlightTask(taskId); return; }
-        if (g() != null)  {  g().requeueInFlightTask(taskId); return; }
+    public static long discardedTaskCount() {
+        if (ss() != null) return ss().getDiscardedTaskCount();
+        if (g() != null) return g().getDiscardedTaskCount();
+        return 0L;
+    }
+
+    /**
+     * Records a failed evaluation of an in-flight task, which is requeued at once or, after
+     * too many failures, discarded (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#failInFlightTask}).
+     *
+     * <p>Called by {@link TaskController} when a worker reports an evaluation error,
+     * sends a result the master rejects, or the task cannot be serialized. This is
+     * faster than waiting for the {@link WatchdogScheduler} to detect the problem after
+     * its 45-second timeout. If the {@code taskId} is not present in
+     * {@code inFlightTasks} (e.g. already requeued by a concurrent watchdog cycle) the
+     * call is a no-op.
+     *
+     * @param taskId the identifier of the task whose evaluation failed
+     * @throws IllegalStateException if neither master instance is available
+     */
+    public static void failInFlightTask(long taskId) {
+        if (ss() != null) { ss().failInFlightTask(taskId); return; }
+        if (g() != null)  {  g().failInFlightTask(taskId); return; }
         throw new IllegalStateException("No master instance available");
+    }
+
+    /**
+     * Records a failed evaluation of an in-flight task.
+     *
+     * @param taskId the identifier of the task whose evaluation failed
+     * @throws IllegalStateException if neither master instance is available
+     * @deprecated since 1.2.0, renamed to {@link #failInFlightTask(long)}, to which it
+     *             delegates. The task is no longer requeued unconditionally: the call
+     *             counts as a failed evaluation and discards the task once it reaches the
+     *             master's failure limit
+     *             ({@link es.unex.jdisrest.distributed.AbstractMaster#setMaxTaskFailures}).
+     */
+    @Deprecated(since = "1.2.0")
+    public static void requeueInFlightTask(long taskId) {
+        failInFlightTask(taskId);
     }
 
     /**
@@ -501,8 +547,9 @@ public class MasterFacade {
     }
 
     /**
-     * Returns {@code true} if the algorithm has completed all its evaluations or
-     * otherwise reached its termination criterion.
+     * Returns {@code true} if the algorithm has completed all its evaluations,
+     * otherwise reached its termination criterion, or been asked to stop
+     * ({@link #requestStop()}).
      *
      * <p>Used by {@link TaskController#getNextTask} to return {@code 410 Gone}
      * and signal workers to shut down.
@@ -514,6 +561,58 @@ public class MasterFacade {
         if (ss() != null) return ss().isFinished();
         if (g() != null) return g().isFinished();
         return false;
+    }
+
+    /**
+     * Asks the active master to finish now, as if it had met its stopping criterion
+     * (see {@link es.unex.jdisrest.distributed.AbstractMaster#requestStop()}): from then
+     * on {@link #isFinished()} is {@code true} and results still in flight are refused.
+     * Used by {@link StopController}; repeated calls are harmless.
+     *
+     * @return {@code true} if a master is running; {@code false} if no master instance is set
+     */
+    public static boolean requestStop() {
+        boolean active = true;
+        if (ss() != null) ss().requestStop();
+        else if (g() != null) g().requestStop();
+        else active = false;
+        return active;
+    }
+
+    /**
+     * Updates the evaluation budget reported by {@code GET /api/v1/status} and
+     * {@code status.json} when it changes while the run goes on (for example, after a new
+     * configuration is applied through {@link ConfigController}), so that
+     * {@code progress} and the ETA follow the new budget. Unlike {@link #init} it may be
+     * called any number of times and does not touch the start time.
+     *
+     * @param maxEvals the new maximum number of evaluations; a value of {@code 0} or less
+     *                 marks the budget as unknown ({@code progress} is then {@code 0})
+     */
+    public static void setMaxEvaluations(int maxEvals) {
+        maxEvaluations.set(maxEvals);
+    }
+
+    /**
+     * Registers the object that reads and changes the configuration of the running algorithm
+     * for {@link ConfigController}. The program that builds the algorithm registers it,
+     * because only it knows how the configuration maps to the algorithm. A later call
+     * replaces the handler.
+     *
+     * @param handler the handler, or {@code null} to disable {@code /api/v1/config} (it then
+     *                answers {@code 501 Not Implemented})
+     */
+    public static void setConfigurationHandler(ConfigurationHandler handler) {
+        configurationHandler = handler;
+    }
+
+    /**
+     * Returns the handler registered with {@link #setConfigurationHandler}.
+     *
+     * @return the handler, or {@code null} if none is registered
+     */
+    public static ConfigurationHandler configurationHandler() {
+        return configurationHandler;
     }
 
     /**

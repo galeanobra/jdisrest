@@ -110,7 +110,8 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
                 // by the master, splitting by component for CompositeSolution. Then
                 // evaluate (may take minutes or hours — the heartbeat runs independently).
                 // A failure in either step is an evaluation error, not a master problem:
-                // report it so the master requeues the task, and move on.
+                // report it so the master requeues the task (or discards it after the
+                // failure limit), and move on.
                 S solution = problem.createSolution();
                 long start = System.currentTimeMillis();
                 long elapsed;
@@ -220,13 +221,15 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 404) {
-            // The master no longer expects this result (the watchdog already requeued it).
-            Log.warn("Master rejected result for taskId " + taskId
-                    + " (already requeued by watchdog)");
+            // The master no longer expects this result (the watchdog already requeued it,
+            // or the run was stopped and the master drops late results).
+            Log.warn("Master no longer holds task " + taskId
+                    + " (requeued by the watchdog, or the run was stopped)");
         } else if (response.statusCode() == 400 || response.statusCode() == 422) {
             // The master could not apply the result (e.g. a NaN objective) and has
-            // requeued the task. This is an evaluation problem, not a dead master:
-            // log the reason and carry on with the next task.
+            // requeued the task (or discarded it after the failure limit). This is an
+            // evaluation problem, not a dead master: log the reason and carry on with
+            // the next task.
             Log.warn("Master rejected result for taskId " + taskId + ": " + response.body());
         } else if (response.statusCode() != 200) {
             throw new RuntimeException("Unexpected status " + response.statusCode()
@@ -236,7 +239,8 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
 
     /**
      * POST /api/v1/tasks/{taskId}/error
-     * Tells the master the evaluation failed so it requeues the task at once.
+     * Tells the master the evaluation failed so it requeues the task at once (or discards
+     * it after the failure limit).
      */
     private void reportError(long taskId, String message) throws Exception {
         String body = mapper.writeValueAsString(Map.of(

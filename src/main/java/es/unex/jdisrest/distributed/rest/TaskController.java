@@ -44,8 +44,9 @@ import java.util.stream.Collectors;
  *       {@code completedTaskQueue}.</li>
  *   <li>If evaluation fails, worker calls {@code POST /{id}/error} — master
  *       requeues the task to {@code pendingTaskQueue} immediately, without
- *       waiting for the watchdog timeout. A result that fails validation (or
- *       cannot be decoded) follows the same path.</li>
+ *       waiting for the watchdog timeout, or discards it once it has failed
+ *       too many times. A result that fails validation (or cannot be decoded)
+ *       follows the same path.</li>
  * </ol>
  *
  * <p>Variable encodings: the decision vector travels as a flat list of JSON
@@ -114,12 +115,13 @@ public class TaskController {
             try {
                 return ResponseEntity.ok(toPayload(task.getIdentifier(), task.getContents()));
             } catch (IllegalArgumentException e) {
-                // Unsupported solution type: the task is already in flight, so put it
-                // back instead of stranding it, and make the misconfiguration visible.
+                // Unsupported solution type: the task is already in flight, so hand it
+                // back (it counts as a failed evaluation) instead of stranding it, and
+                // make the misconfiguration visible.
                 // SteadyStateEvolutionaryAlgorithm.run() rejects such problems up front;
                 // this only guards other masters.
                 Log.error("[task-" + task.getIdentifier() + "] Cannot serialize solution: " + e.getMessage());
-                MasterFacade.requeueInFlightTask(task.getIdentifier());
+                MasterFacade.failInFlightTask(task.getIdentifier());
                 return ResponseEntity.<TaskPayload>internalServerError().build();
             }
         }).subscribeOn(Schedulers.boundedElastic());
@@ -140,13 +142,16 @@ public class TaskController {
      * <ul>
      *   <li>{@code 200 OK} — result accepted and recorded.</li>
      *   <li>{@code 404 Not Found} — {@code taskId} is no longer in
-     *       {@code inFlightTasks}; the watchdog already requeued it because the
-     *       worker took too long. The result is discarded.</li>
+     *       {@code inFlightTasks}, because the watchdog already requeued it (the
+     *       worker took too long), or the run has been stopped
+     *       ({@code POST /api/v1/stop}) and no more results are needed. The result
+     *       is discarded.</li>
      *   <li>{@code 422 Unprocessable Content} — the payload is well-formed JSON
      *       but cannot be applied: wrong number of objectives or constraints, a
      *       {@code null}, {@code NaN} or infinite value, or a decision vector that
-     *       does not fit the solution. The task is requeued as if the worker had
-     *       reported an evaluation error, and the body is a
+     *       does not fit the solution. The task is handled as if the worker had
+     *       reported an evaluation error (requeued, or discarded after too many
+     *       failures), and the body is a
      *       {@link TaskRejectionPayload} explaining the rejection.</li>
      * </ul>
      *
@@ -176,8 +181,8 @@ public class TaskController {
             String reason = rejectionReason(result, solution);
             if (reason != null) {
                 Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId()
-                    + ": " + reason + " — requeueing");
-                MasterFacade.requeueInFlightTask(taskId);
+                    + ": " + reason + " — counted as a failed evaluation");
+                MasterFacade.failInFlightTask(taskId);
                 return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, reason));
             }
 
@@ -199,7 +204,8 @@ public class TaskController {
             }
 
             // Move the task from inFlightTasks → completedTaskQueue.
-            // Returns false if the watchdog already removed it since our null-check above.
+            // Returns false if the watchdog already removed it since our null-check above,
+            // or if a stop has been requested (the result is then dropped).
             boolean accepted = MasterFacade.submitResult(taskId, result.workerId());
             return accepted
                 ? ResponseEntity.<TaskRejectionPayload>ok().build()
@@ -211,8 +217,9 @@ public class TaskController {
      * Endpoint for a worker to report that evaluation of a task has failed.
      *
      * <p>On receiving this call, the master immediately requeues the task back into
-     * {@code pendingTaskQueue} via {@link MasterFacade#requeueInFlightTask}, so
-     * another available worker can retry it. This is faster than waiting for the
+     * {@code pendingTaskQueue} via {@link MasterFacade#failInFlightTask}, so
+     * another available worker can retry it, unless the task has now failed too
+     * many times and is discarded. This is faster than waiting for the
      * {@link WatchdogScheduler} to detect a silent worker after its 45-second
      * timeout.
      *
@@ -231,8 +238,9 @@ public class TaskController {
         return Mono.<ResponseEntity<Void>>fromCallable(() -> {
             Log.warn("[task-" + taskId + "] Evaluation error from " + error.workerId()
                 + ": " + error.errorMessage());
-            // Requeue immediately so the task is not lost until the next watchdog cycle.
-            MasterFacade.requeueInFlightTask(taskId);
+            // Requeue (or discard) at once so the task is not stranded until the next
+            // watchdog cycle.
+            MasterFacade.failInFlightTask(taskId);
             return ResponseEntity.<Void>ok().build();
         }).subscribeOn(Schedulers.boundedElastic());
     }
@@ -247,7 +255,8 @@ public class TaskController {
      * task would stay in {@code inFlightTasks} forever: the worker is alive and
      * keeps sending heartbeats, so the watchdog never requeues it. When the
      * request targets {@code /{taskId}/result} or {@code /{taskId}/error}, the
-     * task is requeued as if the worker had reported an evaluation error. The
+     * task is handled as if the worker had reported an evaluation error (requeued,
+     * or discarded after too many failures). The
      * response keeps Spring's status code and carries a
      * {@link TaskRejectionPayload} explaining what was wrong.
      *
@@ -266,8 +275,8 @@ public class TaskController {
             return Mono.just(ResponseEntity.status(ex.getStatusCode()).body(new TaskRejectionPayload(-1, reason)));
         }
         return Mono.<ResponseEntity<TaskRejectionPayload>>fromCallable(() -> {
-            Log.warn("[task-" + taskId + "] " + reason + " — requeueing");
-            MasterFacade.requeueInFlightTask(taskId);
+            Log.warn("[task-" + taskId + "] " + reason + " — counted as a failed evaluation");
+            MasterFacade.failInFlightTask(taskId);
             return ResponseEntity.status(ex.getStatusCode()).body(new TaskRejectionPayload(taskId, reason));
         }).subscribeOn(Schedulers.boundedElastic());
     }

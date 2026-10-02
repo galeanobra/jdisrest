@@ -40,6 +40,18 @@ Stateful evaluator
     Worker.from_endpoint().run(MyEvaluator("config.json"))
 
 
+Command-line worker
+-------------------
+::
+
+    python -m jdisrest --evaluator my_problem:evaluate --code-dir path/to/code --endpoint .master-endpoint
+
+evaluates with the function ``evaluate`` of ``path/to/code/my_problem.py`` until the run finishes
+(``python -m jdisrest --help`` lists the options; ``jdisrest-worker`` is the same command).
+``load_function`` and ``FunctionEvaluator`` do the same from Python, and ``add_worker_arguments``,
+``configure_logging`` and ``run_worker`` serve worker command lines of your own.
+
+
 Monitor progress (from a separate terminal)
 -------------------------------------------
 ::
@@ -51,8 +63,11 @@ Monitor progress (from a separate terminal)
           f"({status['progress']*100:.1f}%) — ETA {status['estimatedSecondsRemaining']}s")
 """
 
+from ._cli import add_worker_arguments, configure_logging, run_worker
+from ._loader import FunctionEvaluator, load_function
 from ._types import EvalResult, Evaluator, Variables
 from ._worker import Worker
 
-__all__ = ["Worker", "EvalResult", "Evaluator", "Variables"]
-__version__ = "1.1.0"
+__all__ = ["Worker", "EvalResult", "Evaluator", "Variables", "FunctionEvaluator", "load_function",
+           "add_worker_arguments", "configure_logging", "run_worker"]
+__version__ = "1.2.0.dev0"

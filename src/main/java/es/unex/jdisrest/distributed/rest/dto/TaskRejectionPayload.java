@@ -8,9 +8,10 @@ package es.unex.jdisrest.distributed.rest.dto;
  * constraints, non-finite or {@code null} values, a decision vector that does
  * not fit the solution), and with {@code 400 Bad Request} when the body could
  * not be decoded at all (for example a bare {@code NaN} token, which is not
- * valid JSON). In both cases the master has already requeued the task, exactly
- * as if the worker had called {@code POST /api/v1/tasks/{taskId}/error}: the
- * worker should log {@code reason} and move on to the next task.
+ * valid JSON). In both cases the master has already handled the task exactly
+ * as if the worker had called {@code POST /api/v1/tasks/{taskId}/error}
+ * (requeued, or discarded once it has failed too many times): the worker
+ * should log {@code reason} and move on to the next task.
  *
  * @param taskId the task whose result was rejected; {@code -1} if it could not
  *               be determined from the request path
