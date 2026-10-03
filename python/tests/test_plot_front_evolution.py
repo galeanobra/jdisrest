@@ -1,5 +1,6 @@
 """tools/plot_front_evolution.py, which plots the archive snapshots of a run (skipped without numpy or matplotlib)."""
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,6 +17,8 @@ sys.modules[_SPEC.name] = plot_front_evolution
 _SPEC.loader.exec_module(plot_front_evolution)
 
 OUTPUTS = ["front_evolution.gif", "front_evolution.png", "front_evolution_grid.png"]
+# The traces TraceWriter writes for each shape of solution (TraceWriterTest pins them on the Java side).
+GOLDEN = Path(__file__).parent / "data" / "traces"
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -139,6 +142,18 @@ def test_wrong_number_of_labels_stops_the_script(run):
 
     with pytest.raises(SystemExit, match="1 labels given for 2 objectives"):
         plot_front_evolution.main([str(run), "--labels", "cost"])
+
+
+@pytest.mark.parametrize("shape", sorted(path.name for path in GOLDEN.iterdir()))
+def test_the_traces_of_every_encoding_are_plotted(run, shape):
+    for path in (GOLDEN / shape).iterdir():
+        shutil.copy(path, run / "traces")
+
+    fronts = plot_front_evolution.load_fronts(run / "traces", 100, None)
+    plot_front_evolution.main([str(run), "--step", "100"])
+
+    assert fronts[100].tolist() == [[1.0e-4, 4.0], [2.0, 1.0], [3.0, 3.0]]
+    assert _outputs(run) == OUTPUTS
 
 
 @pytest.mark.parametrize("step", ["0", "-1000", "ten"])

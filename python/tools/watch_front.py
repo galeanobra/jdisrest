@@ -22,11 +22,14 @@ and flat traces carry no constraint values, so infeasible solutions are summariz
 others. The default archive prefers feasible solutions (``DominanceWithConstraintsComparator``),
 so with it they only appear in the snapshots taken before the first feasible solution was found.
 
-Trace formats. An ``aFUN`` row holds the objectives separated by commas. An ``aVAR`` row holds the
-variables separated by commas (jMetal's ``SolutionListOutput``, flat solutions) or, for composite
-solutions, is a ``CompositeSolutionListOutput`` row ``v0 v1 ...,[o0  o1],[c0  c1]`` whose variables
-are the space-separated text before the first ``,[``. Every value is read as a float, so integer
-variables are saved as ``3.0``.
+Trace formats. An ``aFUN`` row holds the objectives separated by commas. An ``aVAR`` row holds one
+value per variable, separated by commas (jMetal's ``SolutionListOutput``, flat solutions) or, for
+composite solutions, is a ``CompositeSolutionListOutput`` row ``v0 v1 ...,[o0  o1],[c0  c1]`` whose
+variables are the space-separated text before the first ``,[``. A binary variable is written as its
+bit string, bit 0 first (``00110``). The variables are only shown and saved, never computed with, so
+those written with digits only, integers and bit strings, are kept as they are written (``3``,
+``00110``); the others, real variables, are read as floats and shown and saved like the objectives
+(Java always writes a real with a point or an exponent, so it is never taken for an integer).
 
 It also saves the statistics of every snapshot, in order, to the output folder (``--output-dir``,
 by default the parent of the traces folder):
@@ -120,7 +123,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Iterable, List, Mapping, Sequence
+from typing import Callable, Iterable, List, Mapping, Sequence, TypeVar, Union
 
 ARCHIVE_TRACE = re.compile(r"aFUN_(\d+)\.csv")
 ANY_TRACE = re.compile(r"a?(?:VAR|FUN)_(\d+)\.csv")
@@ -147,6 +150,11 @@ MIN_INTERVAL_SECONDS = SETTLE_SECONDS
 ENCODING = "utf-8"
 
 Row = List[float]
+# A variable of an aVAR trace: the text of an integer or a bit string, or the value of a real.
+Variable = Union[str, float]
+# What read_variable_rows keeps as text: digits only, with an optional sign.
+DIGITS = re.compile(r"[+-]?[0-9]+")
+T = TypeVar("T")
 
 
 @dataclass
@@ -156,7 +164,7 @@ class Extreme:
     objectives: Row
     row: int
     ties: int
-    variables: Row
+    variables: list[Variable]
 
 
 @dataclass
@@ -296,6 +304,26 @@ def read_rows(path: Path) -> list[Row]:
     ``v0 v1 ...,[o0  o1],[c0  c1]``, the variables separated by spaces before the first ``,[``.
     Raises ValueError if it is incomplete or malformed; the message names the file and the line.
     """
+    return _read_trace(path, float)
+
+
+def read_variable_rows(path: Path) -> list[list[Variable]]:
+    """
+    Reads an ``aVAR`` trace like ``read_rows``, but keeps as text the values written with digits
+    only, an optional sign first: integers and the bit strings of binary variables, which as numbers
+    would lose their leading zeros (``001001`` would be read as 1001). The other values, real
+    variables, are read as floats, and anything else is malformed.
+    """
+    return _read_trace(path, _variable)
+
+
+def _variable(text: str) -> Variable:
+    text = text.strip()
+    return text if DIGITS.fullmatch(text) else float(text)
+
+
+def _read_trace(path: Path, value: Callable[[str], T]) -> list[list[T]]:
+    """The rows of a trace with each field read by ``value``; see ``read_rows``."""
     text = path.read_text(encoding=ENCODING)
     if text and not text.endswith("\n"):
         raise ValueError(f"{path.name} is still being written")
@@ -303,7 +331,7 @@ def read_rows(path: Path) -> list[Row]:
     for line_number, line in enumerate(text.splitlines(), 1):
         if line.strip():
             try:
-                rows.append([float(value) for value in _fields(line)])
+                rows.append([value(field) for field in _fields(line)])
             except ValueError as error:
                 raise ValueError(f"{path.name} line {line_number}: {error}") from None
     if len({len(row) for row in rows}) > 1:
@@ -508,7 +536,7 @@ def summarize(traces: Path, evaluations: int, reference: Reference | None = None
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise ValueError(f"aFUN_{evaluations}.csv changed while being read")
     written = after.st_mtime
-    variables = read_rows(traces / f"aVAR_{evaluations}.csv")
+    variables = read_variable_rows(traces / f"aVAR_{evaluations}.csv")
     if len(variables) != len(rows):
         raise ValueError(f"aVAR_{evaluations}.csv and aFUN_{evaluations}.csv have different lengths")
     front = non_dominated(rows)
@@ -539,6 +567,11 @@ def number(value: float) -> str:
     return format(value + 0.0, ".6g")  # + 0.0 turns -0.0 into 0.0
 
 
+def variable_text(variable: Variable, format_number: Callable[[float], str]) -> str:
+    """A variable read by ``read_variable_rows``: its text as written, or its value formatted."""
+    return variable if isinstance(variable, str) else format_number(variable)
+
+
 def format_summary(summary: Summary, labels: Sequence[str], previous: Summary | None,
                    show_variables: bool = False) -> str:
     """The text printed for a snapshot: its extremes, best compromise, means and indicators."""
@@ -563,7 +596,8 @@ def format_summary(summary: Summary, labels: Sequence[str], previous: Summary | 
         ties = f" ({extreme.ties} {tie_note})" if extreme.ties > 1 else ""
         lines.append(row(name, [number(v) for v in extreme.objectives], f"row {extreme.row}{ties}"))
         if show_variables:
-            lines.append(f"  {'':{name_width}}  variables: {', '.join(number(v) for v in extreme.variables)}")
+            lines.append(f"  {'':{name_width}}  variables: "
+                         f"{', '.join(variable_text(v, number) for v in extreme.variables)}")
     lines.append(row("mean", [number(v) for v in summary.means]))
     if previous is not None and previous.means:
         changes = [f"{current - before:+.4g}" for current, before in zip(summary.means, previous.means)]
@@ -631,7 +665,7 @@ class Recorder:
                 special.append((COMPROMISE, summary.compromise))
             self._append(self.extremes, ["evaluations", "extreme_of", "row", "ties", *labels, *variables],
                          [[summary.evaluations, label, extreme.row, extreme.ties,
-                           *map(_value, extreme.objectives), *map(_value, extreme.variables)]
+                           *map(_value, extreme.objectives), *(variable_text(v, _value) for v in extreme.variables)]
                           for label, extreme in special], summary.evaluations)
             self.aggregated.save()
             if summary.indicators is not None:

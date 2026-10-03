@@ -253,7 +253,7 @@ jdisrest/
 │   ├── pyproject.toml            # PEP 621 metadata
 │   ├── jdisrest/                 # Worker-side Python package and command-line worker
 │   ├── tools/                    # Trace tools (watch_front.py, plot_front_evolution.py)
-│   └── tests/                    # pytest suite for the client and the tools
+│   └── tests/                    # pytest suite for the client and the tools; golden traces in data/
 └── docs/
     └── DEVELOPER_MANUAL.md       # Developer manual
 ```

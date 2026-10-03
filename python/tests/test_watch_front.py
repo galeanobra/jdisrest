@@ -5,6 +5,7 @@ import itertools
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +19,22 @@ _SPEC = importlib.util.spec_from_file_location("watch_front", Path(__file__).par
 watch_front = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = watch_front  # dataclasses look the module up while it runs
 _SPEC.loader.exec_module(watch_front)
+
+
+# The traces TraceWriter writes for each shape of solution (TraceWriterTest pins them on the Java side).
+GOLDEN = Path(__file__).parent / "data" / "traces"
+BITS_30 = ["000000000000000000000000000101", "110010000000000000000000000001"]
+# The variables of the two solutions of each golden front, as front_extremes.csv saves them.
+GOLDEN_FRONTS = {
+    "double": (["0.25", "1e-05"], ["-3.5", "2.5"]),
+    "int": (["3", "-7", "0"], ["10", "2", "-10"]),
+    "binary": ([BITS_30[0], "00000", "1"], [BITS_30[1], "00110", "0"]),
+    "int-double": (["3", "-7", "0.25"], ["10", "2", "1e-05"]),
+    "int-binary": (["3", "-7", "00000101", "000"], ["10", "2", "11000000", "010"]),
+    "double-binary": (["0.25", "1e-05", "00110"], ["-3.5", "2.5", "10000"]),
+    "int-double-binary": (["3", "-7", "0.25", "101", "00110"], ["10", "2", "1e-05", "000", "00000"]),
+    "binary-binary": (["0101", "10", "000000"], ["0000", "01", "111000"]),
+}
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -118,6 +135,29 @@ def test_composite_variable_rows_are_read_up_to_their_objectives(traces):
 
     assert watch_front.read_rows(path) == [[3.0, 4.0, 0.5], [5.0, 6.0, 0.25]]
     assert watch_front.read_points(path) == [[3.0, 4.0, 0.5], [5.0, 6.0, 0.25]]
+
+
+def test_variables_written_with_digits_only_are_read_as_text(traces):
+    path = traces / "aVAR_100.csv"
+    path.write_text("001001,100,0\n000000,111,1\n")
+
+    assert watch_front.read_variable_rows(path) == [["001001", "100", "0"], ["000000", "111", "1"]]
+    assert watch_front.read_rows(path) == [[1001.0, 100.0, 0.0], [0.0, 111.0, 1.0]]  # how 1.2.1 read them
+
+
+def test_real_variables_are_read_as_floats_next_to_integers_and_bit_strings(traces):
+    path = traces / "aVAR_100.csv"
+    path.write_text("3 -7 0.25 1.0E-5 00110,[1.0  2.0],[]\n+4 0 -0.0 2.0 11111,[2.0  1.0],[-1.0]\n")
+
+    assert watch_front.read_variable_rows(path) == [["3", "-7", 0.25, 1e-05, "00110"], ["+4", "0", -0.0, 2.0, "11111"]]
+
+
+def test_a_variable_that_is_neither_digits_nor_a_number_is_rejected_with_its_file_and_line(traces):
+    path = traces / "aVAR_100.csv"
+    path.write_text("101,0.5\n10b,0.5\n")
+
+    with pytest.raises(ValueError, match="aVAR_100.csv line 2"):
+        watch_front.read_variable_rows(path)
 
 
 def test_read_points_accepts_commas_and_spaces(traces):
@@ -257,7 +297,43 @@ def test_a_snapshot_of_composite_solutions_is_saved_with_its_variables(traces):
 
     extremes = _csv(traces.parent / "front_extremes.csv")
     assert extremes[0][-3:] == ["x1", "x2", "x3"]
-    assert extremes[1][-3:] == ["3.0", "4.0", "0.5"]
+    assert extremes[1][-3:] == ["3", "4", "0.5"], "integers as written, reals as before"
+
+
+def test_real_variables_are_shown_with_six_digits_and_saved_in_full_as_before(traces, capsys):
+    (traces / "aFUN_100.csv").write_text("1.0,2.0\n2.0,1.0\n")
+    (traces / "aVAR_100.csv").write_text("3 0.123456789 1.0 00110,[1.0  2.0],[]\n5 -2.5E-7 2.0 11111,[2.0  1.0],[]\n")
+
+    assert watch_front.main([str(traces), "--once", "--variables"]) == 0
+
+    first, second = ["3", "0.123456789", "1.0", "00110"], ["5", "-2.5e-07", "2.0", "11111"]
+    extremes = _csv(traces.parent / "front_extremes.csv")
+    assert [row[-4:] for row in extremes[1:]] == [first, second, first], "reals saved in full, as 1.2.1 saved them"
+    shown = [line.split("variables: ")[1] for line in capsys.readouterr().out.splitlines() if "variables: " in line]
+    first, second = "3, 0.123457, 1, 00110", "5, -2.5e-07, 2, 11111"
+    assert shown == [first, second, first], "reals shown with 6 significant digits, like the objectives, as 1.2.1 did"
+
+
+@pytest.mark.parametrize("shape", sorted(GOLDEN_FRONTS))
+def test_the_traces_of_every_encoding_are_saved_and_shown_with_their_variables(traces, capsys, shape):
+    for path in (GOLDEN / shape).iterdir():
+        shutil.copy(path, traces)
+
+    assert watch_front.main([str(traces), "--once", "--variables"]) == 0
+
+    first, second = GOLDEN_FRONTS[shape]
+    width = len(first)
+    extremes = _csv(traces.parent / "front_extremes.csv")
+    assert extremes[0] == ["evaluations", "extreme_of", "row", "ties", "f1", "f2", *(f"x{i + 1}" for i in range(width))]
+    assert extremes[1:] == [["100", "f1", "1", "1", "0.0001", "4.0", *first],
+                            ["100", "f2", "2", "1", "2.0", "1.0", *second],
+                            ["100", "compromise", "1", "2", "0.0001", "4.0", *first]]
+    shown = [line.split("variables: ")[1] for line in capsys.readouterr().out.splitlines() if "variables: " in line]
+    assert shown == [", ".join(first), ", ".join(second), ", ".join(first)]
+
+
+def test_golden_traces_have_a_front_for_every_shape():
+    assert sorted(path.name for path in GOLDEN.iterdir()) == sorted(GOLDEN_FRONTS)
 
 
 def test_restarting_on_the_same_folder_does_not_repeat_saved_snapshots(traces):

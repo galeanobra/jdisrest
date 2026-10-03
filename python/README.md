@@ -227,7 +227,11 @@ evaluations (`archiveSize` for PAES; `setTraceCadence` spaces the snapshots out)
 when the run ends, the archive of non-dominated solutions to `aFUN_<evaluations>.csv`
 (objectives) and `aVAR_<evaluations>.csv` (variables), and the population (for PAES, its
 archive) to `FUN_<evaluations>.csv` and `VAR_<evaluations>.csv`. The local NSGA-II writes the
-same files.
+same files. A `FUN` row holds the objectives of one solution, separated by commas. A `VAR` row
+holds its variables, one value per variable, with a binary variable as its bit string, bit 0
+first: separated by commas for flat solutions (`0.25,1.0E-5`, `3,-7` or `101,00110`), and by spaces
+for composites, followed by the objectives and the constraints
+(`3 -7 0.25 101 00110,[1.0  2.0],[0.0]`).
 
 ### `watch_front.py`
 
@@ -252,8 +256,9 @@ It writes, to `--output-dir` (by default the parent of the traces folder):
 - `front_stats.csv`: one row per snapshot with its evaluations, when its `aFUN` was written, its
   number of non-dominated solutions and the mean of each objective.
 - `front_extremes.csv`: the objectives and variables of the extremes of each snapshot, and of its
-  best compromise solution (`compromise` as `extreme_of`). Every value is read as a float, so
-  integer variables appear as `3.0`.
+  best compromise solution (`compromise` as `extreme_of`). The variables written with digits only,
+  integers and the bit strings of binary variables, are saved as they are written (`3`, `00110`),
+  and real ones like the objectives.
 - `front_indicators.csv`, with a reference: the hypervolume, IGD and IGD+ of each snapshot, and
   `front_indicators_reference.txt`, the reference they were computed with.
 - `front_reference.csv`: the aggregated front, the non-dominated solutions of every snapshot saved.
@@ -268,7 +273,7 @@ goes on where it stopped without repeating rows.
 |---|---|
 | `traces` | Traces folder of the run (the current folder). |
 | `--labels NAME ...` | Names of the objectives (`f1`, `f2`, ...). |
-| `--variables` | Also print the variables of each extreme. |
+| `--variables` | Also print the variables of each extreme: integers and bit strings as written, real ones like the objectives. |
 | `--once` | Save and show the latest snapshot, then exit; the exit status is 1 if there is no readable snapshot yet. |
 | `--interval SECONDS` | Seconds between checks of the folder, at least 2 (15). |
 | `--output-dir DIR` | Folder for the output files (the parent of the traces folder). |
