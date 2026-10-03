@@ -644,9 +644,9 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
         if (status / 100 == 2) return Outcome.ACCEPTED;
         if (status == 404) {
             // The master no longer expects this result (the watchdog already requeued it,
-            // or the run was stopped and the master drops late results).
+            // or the run is over and the master drops late results).
             Log.warn("Master no longer holds task " + taskId
-                    + " (requeued by the watchdog, or the run was stopped)");
+                    + " (requeued by the watchdog, or the run is over)");
             return Outcome.DROPPED;
         }
         if (REJECTION_STATUSES.contains(status)) {

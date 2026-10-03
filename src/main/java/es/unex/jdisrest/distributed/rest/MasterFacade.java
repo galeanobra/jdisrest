@@ -62,8 +62,9 @@ public class MasterFacade {
      * accepted since the master started. Incremented by
      * {@link #submitResult(long, String, Consumer)} only when the underlying master
      * confirms the result was accepted (i.e. the
-     * task had not already been requeued by the watchdog, and no stop had been
-     * requested), so it stops growing once the run is stopped.
+     * task had not already been requeued by the watchdog, no stop had been requested and,
+     * for a {@code SteadyStateEvolutionaryAlgorithm}, the run had not ended), so it stops
+     * growing once a stop is requested or such an algorithm has ended its run.
      */
     private static final AtomicLong totalEvaluations    = new AtomicLong(0);
 
@@ -313,8 +314,8 @@ public class MasterFacade {
      * inside the active master, unblocking the algorithm thread that is waiting
      * for computed results. The evaluation counter is incremented only if the
      * master confirms the result was accepted (i.e. the task had not already been
-     * requeued by the watchdog while the worker was evaluating, and no stop had been
-     * requested).
+     * requeued by the watchdog while the worker was evaluating, no stop had been requested
+     * and, for a {@code SteadyStateEvolutionaryAlgorithm}, the run had not ended).
      *
      * <p>The caller must have written the objectives and constraints into the
      * {@link Solution} object retrieved from {@link #inFlightTasks()} <em>before</em>
@@ -326,8 +327,9 @@ public class MasterFacade {
      * @param workerId the identifier of the submitting worker; may be {@code null}
      * @return {@code true} if the result was accepted; {@code false} if the task
      *         was no longer in {@code inFlightTasks} (watchdog had already
-     *         requeued it) or a stop has been requested, in which case the result is
-     *         dropped and not counted
+     *         requeued it), a stop has been requested or, for a
+     *         {@code SteadyStateEvolutionaryAlgorithm}, the run has ended, in which case the
+     *         result is dropped and not counted
      * @throws IllegalStateException if neither master instance is available
      */
     public static boolean submitResult(long taskId, String workerId) {
@@ -346,7 +348,8 @@ public class MasterFacade {
      * @param workerId the identifier of the submitting worker; may be {@code null}
      * @param recorder writes the result into the task's solution; called at most once
      * @return {@code true} if the result was accepted and recorded; {@code false} if the task
-     *         was not in flight or a stop has been requested
+     *         was not in flight, a stop has been requested or, for a
+     *         {@code SteadyStateEvolutionaryAlgorithm}, the run has ended
      * @throws IllegalStateException if neither master instance is available
      * @throws RuntimeException      whatever {@code recorder} throws; the task has then been
      *                               handled as a failed evaluation

@@ -71,15 +71,17 @@ class AbstractMasterTest {
     }
 
     /**
-     * A master without REST server or discovery file, whose readiness and stopping condition the
-     * test sets.
+     * A master without REST server or discovery file, whose readiness, stopping condition and end
+     * of run the test sets.
      */
     static final class TestMaster extends AbstractMaster<ParallelTask<IntegerSolution>, Void> {
         volatile boolean ready = true;
         volatile BooleanSupplier running = () -> true;
+        volatile boolean ended = false;
 
         @Override public boolean isReady() { return ready; }
         @Override public boolean stoppingConditionIsNotMet() { return running.getAsBoolean(); }
+        @Override boolean runEnded() { return ended; }
 
         long pointerOf(String workerId) {
             WorkerEntry entry = workerRegistry.get(workerId);
@@ -450,6 +452,40 @@ class AbstractMasterTest {
         assertFalse(master.submitResult(1L, "w1", t -> fail("a result after the stop is not recorded")));
         assertTrue(master.getCompletedTaskQueue().isEmpty());
         assertTrue(master.inFlightTasks.isEmpty());
+    }
+
+    @Test
+    void resultAfterTheRunHasEndedIsDroppedWithoutRecording() {
+        // Another worker's result ended the run while w2 was still evaluating task 2: nobody
+        // will process w2's result, so it gets 404 and is not counted.
+        TestMaster master = new TestMaster();
+        master.recordDispatch("w2", task(2));
+        master.ended = true;
+
+        String log = stderrOf(() -> assertFalse(
+            master.submitResult(2L, "w2", t -> fail("a result after the end is not recorded"))));
+
+        assertTrue(master.getCompletedTaskQueue().isEmpty(), "never queued: the algorithm has left its loop");
+        assertTrue(master.inFlightTasks.isEmpty(), "the task leaves flight");
+        assertEquals(-1L, master.pointerOf("w2"), "the worker is idle again");
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "not requeued either");
+        assertEquals(0, master.getDiscardedTaskCount(), "not a failed evaluation");
+        assertFalse(master.isStopRequested(), "a normal end is not turned into a stop");
+        assertEquals("", log, "dropped quietly, as after a stop");
+    }
+
+    @Test
+    void resultIsStillAcceptedWhileOnlyTheStoppingConditionIsMet() {
+        // isFinished() can be true on a REST thread before the algorithm thread has noticed it
+        // (a criterion installed with setTermination, or one that reads the clock): the loop may
+        // be waiting for this very result to notice, so refusing it could hang the run.
+        TestMaster master = new TestMaster();
+        master.recordDispatch("w1", task(1));
+        master.running = () -> false;
+
+        assertTrue(master.isFinished());
+        assertTrue(master.submitResult(1L, "w1", t -> { }), "accepted until the algorithm has left its loop");
+        assertEquals(1, master.getCompletedTaskQueue().size());
     }
 
     // ── Failures ──────────────────────────────────────────────────────────────

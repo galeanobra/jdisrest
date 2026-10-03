@@ -203,7 +203,7 @@ through (a network error, or an answer such as `500` or `502`), are reported the
 best-effort, so that the master requeues the task at once instead of keeping it in flight; the
 master counts such a report as a failed evaluation of the task if it still has the task in
 flight. The master answers `404` to a result it no longer expects (the task was requeued, or
-the run was stopped) and `400`, `413`, `415` or `422` to one it cannot apply, which already
+the run is over) and `400`, `413`, `415` or `422` to one it cannot apply, which already
 counts as a failed evaluation: for a `422`, unless another worker holds the task by then; a
 `400`, `413` or `415` counts whoever holds it, because the master cannot read the `workerId` of
 a body it has not decoded. The worker logs the answer and carries on.

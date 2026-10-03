@@ -691,7 +691,8 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      * @param taskId   the identifier of the completed task
      * @param workerId the ID of the worker submitting the result; may be {@code null}
      * @return {@code true} if the task was found and moved to the completed queue;
-     *         {@code false} if the task was not in flight or a stop has been requested
+     *         {@code false} if the task was not in flight, a stop has been requested or the
+     *         algorithm has ended its run
      */
     public boolean submitResult(long taskId, String workerId) {
         return submitResult(taskId, workerId, task -> { });
@@ -715,13 +716,14 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      *   <li>The task ID is not found in {@link #inFlightTasks}, typically because the watchdog
      *       re-enqueued it after the reporting worker was considered dead. The late result is
      *       discarded to avoid double-processing, and a warning is logged.</li>
-     *   <li>A stop has been requested ({@link #requestStop()}). The task leaves
-     *       {@link #inFlightTasks} but its result is dropped: the algorithm finishes with
-     *       the state it had when the stop was requested, and refusing the result here stops
-     *       the {@code evaluations} counter of {@code GET /api/v1/status} from growing after
-     *       the stop. Results accepted before the stop that the algorithm thread has not
-     *       taken yet (and one being recorded at the very moment the stop lands) are still
-     *       counted, then dropped.</li>
+     *   <li>A stop has been requested ({@link #requestStop()}), or the algorithm has ended its
+     *       run ({@link #runEnded()}). The task leaves {@link #inFlightTasks} but its result is
+     *       dropped: the algorithm finishes with the state it had when the stop was requested,
+     *       or has left its loop already, and refusing the result here stops the
+     *       {@code evaluations} counter of {@code GET /api/v1/status} from growing after the
+     *       stop or the end. Results accepted before then that the algorithm thread has not
+     *       taken yet (and one being recorded at that very moment) are still counted, then
+     *       dropped.</li>
      * </ul>
      *
      * <p>Whenever the task was in flight, every worker's {@link WorkerEntry#currentTaskId} that
@@ -740,7 +742,8 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      * @param recorder writes the result into the task's solution; called at most once, on the
      *                 calling thread, before the task is enqueued
      * @return {@code true} if the result was recorded and the task moved to the completed queue;
-     *         {@code false} if the task was not in flight or a stop has been requested
+     *         {@code false} if the task was not in flight, a stop has been requested or the
+     *         algorithm has ended its run
      */
     public boolean submitResult(long taskId, String workerId, Consumer<? super T> recorder) {
         T task = inFlightTasks.remove(taskId);
@@ -762,7 +765,7 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
             });
         }
 
-        if (isStopRequested()) {
+        if (isStopRequested() || runEnded()) {
             taskFailures.forget(taskId);
             return false;  // the run is over: nobody will process this result
         }
@@ -1109,6 +1112,25 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      */
     public boolean isStopRequested() {
         return stopRequest.isRequested();
+    }
+
+    /**
+     * Whether the algorithm has ended its run: {@code true} once it has left its loop for good,
+     * whatever ended it, with or without a stop. From then on
+     * {@link #submitResult(long, String, Consumer)} refuses results as it does after
+     * {@link #requestStop()}, so that a result still in flight when the run ended is answered
+     * {@code 404} and not counted, instead of being accepted into a queue nobody reads.
+     *
+     * <p>It must not become {@code true} any earlier: a stopping condition that REST threads
+     * already see met ({@link #isFinished()}) is not enough, because the loop may still be
+     * waiting for the next result to notice it. Package-private, like {@link #taskDiscarded}, so
+     * that only the framework's own algorithms override it, as
+     * {@link SteadyStateEvolutionaryAlgorithm} does; {@code false} here.
+     *
+     * @return {@code true} once the algorithm will process no more results
+     */
+    boolean runEnded() {
+        return false;
     }
 
     /**

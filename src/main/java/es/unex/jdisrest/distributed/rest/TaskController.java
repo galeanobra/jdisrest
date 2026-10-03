@@ -174,11 +174,13 @@ public class TaskController {
      * <p>Response codes:
      * <ul>
      *   <li>{@code 200 OK} — result accepted and recorded.</li>
-     *   <li>{@code 404 Not Found} — {@code taskId} is no longer in
-     *       {@code inFlightTasks}, because the watchdog already requeued it (the
-     *       worker took too long), another report for it was accepted first, or
-     *       the run has been stopped ({@code POST /api/v1/stop}) and no more
-     *       results are needed. The result is discarded.</li>
+     *   <li>{@code 404 Not Found} — the master no longer expects the result:
+     *       {@code taskId} is no longer in {@code inFlightTasks} (the watchdog
+     *       already requeued it because the worker took too long, or another report
+     *       for it was accepted first), or no more results are needed (the run was
+     *       stopped with {@code POST /api/v1/stop} or, for
+     *       {@code SteadyStateEvolutionaryAlgorithm} and its subclasses, has ended on
+     *       its stopping criterion). The result is discarded and not counted.</li>
      *   <li>{@code 422 Unprocessable Content} — the payload is well-formed JSON
      *       but cannot be applied: wrong number of objectives or constraints, a
      *       {@code null}, {@code NaN} or infinite value, or a decision vector that
@@ -215,8 +217,9 @@ public class TaskController {
             }
             try {
                 // Takes the task out of flight, records the result, moves it to the completed
-                // queue. Returns false if the task was not in flight (the watchdog or another
-                // report took it first) or a stop has been requested (the result is dropped).
+                // queue. Returns false, dropping the result, if the task was not in flight (the
+                // watchdog or another report took it first), a stop has been requested or a
+                // SteadyStateEvolutionaryAlgorithm has ended its run.
                 boolean accepted = MasterFacade.submitResult(taskId, result.workerId(),
                     claimed -> record(claimed.getContents(), result));
                 return accepted

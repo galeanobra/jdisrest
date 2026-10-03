@@ -35,6 +35,7 @@ language capable of making HTTP requests).
    - [Startup and shutdown](#startup-and-shutdown)
    - [`status.json` file](#statusjson-file)
 9. [Changes in 1.2](#9-changes-in-12)
+10. [Changes in 1.2.1](#10-changes-in-121)
 
 ---
 
@@ -207,7 +208,9 @@ Possible responses:
   404 Not Found              → the master no longer expects this result: the task was requeued (the
                                watchdog found the worker silent, or the worker asked for a new task
                                first, section 2.2), another report for it was handled first, or the
-                               run was stopped (POST /api/v1/stop)
+                               run was stopped (POST /api/v1/stop) or, with the bundled algorithms,
+                               has ended on its stopping criterion (section 8); the result is not
+                               counted
   422 Unprocessable Content  → the result is invalid (see below); the task has been requeued (or discarded)
   400 Bad Request            → the body is not valid JSON (e.g. a bare NaN); the task has been requeued (or discarded)
   413 Content Too Large      → the body is larger than the server's limit (16 MiB by default, section 5); same
@@ -235,7 +238,7 @@ A failed evaluation is a `POST /error`, a `422`, `400`, `413` or `415` answer to
 
 An evaluator that produces `NaN` for some inputs must still map it to a finite penalty itself — the master has no way to choose one, and otherwise each such solution costs `DEFAULT_MAX_TASK_FAILURES` wasted evaluations and is lost to the search. Note that Python's `json.dumps` emits `NaN` as a bare token (invalid JSON, answered with `400`) and MATLAB's `jsonencode` turns `NaN` into `null` (answered with `422`); the bundled Python client validates finiteness before sending and reports the problem through `/error` instead. Its command-line worker (section 4.2) can apply the penalty: `--non-finite-penalty X`, or `FunctionEvaluator(function, non_finite_penalty=X)` from Python, gives `X` to every objective of a result whose objectives are not all finite, and logs a warning. It is opt-in and has no default, because no value is safe for every problem: choose one worse than any valid objective.
 
-> The 404 is not a critical error: the task was requeued, or the run was stopped. The worker should log a warning and continue. The 400, 413, 415 and 422 are not network errors either: log the reason and move on to the next task. Both bundled workers treat a `2xx`, `404`, `400`, `413`, `415` or `422` answer to `/result` or `/error` as the answer of a live master, and count anything else (a `5xx`, another `4xx`, a network error) towards giving the master up as lost (section 4).
+> The 404 is not a critical error: the task was requeued, or the run is over. The worker should log a warning and continue. The 400, 413, 415 and 422 are not network errors either: log the reason and move on to the next task. Both bundled workers treat a `2xx`, `404`, `400`, `413`, `415` or `422` answer to `/result` or `/error` as the answer of a live master, and count anything else (a `5xx`, another `4xx`, a network error) towards giving the master up as lost (section 4).
 
 ### 2.4 `POST /api/v1/tasks/{taskId}/error`
 
@@ -554,7 +557,7 @@ function submit_result(masterUrl, workerId, taskId, objectives, elapsedMs)
     resp = req.send(uri, HTTPOptions('ResponseTimeout', 15));
     code = double(resp.StatusCode);
     if code == 404
-        % Requeued, or the run was stopped: the result is not needed.
+        % Requeued, or the run is over: the result is not needed.
         fprintf('[%s] task %d no longer expected by the master\n', workerId, taskId);
     elseif any(code == [400 413 415 422])
         % The master could not apply the result and has requeued (or discarded) the task.
@@ -858,7 +861,7 @@ The class path needs jdisrest, its dependencies and the problem's class. A run g
 4. The traces folder, if the file names one, receives the configuration and `configuration.log` (see below).
 5. An `AlgorithmReconfiguration` is registered, so `GET /api/v1/config` returns the configuration in use and `POST /api/v1/config` changes it (section 8).
 6. The algorithm runs until its budget is spent or `POST /api/v1/stop`, and its result is written to `VAR.csv` and `FUN.csv` (comma-separated) in the working directory; a run stopped before its first result writes them empty. The master logs `ZDT1 finished after <evaluations> evaluations: <n> solutions written to VAR.csv and FUN.csv`.
-7. The master is shut down (`shutdown()`, section 5), also when a step after the second fails: `.master-endpoint` is deleted, the REST server closes and `status.json` gets a final snapshot that reports the run as finished. Then the JVM exits. Workers that asked for a task before the close got `410` and stopped; those still evaluating find the master gone and stop after their failed heartbeats or requests, typically 10 to 25 s later (section 8, `POST /api/v1/stop`). A Python worker started from the endpoint file then finds the file deleted and exits with 0, not 3 (section 4.2).
+7. The master is shut down (`shutdown()`, section 5), also when a step after the second fails: `.master-endpoint` is deleted, the REST server closes and `status.json` gets a final snapshot that reports the run as finished. Then the JVM exits. Workers that asked for a task before the close got `410` and stopped (a result they posted after the run had ended got `404` first, and was not counted); those still evaluating find the master gone and stop after their failed heartbeats or requests, typically 10 to 25 s later (section 8, `POST /api/v1/stop`). A Python worker started from the endpoint file then finds the file deleted and exits with 0, not 3 (section 4.2).
 
 `--check` reads the file for the problem exactly as a run does (every value, the operators, which are built once, and the MOEA/D lattice size against the problem's objectives), prints `Configuration OK for <class name>: <summary>` on the standard output and exits without starting Spring, so a script can gate the submission of a job on its exit status. The exit status is 0 when a run ends (also after `POST /api/v1/stop`) or a check passes, and 1 otherwise. A usage error prints `Invalid arguments: <reason>` and the usage text (for instance `port must be an integer in [1, 65535], got '0'`); an invalid file prints `Invalid configuration: <reason>`, such as `mutation.beta must be in (1, 2), got '2'`; both go to the standard error without a stack trace. A failure while the run starts or goes on is logged as `<class name> failed: <exception>` with its stack trace, and still ends the JVM with status 1; a port already in use, for instance, gives `ZDT1 failed: java.lang.IllegalStateException: Could not start the REST server on port 8080 — Address already in use` (with the operating system's wording of the cause).
 
@@ -1128,8 +1131,9 @@ TaskController.submitResult():          [virtual thread]
   → MasterFacade.submitResult(taskId, workerId, recorder)
      → inFlightTasks.remove(taskId)     (404 if no longer in flight)
      → currentTaskId = -1 for every worker that pointed at the task
+     → if a stop is requested or the loop has ended: 404, nothing recorded
      → recorder: writes variables (optional), objectives and constraints into the solution
-     → completedTaskQueue.add(task)     (404 instead once a stop is requested)
+     → completedTaskQueue.add(task)
 
 run() loop                              [algorithm thread]
   ← waitForComputedTask()               (completedTaskQueue; null after a stop)
@@ -1310,7 +1314,7 @@ Lightweight snapshot with global progress. Meant for monitoring scripts and exte
 }
 ```
 
-`evaluations` counts the results the master has accepted; `finished` is `true` once the stopping criterion is met or a stop has been requested. Before the master is ready (section 7.5) the run is reported as running and not finished. `progress` is `evaluations / maxEvaluations`, clamped to [0, 1], and `estimatedSecondsRemaining` extrapolates it, `elapsedSeconds / progress × (1 − progress)`: it is never negative, `0` once the accepted results have reached the budget while the run has not finished yet, and `-1` until `progress` passes 1 %, once the run has finished, or before any time has elapsed. `elapsedSeconds` counts from `MasterFacade.init`, and is `0` before it. `discardedTasks` counts the tasks discarded after reaching the failure limit (section 2.3): any value above zero means some solutions could not be evaluated, and the master log names them (`[task-42] Failed evaluation 3 of 3 — discarded; its variables were [...]`). A `discardedTasks` that keeps growing while `evaluations` stays still means that every evaluation fails, for instance because the workers evaluate another problem. Fields added in later versions go last; Java clients that bind this JSON to a class with the ten fields of jdisrest 1.1 must ignore unknown properties (Jackson 2 fails on them by default); in the other direction, `StatusSnapshot` reads the JSON of a 1.1 master, which has no `discardedTasks`, as `0`.
+`evaluations` counts the results the master has accepted; `finished` is `true` once the stopping criterion is met or a stop has been requested. Before the master is ready (section 7.5) the run is reported as running and not finished. A result that arrives after a stop or, with the bundled algorithms (`SteadyStateEvolutionaryAlgorithm` and its subclasses), once the algorithm has ended its run, is refused with `404` and not counted. Results accepted while the algorithm was still processing earlier ones, and still queued when it ended, are counted although it never uses them (they show as `queuedResults` in `GET /api/v1/workers/status`), so the final `evaluations` can exceed `maxEvaluations` by those: usually none or a few while the workers together deliver results more slowly than the algorithm processes them, possibly many when they deliver them faster (cheap evaluations, many workers). `getEvaluations()`, which `ConfiguredMaster` logs, is the number of results the algorithm used. `progress` is `evaluations / maxEvaluations`, clamped to [0, 1], and `estimatedSecondsRemaining` extrapolates it, `elapsedSeconds / progress × (1 − progress)`: it is never negative, `0` once the accepted results have reached the budget while the run has not finished yet, and `-1` until `progress` passes 1 %, once the run has finished, or before any time has elapsed. `elapsedSeconds` counts from `MasterFacade.init`, and is `0` before it. `discardedTasks` counts the tasks discarded after reaching the failure limit (section 2.3): any value above zero means some solutions could not be evaluated, and the master log names them (`[task-42] Failed evaluation 3 of 3 — discarded; its variables were [...]`). A `discardedTasks` that keeps growing while `evaluations` stays still means that every evaluation fails, for instance because the workers evaluate another problem. Fields added in later versions go last; Java clients that bind this JSON to a class with the ten fields of jdisrest 1.1 must ignore unknown properties (Jackson 2 fails on them by default); in the other direction, `StatusSnapshot` reads the JSON of a 1.1 master, which has no `discardedTasks`, as `0`.
 
 ### `GET /api/v1/workers/status`
 
@@ -1478,3 +1482,13 @@ What behaves differently from jdisrest 1.1. The task payload of an integer probl
 **Configuration** (section 5)
 
 - New: configuration files for NSGA-II, PAES and MOEA/D (`es.unex.jdisrest.config`), the `ConfiguredMaster` launcher with `--check`, changes during a run through `POST /api/v1/config`, and the record of the configuration in the traces folder; the warm-start file `iVAR.csv` is copied into the traces folder.
+
+---
+
+## 10. Changes in 1.2.1
+
+What behaves differently from jdisrest 1.2.0.
+
+**Protocol and master**
+
+- A result that arrives after a steady-state run has ended on its stopping criterion gets `404` and is not counted, as after `POST /api/v1/stop`. 1.2.0 accepted and counted it although nobody processed it, so `evaluations` in `GET /api/v1/status` and `status.json` could end above `maxEvaluations` by up to one more result per worker still evaluating at the end, on top of the results still queued when the run ended; now the remaining excess is those queued results (section 8). The bundled algorithms all do this, since they extend `SteadyStateEvolutionaryAlgorithm`; a master of your own that does not extend it keeps the 1.2.0 behaviour (sections 2.3 and 8).
