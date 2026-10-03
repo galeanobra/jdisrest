@@ -112,16 +112,16 @@ public class CompositeSolutionListOutput {
      * variable is written as Java prints it, a binary one as its bit string (see the class
      * description).
      *
-     * <p>A flat solution or segment is binary when it is a {@link BinarySolution}, or when its
-     * first variable is a {@link BinarySet}; its variables must then all be {@link BinarySet}s of
-     * at least one bit, since a variable of no bits would leave an empty token that a reader cannot
-     * tell from a missing one. Any other flat solution or segment is read through
-     * {@link SolutionVariables#flatten}, with its rules and messages.
+     * <p>The encoding of a flat solution or segment is {@link SolutionVariables#encodingOf}'s. The
+     * variables of a binary one must all be {@link BinarySet}s of at least one bit, since a
+     * variable of no bits would leave an empty token that a reader cannot tell from a missing
+     * one. Any other flat solution or segment is read through {@link SolutionVariables#flatten},
+     * with its rules and messages.
      *
      * @param solution a composite or flat solution
      * @return the VAR row
-     * @throws IllegalArgumentException if the solution (or one segment) is neither binary nor of an
-     *                                  encoding {@link SolutionVariables} supports, or a variable is
+     * @throws IllegalArgumentException if the solution (or one segment) is not of an encoding
+     *                                  {@link SolutionVariables} supports, or a variable is
      *                                  {@code null}, of another type or a binary variable of no
      *                                  bits; for a composite, the message names the segment first
      *                                  and counts the positions of the variables within it
@@ -155,8 +155,8 @@ public class CompositeSolutionListOutput {
      *                                  {@code solution}
      */
     private static void addVariables(StringJoiner row, Solution<?> solution) {
-        if (!isBinary(solution)) {
-            SolutionVariables.encodingOf(solution);  // rejects a nested composite, which flatten would accept
+        // encodingOf also rejects a nested composite, which flatten would accept.
+        if (SolutionVariables.encodingOf(solution) != SolutionVariables.Encoding.BINARY) {
             for (Number value : SolutionVariables.flatten(solution)) {
                 row.add(String.valueOf(value));
             }
@@ -181,8 +181,11 @@ public class CompositeSolutionListOutput {
     }
 
     /**
-     * Whether a flat solution or segment is written as binary: it is a {@link BinarySolution}, or
-     * its first variable is a {@link BinarySet}.
+     * Whether a flat solution may be binary, decided without rejecting anything: it is a
+     * {@link BinarySolution}, or its first variable is a {@link BinarySet}. {@link TraceWriter#check}
+     * formats such a solution to check its variables; {@link #formatSolution} itself decides with
+     * {@link SolutionVariables#encodingOf}, which rejects a solution that mixes {@link BinarySet}s
+     * with other variables.
      */
     static boolean isBinary(Solution<?> solution) {
         return solution instanceof BinarySolution

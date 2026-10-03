@@ -70,7 +70,8 @@ import java.util.stream.IntStream;
  * {@link #isReady()} is {@code false} and {@link #stoppingConditionIsNotMet()} answers
  * {@code true} on REST threads without consulting the termination (see both).
  *
- * @param <S> the solution type (e.g., {@code IntegerSolution} or {@code CompositeSolution})
+ * @param <S> the solution type (e.g., {@code IntegerSolution}, {@code BinarySolution} or
+ *            {@code CompositeSolution})
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends SteadyStateMaster<ParallelTask<S>, List<S>>
@@ -217,12 +218,14 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      *
      * <p>The key is a defensive copy of the flat decision vector produced by
      * {@link SolutionVariables#flatten}: for {@code CompositeSolution} the component
-     * variables are concatenated. {@code variables()} itself would compare correctly (jMetal
+     * variables are concatenated, and a binary variable contributes one {@code 0} or {@code 1}
+     * per bit of its length. {@code variables()} itself would compare correctly (jMetal
      * solutions are equal when their variables are), but it is the live list of the solution
-     * (for a {@code CompositeSolution}, a list of its live component solutions), so a later
-     * change of the solution would silently change a key already stored in the set.
+     * (for a {@code CompositeSolution}, a list of its live component solutions; for a
+     * {@code BinarySolution}, its live {@code BinarySet}s, which a mutation flips in place), so a
+     * later change of the solution would silently change a key already stored in the set.
      *
-     * <p>Equality is exact, element by element. With integer encodings this catches
+     * <p>Equality is exact, element by element. With integer and binary encodings this catches
      * every duplicate. With real encodings two independently generated vectors are
      * practically never bit-identical, so the filter only catches exact clones —
      * offspring on which neither crossover nor mutation acted — which is what real-coded

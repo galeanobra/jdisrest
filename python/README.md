@@ -75,9 +75,11 @@ worker is interrupted, then exits.
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING` or `ERROR`, in any case (`INFO`). |
 
 The function receives the variables as a list (ints for an integer-encoded problem, floats for a
-real-encoded one) and may return an `EvalResult`, a number (a single objective), a sequence of
-objectives such as a list, a tuple or a numpy array, a dict with `"objectives"` and optional
-`"constraints"` and `"variables"`, or an object with those attributes.
+real-encoded one, the ints 0 and 1 for each bit of a binary variable, and the segments of a
+composite one after the other) and may return an `EvalResult`, a number (a single objective), a
+sequence of objectives such as a list, a tuple or a numpy array, a dict with `"objectives"` and
+optional `"constraints"` and `"variables"`, or an object with those attributes. Repaired bits go
+back as the ints 0 and 1.
 
 **Non-finite objectives.** Without `--non-finite-penalty`, a result with a NaN or infinite
 objective is reported to the master as a failed evaluation (`POST /api/v1/tasks/{id}/error`).

@@ -24,9 +24,10 @@ as external simulators, trained models, or legacy code, across a cluster
 implementation to the evaluation language.
 
 Problems may use integer variables (`IntegerSolution`), real variables
-(`DoubleSolution`) or a `CompositeSolution` that mixes both; the decision
-vector travels to the workers as a flat list of JSON numbers whatever the
-encoding.
+(`DoubleSolution`), binary variables (`BinarySolution`) or a
+`CompositeSolution` that mixes them; the decision vector travels to the
+workers as a flat list of JSON numbers whatever the encoding, with each bit
+of a binary variable as `0` or `1`.
 
 The algorithmic core (NSGA-II, MOEA/D, SMS-EMOA, PAES, solution
 encodings, and several operators) is built on top of
@@ -109,7 +110,9 @@ mvn install        # deposits into ~/.m2/repository
 
 `mvn test` runs the unit tests. `mvn verify`, and so `mvn install`, also
 runs the integration tests (the `*IT` classes), each class in a JVM of its
-own: they start a real master on a free port and talk to it over HTTP.
+own: they start a real master on a free port and talk to it over HTTP,
+some through `RestWorker`s that evaluate a whole run of a binary or a
+composite problem.
 
 Consumers reference it via:
 
@@ -172,7 +175,8 @@ A matching Python worker:
 from jdisrest import Worker, EvalResult
 
 def evaluate(variables) -> EvalResult:
-    # ints for an integer-encoded problem, floats for a real-encoded one
+    # ints for an integer-encoded problem, floats for a real-encoded one,
+    # 0 and 1 (ints) for each bit of a binary variable
     return EvalResult(objectives=[float(sum(x ** 2 for x in variables))])
 
 Worker("http://10.0.0.1:8080").run(evaluate)
@@ -277,9 +281,10 @@ jdisrest/
   by problems that can seed the initial population from disk (`iVAR.csv`,
   which `WarmStart` also copies into the traces folder).
 - `es.unex.jdisrest.util.SolutionVariables`: flattens `IntegerSolution`,
-  `DoubleSolution` and `CompositeSolution` variables into the wire vector and
-  writes results back, converting each value to the type of the destination
-  variable.
+  `DoubleSolution`, `BinarySolution` (one `0` or `1` per bit) and
+  `CompositeSolution` variables into the wire vector, describes its layout
+  (`layoutOf`), and writes results back, converting each value to the type
+  of the destination variable.
 - `es.unex.jdisrest.distributed.rest.MasterSpringApp`: embedded Spring Boot entry
   point (auto-loaded by the master).
 - `es.unex.jdisrest.local.algorithms.NSGAII`: sequential local variant (no REST)

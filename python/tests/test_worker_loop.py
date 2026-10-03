@@ -69,6 +69,38 @@ def test_real_coded_task_round_trip():
     assert not _calls(responses, "/tasks/5/error")
 
 
+@pytest.mark.parametrize("payload, repaired", [
+    # Two binary variables of 3 and 5 bits, one 0 or 1 per bit, bit 0 first.
+    ({"taskId": 45, "variables": [1, 0, 1, 0, 0, 1, 1, 0], "encoding": "binary", "bitsPerVariable": [3, 5]},
+     [1, 0, 1, 1, 0, 1, 1, 0]),
+    # The same bits after an integer and a real segment.
+    ({"taskId": 46, "variables": [3, -7, 0.25, 1, 0, 1, 0, 0, 1, 1, 0], "segmentSizes": [2, 1, 8],
+      "encoding": "mixed", "segmentEncodings": ["int", "double", "binary"], "bitsPerVariable": [3, 5]},
+     [3, -7, 0.25, 1, 0, 1, 1, 0, 1, 1, 0]),
+])
+@responses.activate
+def test_bits_reach_the_evaluator_as_ints_and_a_repair_goes_back_as_ints(payload, repaired):
+    _mock_master(responses, payload, 200)
+    seen = []
+
+    def evaluate(variables):
+        seen.append(variables)
+        fixed = list(variables)
+        fixed[-5] = 1
+        return EvalResult(objectives=[float(sum(variables))], variables=fixed)
+
+    assert Worker(MASTER, worker_id="w").run(evaluate) == "finished"
+
+    assert seen == [payload["variables"]]
+    assert [type(v) for v in seen[0][-8:]] == [int] * 8, "bits are ints, not bools, as integer variables are"
+    body = _calls(responses, f"/tasks/{payload['taskId']}/result")[0].request.body
+    posted = json.loads(body)
+    assert posted["variables"] == repaired
+    assert [type(v) for v in posted["variables"][-8:]] == [int] * 8, "sent as JSON 0 and 1, which the master takes"
+    assert b"true" not in (body if isinstance(body, bytes) else body.encode())
+    assert not _calls(responses, f"/tasks/{payload['taskId']}/error")
+
+
 @responses.activate
 def test_nan_objective_is_reported_as_evaluation_error_not_posted_as_result(caplog):
     _mock_master(responses, {"taskId": 6, "variables": [1, 2]}, result_status=None)

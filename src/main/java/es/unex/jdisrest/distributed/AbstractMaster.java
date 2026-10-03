@@ -994,7 +994,8 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
 
     /**
      * Describes the decision vector of a task for the discard log, whatever its encoding: the
-     * flat vector of {@link SolutionVariables#flatten} when the solution type is supported,
+     * flat vector of {@link SolutionVariables#flatten} when the solution type is supported (a
+     * binary variable as its bits, {@code 0} or {@code 1}, as the worker received them),
      * otherwise the raw {@code variables()} list, abbreviated beyond
      * {@value #MAX_LOGGED_VARIABLES} values; anything that is not a solution is printed as is.
      *

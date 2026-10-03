@@ -84,7 +84,7 @@ language capable of making HTTP requests).
 1. The algorithm's constructor starts the REST server (Spring Boot), returns once it accepts connections, and writes `.master-endpoint`; `run()` then builds the initial tasks. Until they exist the master hands out no task: a worker that asks gets `204` and asks again (section 2.2).
 2. Each worker starts, sends `POST /heartbeat` to register itself, and enters its loop.
 3. The worker requests a task: `GET /tasks/next` with long-polling of up to 30 s. A steady-state master creates the task on demand when its queue is empty.
-4. The master responds with a `taskId` + the decision vector (integers, reals, or both for composite problems).
+4. The master responds with a `taskId` + the decision vector (integers, reals, the bits of binary variables as `0` and `1`, or a mix of them for composite problems).
 5. The worker evaluates the objective function (this can take minutes or hours).
 6. The worker returns the result: `POST /tasks/{id}/result` with objectives and constraints. If the evaluation fails, it reports it with `POST /tasks/{id}/error` instead; the master then requeues the task, or discards it once it has failed `AbstractMaster.DEFAULT_MAX_TASK_FAILURES` (3) times (section 2.3).
 7. The master integrates the result into the population.
@@ -138,9 +138,10 @@ Possible responses:
                    request being served when the run is stopped or ends: the next one gets 410)
   410 Gone → algorithm finished (or stopped with POST /api/v1/stop), the worker must stop
   500 Internal Server Error → the master could not build the payload of the task it took
-                              for this worker (an unsupported solution type, or a variable
-                              that is null, NaN or infinite); the task counts as a failed
-                              evaluation (section 2.3), and the worker may ask again
+                              for this worker (an unsupported solution type, a variable
+                              that is null, NaN or infinite, or a binary variable of no
+                              bits); the task counts as a failed evaluation (section 2.3),
+                              and the worker may ask again
 ```
 
 The REST server starts, and `.master-endpoint` is written, in the algorithm's constructor, but the algorithm can only hand out tasks once `run()` has built its initial ones (`isReady()`, section 7.5). Until then `GET /tasks/next` answers `204` at once, without creating a task, and `GET /api/v1/status` reports the run as running (section 8). Both bundled workers wait 5 s after a `204`. (jdisrest 1.1 answered `500` in that window.)
@@ -180,12 +181,59 @@ Composite problem with an integer segment and a real segment:
 }
 ```
 
-- `variables`: flat vector of numbers. Integer variables travel as JSON integers (`5`), real variables as JSON floats (`5.0`). For `CompositeSolution` it is the concatenation of the segments `[seg0 | seg1 | ...]`.
-- `segmentSizes`: **only present for composite problems**: number of variables in each segment, so the worker can reconstruct the boundaries.
-- `encoding`: `"double"` when every variable is real, `"mixed"` when a composite mixes integer and real segments. **Absent means every variable is an integer.**
-- `segmentEncodings`: only for composites that are not all-integer: `"int"` or `"double"` per segment, aligned with `segmentSizes`.
+Binary problem (`BinarySolution`) with a variable of 3 bits and one of 5, `101` and `00110`:
 
-The three optional fields are omitted for integer problems, so the JSON of an integer problem is byte for byte the one sent by jdisrest 1.0. A worker that hands the whole vector to a simulator can ignore all three; JSON parsers already deliver ints and floats with the right type.
+```json
+{
+  "taskId": 45,
+  "variables": [1, 0, 1, 0, 0, 1, 1, 0],
+  "encoding": "binary",
+  "bitsPerVariable": [3, 5]
+}
+```
+
+Composite problem with an integer, a real and a binary segment:
+
+```json
+{
+  "taskId": 46,
+  "variables": [3, -7, 0.25, 1, 0, 1, 0, 0, 1, 1, 0],
+  "segmentSizes": [2, 1, 8],
+  "encoding": "mixed",
+  "segmentEncodings": ["int", "double", "binary"],
+  "bitsPerVariable": [3, 5]
+}
+```
+
+- `variables`: flat vector of numbers. Integer variables travel as JSON integers (`5`), real variables as JSON floats (`5.0`), and a binary variable (a `BinarySet`) as one JSON integer `0` or `1` per bit of its length, bit 0 first: `[1, 0, 1]` is the variable a trace writes as `101` (section 7.7). For `CompositeSolution` it is the concatenation of the segments `[seg0 | seg1 | ...]`.
+- `segmentSizes`: **only present for composite problems**: number of values in each segment (the bits of a binary segment), so the worker can reconstruct the boundaries.
+- `encoding`: `"double"` when every variable is real, `"binary"` when every variable is binary, `"mixed"` when a composite mixes segments of different encodings. **Absent means every variable is an integer**, so it is always present when a variable is binary.
+- `segmentEncodings`: only for composites that are not all-integer: `"int"`, `"double"` or `"binary"` per segment, aligned with `segmentSizes`.
+- `bitsPerVariable`: only when a variable is binary: the length of every binary variable, in vector order across the segments, so the worker can tell where each one ends.
+
+The four optional fields are omitted for integer problems, so the JSON of an integer problem is byte for byte the one sent by jdisrest 1.0, and `bitsPerVariable` is omitted when no variable is binary, so the JSON of the other problems is the one of jdisrest 1.1 and 1.2. A worker that hands the whole vector to a simulator can ignore all four; JSON parsers already deliver ints and floats with the right type. One that needs the variables walks `segmentSizes` (a flat task is one segment of every value) and, inside each binary segment, `bitsPerVariable`:
+
+```python
+def variables_of(task):
+    """A number per integer or real variable, a list of bits per binary one, in order."""
+    values = task["variables"]
+    sizes = task.get("segmentSizes") or [len(values)]
+    encodings = task.get("segmentEncodings") or [task.get("encoding", "int")] * len(sizes)
+    lengths = iter(task.get("bitsPerVariable", []))
+    out, start = [], 0
+    for size, encoding in zip(sizes, encodings):
+        segment, start = values[start:start + size], start + size
+        if encoding == "binary":
+            while segment:
+                n = next(lengths)
+                out.append(segment[:n])
+                segment = segment[n:]
+        else:
+            out.extend(segment)
+    return out
+```
+
+A binary variable takes about two or three bytes of JSON per bit, so a result that sends a million repaired bits back stays far below the 16 MiB limit of a request body (section 5). Earlier workers and binary tasks: a `RestWorker` of 1.2 compares `encoding` with the solution of its own problem and reports the task through `POST /error` (it does not support a binary solution, and an integer one of the same length has another encoding), so it never evaluates bits as integers; one of 1.0 or 1.1 checks no layout at all, for any encoding, so use a `RestWorker` of this version for a binary problem. The Python worker of 1.2 hands the bits to its evaluator as ints, as this one does (section 4.2).
 
 The client's read timeout must be **greater than the 30 s long-poll** (both bundled workers wait 40 s). A poll that times out on the client while the master hands it a task leaves that task in flight until the worker's next request requeues it.
 
@@ -225,9 +273,9 @@ Possible responses:
 - `objectives`: list of **doubles**, exactly one per objective of the problem. jMetal minimizes; to maximize, negate.
 - `constraints`: list of doubles, exactly one per constraint of the problem. jMetal convention: `>= 0` satisfied, `< 0` violated. Empty list (or omitted) if the problem has no constraints.
 - `evaluationTimeMs`: optional, for statistics.
-- `variables`: **optional**. If the evaluator "repairs" the solution (Lamarckian search), it can return the repaired vector here and the master will overwrite the original solution before archiving the result. Omit it (or send an empty list, which means the same) if the variables are not modified. Same layout as the vector received. The JSON number type does not matter: the master converts each value to the type of the destination variable, so `2` is accepted for a real variable and `2.0` for an integer one. `2.7` for an integer variable is rejected, and so is a value outside the bounds of its variable.
+- `variables`: **optional**. If the evaluator "repairs" the solution (Lamarckian search), it can return the repaired vector here and the master will overwrite the original solution before archiving the result. Omit it (or send an empty list, which means the same) if the variables are not modified. Same layout as the vector received, one value per bit of a binary variable. The JSON number type does not matter: the master converts each value to the type of the destination variable, so `2` is accepted for a real variable and `2.0` for an integer one. `2.7` for an integer variable is rejected, and so is a value outside the bounds of its variable. A bit must be `0` or `1` (or `0.0` and `1.0`, within the same `1e-9` as an integer): `2`, `-1` or `0.5` is rejected. JSON `true` and `false` are not numbers: the body cannot be read as a result, and the master answers `400`, so send bits as `0` and `1`.
 
-The master validates the whole body before writing anything into the solution. It rejects with `422`: a wrong number of objectives or constraints, any `null`, `NaN`, `Infinity` or `-Infinity`, a `variables` vector whose length differs from the solution's, a non-integral value for an integer variable, and a value outside the bounds of its variable. Bounds are those of an `IntegerSolution` or `DoubleSolution`, or of such segments of a composite (other solution types declare none); they are inclusive and checked without tolerance, so a repair must clip exactly to them: a value computed as `lb + (ub - lb) * x` can land one ulp outside and be rejected. The body of the `422` (and of the `400`, `413` and `415`) is `{"taskId": 42, "reason": "objectives[1] is not finite: NaN"}`, or for instance `"variables[2] = 3.0 is outside the bounds [-2.5, 2.5] of its variable"`. A valid result is written into the solution only after the master has taken the task out of flight, so two reports of the same task never write into it at once.
+The master validates the whole body before writing anything into the solution. It rejects with `422`: a wrong number of objectives or constraints, any `null`, `NaN`, `Infinity` or `-Infinity`, a `variables` vector whose length differs from the solution's (which counts the bits of its binary variables), a non-integral value for an integer variable, a value other than 0 or 1 for a bit (`variables[5] = 2 is not a bit (0 or 1) but its variable is binary`), and a value outside the bounds of its variable. Bounds are those of an `IntegerSolution` or `DoubleSolution`, or of such segments of a composite (other solution types declare none); they are inclusive and checked without tolerance, so a repair must clip exactly to them: a value computed as `lb + (ub - lb) * x` can land one ulp outside and be rejected. The body of the `422` (and of the `400`, `413` and `415`) is `{"taskId": 42, "reason": "objectives[1] is not finite: NaN"}`, or for instance `"variables[2] = 3.0 is outside the bounds [-2.5, 2.5] of its variable"`. A valid result is written into the solution only after the master has taken the task out of flight, so two reports of the same task never write into it at once.
 
 A rejected result is treated exactly like `POST /error`: it counts as a failed evaluation, the task goes back to the pending queue and the same solution will be evaluated again by whichever worker claims it. As with `POST /error` (section 2.4), a `422` sent by a worker that no longer holds the task (another worker has it now) is answered but changes nothing. The other requests Spring rejects before the handler runs, such as a body that is not JSON (`400`), a wrong `Content-Type` (`415`) or a body above the size limit (`413`), count as a failed evaluation whoever sent them, because the master cannot read the `workerId` of a body it has not decoded.
 
@@ -305,7 +353,39 @@ public class SphereProblem extends AbstractIntegerProblem {
 
 > For multi-objective: `numberOfObjectives(2)` and fill in `solution.objectives()[0]` and `[1]`.
 
-jdisrest accepts three encodings: `IntegerSolution` (`AbstractIntegerProblem`), `DoubleSolution` (`AbstractDoubleProblem`) and `CompositeSolution` whose segments are any mix of the two. The real-coded version of the same problem:
+### Strategy B: evaluation on the worker (external problem)
+
+If the objective function is expensive or lives outside Java (a Python simulator, MATLAB code, a trained model, …), the Java problem only defines variables and bounds; evaluation happens on the workers.
+
+```java
+package es.unex.example;
+
+import org.uma.jmetal.problem.integerproblem.impl.AbstractIntegerProblem;
+import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import java.util.Collections;
+
+public class MyExternalProblem extends AbstractIntegerProblem {
+
+    public MyExternalProblem(int nVars, int lb, int ub) {
+        numberOfObjectives(2);
+        numberOfConstraints(0);
+        name("MyExternalProblem");
+        variableBounds(Collections.nCopies(nVars, lb), Collections.nCopies(nVars, ub));
+    }
+
+    @Override
+    public IntegerSolution evaluate(IntegerSolution solution) {
+        // Never called in distributed mode: the master writes the
+        // objectives a worker returns into the solution.
+        throw new UnsupportedOperationException(
+            "Distributed evaluation — call from a worker");
+    }
+}
+```
+
+### Encodings and their operators
+
+Under either strategy, jdisrest accepts four kinds of solution: `IntegerSolution` (`AbstractIntegerProblem`), `DoubleSolution` (`AbstractDoubleProblem`), `BinarySolution` (`AbstractBinaryProblem`) and `CompositeSolution` whose segments are any mix of the three. The real-coded version of the `SphereProblem` of Strategy A:
 
 ```java
 package es.unex.example;
@@ -338,35 +418,47 @@ public class SphereRealProblem extends AbstractDoubleProblem {
 
 The workers receive its variables as JSON floats and the task payload carries `"encoding": "double"` (section 2.2). Operators must match the encoding: jMetal's `SBXCrossover` + `PolynomialMutation` (or the variants in `es.unex.jdisrest.operator`) for `DoubleSolution`, and `IntegerSBXCrossover` + `IntegerPolynomialMutation` from `es.unex.jdisrest.operator` (or its `IntegerBLXCrossover`, `IntegerSimpleRandomMutation` and `IntegerGaussianMutation`) for `IntegerSolution`. Check the imports: jMetal 7.1 has an `IntegerSBXCrossover`, an `IntegerPolynomialMutation` and an `IntegerSimpleRandomMutation` too, with the same constructors, which compile in their place but turn each new value into an `int` with a cast. The cast truncates toward zero, so the values they produce are about half a unit too low on average (too high for negative values), and a variable in [0, 1] drifts to 0: their mutations never turn a 0 into a 1, and their crossover turns the parents 0 and 1 into two 0s whenever it crosses them (section 5, [Extra operators](#extra-operators)). For variables with only a few values, such as 0/1, prefer `IntegerSimpleRandomMutation`: a polynomial step is a fraction of the range, so at the default distribution index of 20 it seldom reaches the next value.
 
-### Strategy B: evaluation on the worker (external problem)
-
-If the objective function is expensive or lives outside Java (a Python simulator, MATLAB code, a trained model, …), the Java problem only defines variables and bounds; evaluation happens on the workers.
+A binary problem gives the length of each variable, and the lengths may differ. Here, as in jMetal's `OneZeroMax`, one objective rewards the bits set and the other the bits clear, over three variables of 12, 4 and 4 bits:
 
 ```java
 package es.unex.example;
 
-import org.uma.jmetal.problem.integerproblem.impl.AbstractIntegerProblem;
-import org.uma.jmetal.solution.integersolution.IntegerSolution;
-import java.util.Collections;
+import org.uma.jmetal.problem.binaryproblem.impl.AbstractBinaryProblem;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
+import java.util.List;
 
-public class MyExternalProblem extends AbstractIntegerProblem {
+public class BitCountProblem extends AbstractBinaryProblem {
 
-    public MyExternalProblem(int nVars, int lb, int ub) {
-        numberOfObjectives(2);
-        numberOfConstraints(0);
-        name("MyExternalProblem");
-        variableBounds(Collections.nCopies(nVars, lb), Collections.nCopies(nVars, ub));
-    }
+    private static final List<Integer> BITS = List.of(12, 4, 4);
+
+    @Override public int numberOfVariables()                 { return BITS.size(); }
+    @Override public int numberOfObjectives()                { return 2; }
+    @Override public int numberOfConstraints()               { return 0; }
+    @Override public String name()                           { return "BitCount"; }
+    @Override public List<Integer> numberOfBitsPerVariable() { return BITS; }
 
     @Override
-    public IntegerSolution evaluate(IntegerSolution solution) {
-        // Never called in distributed mode: the master writes the
-        // objectives a worker returns into the solution.
-        throw new UnsupportedOperationException(
-            "Distributed evaluation — call from a worker");
+    public BinarySolution evaluate(BinarySolution solution) {
+        int ones = 0;
+        for (BinarySet bits : solution.variables()) ones += bits.cardinality();   // a BinarySet is a BitSet
+        solution.objectives()[0] = -ones;                                       // jMetal minimizes
+        solution.objectives()[1] = -(solution.totalNumberOfBits() - ones);
+        return solution;
     }
 }
 ```
+
+The workers receive its 20 bits as `0` and `1`, bit 0 of the first variable first, with `"encoding": "binary"` and `"bitsPerVariable": [12, 4, 4]` (section 2.2). Its operators are jMetal's: `SinglePointCrossover`, which cuts the bits of the whole solution at one position, inside a variable or between two, `HUXCrossover`, `UniformCrossover`, and `BitFlipMutation`, whose probability applies to each bit, so `1.0 / problem.totalNumberOfBits()` flips one bit per solution on average. jMetal's `NPointCrossover` and `TwoPointCrossover` need numeric variables. The length of a variable is the one it was created with (`getBinarySetLength()`), and a variable of no bits is rejected (section 7.7).
+
+| Encoding | Crossovers | Mutations |
+|---|---|---|
+| real (`DoubleSolution`) | jMetal's `SBXCrossover`, `BLXAlphaCrossover`, `LaplaceCrossover`, `ArithmeticCrossover`, `WholeArithmeticCrossover`; `DoubleNPointCrossover` | jMetal's `PolynomialMutation`, `LinkedPolynomialMutation`, `UniformMutation`, `SimpleRandomMutation`, `LevyFlightMutation`; `PolynomialMutationRandomProbability`, `RandomMutationWithRandomProbability`, `LevyFlightMutationRandomStepSize` |
+| integer (`IntegerSolution`) | `IntegerSBXCrossover`, `IntegerBLXCrossover` | `IntegerPolynomialMutation`, `IntegerSimpleRandomMutation`, `IntegerGaussianMutation` |
+| binary (`BinarySolution`) | jMetal's `SinglePointCrossover`, `HUXCrossover`, `UniformCrossover` | jMetal's `BitFlipMutation` |
+| composite (`CompositeSolution`) | `SafeCompositeCrossover` of one crossover per segment | jMetal's `CompositeMutation` of one mutation per segment |
+
+The classes not marked as jMetal's are in `es.unex.jdisrest.operator` (section 5, [Extra operators](#extra-operators)).
 
 ### Warm-start
 
@@ -378,7 +470,19 @@ When a run uses the warm start and has a traces folder, `iVAR.csv` is copied int
 
 ### Composite problems
 
-For problems with heterogeneous segments (e.g. three independent sets of variables with different bounds, or an integer segment next to a real one), implement `Problem<CompositeSolution>` directly. Segments may be `IntegerSolution`, `DoubleSolution` or any mix; the master flattens them in declaration order and tells the worker where each segment starts (`segmentSizes`) and how it is encoded (`segmentEncodings`, section 2.2). jMetal provides `CompositeCrossover` and `CompositeMutation`, but `CompositeCrossover` can return children that share segments with their parents, which a mutation applied in place then corrupts. The defensive wrapper `es.unex.jdisrest.operator.SafeCompositeCrossover` copies the parents first; it takes the same constructor argument and fits wherever a `CrossoverOperator<CompositeSolution>` is expected, but it is not a subclass of `CompositeCrossover` (section 5, [Extra operators](#extra-operators)).
+For problems with heterogeneous segments (e.g. three independent sets of variables with different bounds, or an integer segment next to a real one), implement `Problem<CompositeSolution>` directly. Segments may be `IntegerSolution`, `DoubleSolution`, `BinarySolution` or any mix; the master flattens them in declaration order and tells the worker where each segment starts (`segmentSizes`, in values, so a binary segment counts its bits), how it is encoded (`segmentEncodings`) and how long its binary variables are (`bitsPerVariable`, section 2.2). `createSolution()` returns a `CompositeSolution` of one new solution per segment, each with the objectives and constraints of the problem; a binary segment is created with the length of each of its variables, at least one bit (section 7.7). An integer segment of three variables followed by a binary one of two variables, of 4 and 6 bits:
+
+```java
+@Override
+public CompositeSolution createSolution() {
+    int m = numberOfObjectives(), c = numberOfConstraints();
+    return new CompositeSolution(List.of(
+        new DefaultIntegerSolution(Collections.nCopies(3, Bounds.create(0, 10)), m, c),
+        new DefaultBinarySolution(List.of(4, 6), m, c)));
+}
+```
+
+Each segment takes the operators of its encoding: for these two, `new SafeCompositeCrossover(List.of(new IntegerSBXCrossover(0.9, 20.0), new SinglePointCrossover<>(0.9)))` and `new CompositeMutation(List.of(new IntegerPolynomialMutation(1.0 / 3, 20.0), new BitFlipMutation<>(1.0 / 10)))`, with a mutation probability of 1/n in each segment. jMetal provides `CompositeCrossover` and `CompositeMutation`, but `CompositeCrossover` can return children that share segments with their parents, which a mutation applied in place then corrupts. The defensive wrapper `es.unex.jdisrest.operator.SafeCompositeCrossover` copies the parents first; it takes the same constructor argument and fits wherever a `CrossoverOperator<CompositeSolution>` is expected, but it is not a subclass of `CompositeCrossover` (section 5, [Extra operators](#extra-operators)).
 
 ---
 
@@ -417,9 +521,9 @@ public class SphereWorker {
 - A heartbeat thread every 15 s in parallel with evaluation. A heartbeat that fails (a network error, or an answer other than `2xx`) is retried after 5 s.
 - Dead-master detection: 5 failed exchanges in a row in the main loop, or 3 failed heartbeats in a row, and the worker shuts down cleanly. A failed exchange is a network error or a timeout, an answer the protocol does not define for that call (a `5xx`, a `401`, ...) or a task without a usable `taskId`; the worker waits 10 s after one. The count starts again only on a `204` or when the master answers the report of a task (`2xx`, `404`, `400`, `413`, `415` or `422` to its result or error), not when a task is merely handed out, so a master that serves tasks but fails every result stops the worker too.
 - Timeouts derived from `es.unex.jdisrest.util.Timings`: `GET /next` waits for the long-poll plus 10 s (40 s), a heartbeat a third of the heartbeat interval (5 s); a result or error report waits 15 s and a connection 10 s.
-- Any supported encoding. Before the received vector is written into `problem.createSolution()`, the layout the master announces (`segmentSizes`, `encoding`, `segmentEncodings`, section 2.2) is compared with that solution's: a worker whose problem builds another kind of solution (other segment boundaries, a flat solution for a composite one, real variables for integer ones) reports the task through `POST /error` instead of evaluating misaligned values. The vector is then written through `SolutionVariables.apply()`, which splits composite solutions by segment and converts every value to the type of the destination variable.
-- Failed and unusable tasks. Once the task id is known, everything that keeps a task from being evaluated is reported through `POST /error`, so the master requeues the task at once (or discards it after the failure limit, section 2.3), and the worker moves on: an unreadable `variables` list, a layout mismatch, a vector that does not fit the solution, an exception from `createSolution()` or `evaluate()` (logged at ERROR with its stack trace), and a `NaN` or infinite objective, constraint or changed variable. After two or more failed tasks in a row (rejected results included), the worker waits 5 s before asking for the next one.
-- Lamarckian repair: when `evaluate()` changes the decision variables, the result carries the whole new vector in `variables` (section 2.3), and the master writes it into its solution if it lies within the bounds. When the variables are unchanged the field is left out.
+- Any supported encoding. Before the received vector is written into `problem.createSolution()`, the layout the master announces (`segmentSizes`, `encoding`, `segmentEncodings`, `bitsPerVariable`, section 2.2) is compared with that solution's: a worker whose problem builds another kind of solution (other segment boundaries, a flat solution for a composite one, real variables for integer ones, binary variables of other lengths) reports the task through `POST /error` instead of evaluating misaligned values. The vector is then written through `SolutionVariables.apply()`, which splits composite solutions by segment and converts every value to the type of the destination variable; the bits of a binary variable go into a new `BinarySet` of the length the problem gives it, so `evaluate()` gets the `BinarySolution` it would get from a local run. The evaluation must keep that layout: one that replaces a variable with a `BinarySet` of another length is reported through `POST /error` (`the evaluation changed the layout of the solution: bitsPerVariable [3, 5] before it, [5, 3] after`), since the master would split the returned bits as before.
+- Failed and unusable tasks. Once the task id is known, everything that keeps a task from being evaluated is reported through `POST /error`, so the master requeues the task at once (or discards it after the failure limit, section 2.3), and the worker moves on: an unreadable `variables` list, a layout mismatch, a vector that does not fit the solution, an exception from `createSolution()` or `evaluate()` (logged at ERROR with its stack trace), a layout changed by `evaluate()`, and a `NaN` or infinite objective, constraint or changed variable. After two or more failed tasks in a row (rejected results included), the worker waits 5 s before asking for the next one.
+- Lamarckian repair: when `evaluate()` changes the decision variables, the result carries the whole new vector in `variables` (section 2.3), bits as `0` and `1`, and the master writes it into its solution if it lies within the bounds. When the variables are unchanged the field is left out.
 - Rejected results (`400`, `413`, `415`, `422`) and results the master no longer expects (`404`): logged and skipped.
 - `run()` runs once: a second call, a call from another thread while it runs, or a call after `close()` throws `IllegalStateException`. `close()` called from another thread stops a running loop at its next step, after the request in progress (at most the long-poll).
 
@@ -431,7 +535,8 @@ The `jdisrest` package (installable with `pip install -e <path-to-jdisrest>/pyth
 from jdisrest import Worker, EvalResult
 
 def evaluate(variables) -> EvalResult:
-    # ints for an integer-encoded problem, floats for a real-encoded one
+    # ints for an integer-encoded problem, floats for a real-encoded one,
+    # 0 and 1 (ints) for each bit of a binary variable
     f = sum(x ** 2 for x in variables)
     return EvalResult(objectives=[float(f)])
 
@@ -468,7 +573,7 @@ Worker.from_endpoint().run(MyEvaluator("config.json"))
 - A sequence of objectives: a list, a tuple or a numpy array
 - Any object with an `.objectives` attribute (and optionally `.constraints` and `.variables`)
 
-Before posting, the client converts objectives and constraints to plain floats (numpy scalars included) and checks that there is at least one objective and that every value is finite. A `NaN` or `inf` is reported to the master through `/error`, with the field and index in the message, so the task is requeued (or discarded after the failure limit, section 2.3) and the log points at the evaluator. Repaired `variables` keep their kind: Python ints are sent as JSON integers and floats as JSON floats; they must lie within the bounds of their variables (section 2.3).
+Before posting, the client converts objectives and constraints to plain floats (numpy scalars included) and checks that there is at least one objective and that every value is finite. A `NaN` or `inf` is reported to the master through `/error`, with the field and index in the message, so the task is requeued (or discarded after the failure limit, section 2.3) and the log points at the evaluator. Repaired `variables` keep their kind: Python ints are sent as JSON integers and floats as JSON floats; they must lie within the bounds of their variables, and bits must be the ints `0` and `1` (section 2.3): a `bool` is refused, as it is for any variable, and the result is reported through `/error`.
 
 `run()` blocks until the run finishes, the master is lost or the worker is interrupted, and returns which: `"finished"` (the master answered `410`, because the run finished or was stopped; or, for a worker created from an endpoint file, the master stopped answering and the file is gone or names another master, because the master shut down), `"master-lost"` or `"interrupted"` (also `Worker.FINISHED`, `Worker.MASTER_LOST` and `Worker.INTERRUPTED`). The same `Worker` can run again once `run()` has returned, one run at a time: a second `run()` while one is in progress raises `RuntimeError`.
 
@@ -599,7 +704,7 @@ Or as a non-interactive script:
 matlab -nodisplay -nosplash -r "sphere_worker('http://10.0.0.1:55000','worker-matlab-01'); exit"
 ```
 
-`double(task.variables)` works for every encoding: `jsondecode` already delivers integers and reals as doubles. Two things to watch: `jsonencode` turns `NaN` into `null`, which the master rejects with `422` (map non-finite objectives to a finite penalty before `submit_result`), and a `422`, `400`, `413` or `415` response means the task was requeued, or discarded after the failure limit (neither after a stop or the end of the run, section 2.3): `submit_result` above logs the reason and returns, so the loop continues with the next task instead of counting it as a connection error. The error count starts again after a `204` or an answered result, not when a task arrives, as in the bundled workers (section 4.1). The worker id must be unique among the workers of the run (section 2.1); the default above is a random one.
+`double(task.variables)` works for every encoding: `jsondecode` already delivers integers, reals and bits as doubles, and `logical(x(i:j))` turns the bits of a binary variable into a mask (section 2.2 shows how to find where each variable starts). Send repaired bits back as numbers, `double(mask)`: `jsonencode` writes a logical array as `true` and `false`, which the master refuses with `400`. Two things to watch: `jsonencode` turns `NaN` into `null`, which the master rejects with `422` (map non-finite objectives to a finite penalty before `submit_result`), and a `422`, `400`, `413` or `415` response means the task was requeued, or discarded after the failure limit (neither after a stop or the end of the run, section 2.3): `submit_result` above logs the reason and returns, so the loop continues with the next task instead of counting it as a connection error. The error count starts again after a `204` or an answered result, not when a task arrives, as in the bundled workers (section 4.1). The worker id must be unique among the workers of the run (section 2.1); the default above is a random one.
 
 ---
 
@@ -775,8 +880,8 @@ The child is started as `<python> -u <script> [scriptArgs...]`, in `workingDirec
 **The child protocol.** One JSON object per line, in strict lock-step: Java writes one request and waits for exactly one answer before it writes the next.
 
 - Handshake: the first line the child prints must be a JSON object with `"ready": true` (other fields are ignored).
-- Request: `{"id": 0, "vars": [3, -1.5, ...]}`. The key is `vars`, not `variables` as in the REST payload, for compatibility with existing children, and the key order is unspecified. Integer variables are written as JSON integers and real ones as JSON floats, in the layout of `SolutionVariables.flatten` (composite segments concatenated). A `null`, `NaN` or infinite variable is never sent: the call fails with `IllegalArgumentException` (`Cannot send the decision to the Python evaluator: variables[3] is not finite: NaN`) before anything is written, and the evaluator stays usable.
-- Answer: `{"id": 0, "objectives": [...], "constraints": [...], "variables": [...]}`, where `id` echoes the request's, and `constraints` and `variables` are optional. Objectives and constraints must be finite numbers, as many as the problem defines (else `IOException` or `IllegalStateException`). `variables` is a repaired decision vector (Lamarckian repair), in the layout of the request; its numbers are converted to the type of each variable.
+- Request: `{"id": 0, "vars": [3, -1.5, ...]}`. The key is `vars`, not `variables` as in the REST payload, for compatibility with existing children, and the key order is unspecified. Integer variables are written as JSON integers and real ones as JSON floats, and a binary variable as one JSON integer `0` or `1` per bit, in the layout of `SolutionVariables.flatten` (composite segments concatenated). A `null`, `NaN` or infinite variable is never sent: the call fails with `IllegalArgumentException` (`Cannot send the decision to the Python evaluator: variables[3] is not finite: NaN`) before anything is written, and the evaluator stays usable.
+- Answer: `{"id": 0, "objectives": [...], "constraints": [...], "variables": [...]}`, where `id` echoes the request's, and `constraints` and `variables` are optional. Objectives and constraints must be finite numbers, as many as the problem defines (else `IOException` or `IllegalStateException`). `variables` is a repaired decision vector (Lamarckian repair), in the layout of the request; its numbers are converted to the type of each variable, and a bit must be `0` or `1`.
 - Error: `{"id": 0, "error": "<message>"}`. The call fails with an `IOException` carrying the message, and the protocol stays in step, so the next call works. Only a non-empty string counts as an error: an `error` field that is `null`, `false`, `""` or not a string is ignored, and the answer must then carry `objectives`.
 - End: Java closes the child's standard input (EOF) when it has no more requests, and the child must exit then.
 
@@ -1235,7 +1340,7 @@ Inside `SteadyStateEvolutionaryAlgorithm`, `population` and `populationSignature
 5. If the algorithm keeps state about tasks in flight (for example MOEA/D's map from task to subproblem), override `onTaskDiscarded(task)` to release it: a task discarded after the failure limit never reaches `processComputedTask`. It runs on the REST thread that handled the failure, concurrently with the algorithm thread, so it must be thread-safe and fast; it need not call `super`, because the framework's own accounting does not depend on it. `MOEAD` is the in-tree example.
 6. The stop and the start-up window need no code. `stoppingConditionIsNotMet()` already includes the stop, the end of `run()` and readiness (section 7.5); an override should combine its own condition with `super.stoppingConditionIsNotMet()`. A subclass that overrides `waitForComputedTask()` must return `null` once `isStopRequested()` is `true`, because no result arrives after a stop and a plain `take()` would hang `run()`; the default `run()` loop ends on a `null`. An override of `run()` must call `super.run()` or end its loop on a stop as well.
 7. `setVariation`, `setTermination` and `getEvaluations` let a `ConfigurationHandler` change the operators and the budget of the running algorithm. Settings of your own need a method that checks every argument before it changes anything, under the population lock, as `PAES.reconfigure` and `MOEAD.reconfigure` do.
-8. Keep the rules of the algorithm in a class without Spring (package-private unless users need it), as `PAESState`, `MOEADWeights`, `MOEADAggregation`, `TaskFailureTracker` and `StopRequest` do: the constructor of every master starts the REST server, so the master itself cannot be built in a unit test. Check the constructor arguments before calling `super(...)`, which starts the server, so that a wrong argument fails at once instead of leaving a live server behind (Java 25 allows statements before `super`): the program has no reference to the half-built master, so nothing can shut that server down. In this repository an integration test can build one: `EndOfRunScenario` starts a master on port `0` (a free port) and plays its workers over HTTP. Its subclasses end in `IT`, which `mvn verify` runs (not `mvn test`), each class in a JVM of its own, because a master registers itself in static singletons; they run only when the system property `jdisrest.it` is `true`, which Failsafe sets (set it yourself to run one from an IDE).
+8. Keep the rules of the algorithm in a class without Spring (package-private unless users need it), as `PAESState`, `MOEADWeights`, `MOEADAggregation`, `TaskFailureTracker` and `StopRequest` do: the constructor of every master starts the REST server, so the master itself cannot be built in a unit test. Check the constructor arguments before calling `super(...)`, which starts the server, so that a wrong argument fails at once instead of leaving a live server behind (Java 25 allows statements before `super`): the program has no reference to the half-built master, so nothing can shut that server down. In this repository an integration test can build one: `EndOfRunScenario` starts a master on port `0` (a free port) and plays its workers over HTTP, and `EncodingRunScenario` runs a whole budget on such a master with two in-process `RestWorker`s, for one encoding per subclass (`BinaryRunIT`, NSGA-II on the binary ZDT5; `CompositeSmsemoaIT`, SMS-EMOA on an integer and binary composite). Their subclasses end in `IT`, which `mvn verify` runs (not `mvn test`), each class in a JVM of its own, because a master registers itself in static singletons; they run only when the system property `jdisrest.it` is `true`, which Failsafe sets (set it yourself to run one from an IDE).
 9. The traces need no code either: `updateProgress()` calls the public `saveTrace()` after every processed result, and `run()` calls it once more when the loop ends, for the final snapshot (section 7.7). An override of `saveTrace()` is called that last time too. Override `populationTraceSnapshot()` instead to change what `VAR_<n>.csv` / `FUN_<n>.csv` hold (PAES writes its archive there).
 
 ```java
@@ -1286,13 +1391,14 @@ public class MyAlgo<S extends Solution<?>> extends SteadyStateEvolutionaryAlgori
 
 `es.unex.jdisrest.util.SolutionVariables` is the only place where a jMetal solution becomes a flat numeric vector or is rebuilt from one. `TaskController`, `RestWorker`, `PythonSolutionListEvaluator` and the duplicate filter (`solutionKey()`) all go through it, and so does the composite trace writer for its integer and real segments.
 
-- `flatten(solution)` copies the variables into a new `List<Number>`, concatenating composite segments in declaration order and keeping `Integer`/`Double` element types, so Jackson emits `5` for integer variables and `5.0` for real ones. A `null` variable, or one of another type than its segment's encoding, raises `IllegalArgumentException` with its position. Non-finite values are copied as they are (they are valid duplicate keys and trace values); `checkFinite(values)` tells whether a vector can travel as JSON numbers, and the controller fails a task whose vector cannot (section 2.2).
-- `apply(solution, values)` writes a vector back. Each value is converted to the type of the destination variable (`intValue()` / `doubleValue()`), never trusting the type Jackson chose from the JSON text (`5` → `Integer`, `5.0` → `Double`, big values → `Long`). It validates first and writes afterwards, so a rejected vector leaves the solution untouched: wrong length, `null`, non-finite, non-integral for an integer variable (tolerance `1e-9`) and `int` overflow all raise `IllegalArgumentException` with the offending index. `convert(solution, values)` does the same conversion without writing.
-- `checkBounds(solution, convert(solution, values))` checks a vector that comes back from outside, such as a Lamarckian repair, against the bounds of the variables it would overwrite: inclusive, without tolerance, for `IntegerSolution` and `DoubleSolution` variables and such segments of a composite; other solution types declare no bounds. It returns the reason or `null`; the controller (section 2.3) and the local evaluator ([Local mode](#local-mode)) reject such a vector. `apply` itself does not check bounds.
-- `wireEncoding(solution)` / `segmentEncodings(solution)` produce the `encoding` and `segmentEncodings` fields of section 2.2. The controller omits both for all-integer solutions.
-- Supported types: `IntegerSolution`, `DoubleSolution`, `CompositeSolution` of those (not nested). Any other solution is accepted only if its variables are all `Integer` or all `Double` at runtime (integer permutations); otherwise `IllegalArgumentException` names the class. `SteadyStateEvolutionaryAlgorithm.run()` performs this check on one `problem.createSolution()` before dispatching anything, so an unsupported encoding fails at start-up rather than once per task.
+- `layoutOf(solution)` reads the shape of the vector as a `SolutionVariables.VectorLayout`: whether the solution is a composite, and for each segment its `Encoding` (`INT`, `DOUBLE` or `BINARY`), its width (its variables, or the bits of a binary segment) and the length of each binary variable. Every width the class uses comes from it, so the payload, the worker's check of it (section 4.1) and the conversions agree; `width()`, `wireName()`, `segmentSizes()`, `wireSegmentEncodings()` and `bitsPerVariable()` give what the payload carries (section 2.2), and `size(solution)` is its width. The length of a binary variable is `getBinarySetLength()`, the one it was created with: `BitSet.length()` would give 4 for `00110` and 0 for `00000`. A binary variable of no bits is rejected: it would take no position in the vector, and its empty token in a trace could not be told from a missing one.
+- `flatten(solution)` copies the variables into a new `List<Number>`, concatenating composite segments in declaration order and keeping `Integer`/`Double` element types, so Jackson emits `5` for integer variables and `5.0` for real ones; a binary variable gives one `Integer` `0` or `1` per bit of its length, bit 0 first. A `null` variable, or one of another type than its segment's encoding, raises `IllegalArgumentException` with its position, which for a binary variable is that of its first bit. Non-finite values are copied as they are (they are valid duplicate keys and trace values); `checkFinite(values)` tells whether a vector can travel as JSON numbers, and the controller fails a task whose vector cannot (section 2.2).
+- `apply(solution, values)` writes a vector back. Each value is converted to the type of the destination variable (`intValue()` / `doubleValue()`, or a bit), never trusting the type Jackson chose from the JSON text (`5` → `Integer`, `5.0` → `Double`, big values → `Long`), and each binary variable is replaced by a new `BinarySet` of its length, so a set that an operator shares with another solution is never written into. It validates first and writes afterwards, so a rejected vector leaves the solution untouched: wrong length, `null`, non-finite, non-integral for an integer variable (tolerance `1e-9`), `int` overflow and anything but 0 or 1 for a bit (`1.0` and `0.9999999999` are 1) all raise `IllegalArgumentException` with the offending index. `convert(solution, values)` does the same conversion without writing.
+- `checkBounds(solution, convert(solution, values))` checks a vector that comes back from outside, such as a Lamarckian repair, against the bounds of the variables it would overwrite: inclusive, without tolerance, for `IntegerSolution` and `DoubleSolution` variables and such segments of a composite; other solution types declare no bounds, and a bit has none beyond its 0 or 1. It returns the reason or `null`; the controller (section 2.3) and the local evaluator ([Local mode](#local-mode)) reject such a vector. `apply` itself does not check bounds.
+- `wireEncoding(solution)` / `segmentEncodings(solution)` produce the `encoding` and `segmentEncodings` fields of section 2.2. The controller omits both for all-integer solutions, and `bitsPerVariable` for solutions without binary variables.
+- Supported types: `IntegerSolution`, `DoubleSolution`, `BinarySolution`, `CompositeSolution` of those (not nested). Any other solution is accepted only if its variables are all `Integer`, all `Double` or all `BinarySet` at runtime (integer permutations); otherwise `IllegalArgumentException` names the class. `SteadyStateEvolutionaryAlgorithm.run()` performs this check on one `problem.createSolution()` before dispatching anything, so an unsupported encoding, or a binary variable of no bits, fails at start-up rather than once per task.
 
-**Duplicate filter.** `SteadyStateEvolutionaryAlgorithm.solutionKey()` returns `flatten(solution)` and `populationSignatures` compares keys element by element. With integer encodings this rejects every duplicate offspring. With real encodings two independently generated vectors are practically never bit-identical, so the filter only catches exact clones — offspring on which neither crossover nor mutation acted, which are the duplicates real-coded evolution actually produces. The retry loop in `createNewTask()` therefore exits on the first iteration for most real-coded offspring and `MAX_DUPLICATE_RETRIES` is never reached. Nothing else changes; a tolerance-based comparison was deliberately not added because it would need a per-variable scale.
+**Duplicate filter.** `SteadyStateEvolutionaryAlgorithm.solutionKey()` returns `flatten(solution)` and `populationSignatures` compares keys element by element. A key is a copy of the values, the bits of a binary variable included, so a mutation that flips the bits of a population member in place, as jMetal's `BitFlipMutation` does, cannot change a key already stored; the member's `BinarySet`s would, and `BinarySet.equals` ignores the declared length besides. With integer and binary encodings this rejects every duplicate offspring. With real encodings two independently generated vectors are practically never bit-identical, so the filter only catches exact clones — offspring on which neither crossover nor mutation acted, which are the duplicates real-coded evolution actually produces. The retry loop in `createNewTask()` therefore exits on the first iteration for most real-coded offspring and `MAX_DUPLICATE_RETRIES` is never reached. Nothing else changes; a tolerance-based comparison was deliberately not added because it would need a per-variable scale.
 
 **Traces.** A `VAR` row holds the variables of one solution, one token per jMetal variable: an integer or real variable as Java prints it (`3`, `0.25`, `1.0E-5`), a binary variable (`BinarySet`) as its bit string, bit 0 first and one character per bit of its length (`00110`). `TraceWriter` writes flat solutions with jMetal's `SolutionListOutput`, which joins the variables with the separator (a comma in every trace and result file jdisrest writes) and writes nothing else: `0.25,1.0E-5`, `3,-7` or `101,00110`. It writes composites with `CompositeSolutionListOutput`, which takes any number of segments of integer, real or binary variables, joins their variables with spaces whatever the separator, and adds the objectives and the constraints: `v0 v1 ... vN-1,[obj...],[con...]`, for instance `3 -7 0.25 101 00110,[1.0  2.0],[0.0]`. A `FUN` row holds the objectives, joined by the separator. A variable reads the same in both forms, and the rows do not depend on how the variables travel to the workers. Rows end with the platform's line separator, CRLF on Windows; the Python tools read both.
 
@@ -1526,3 +1632,11 @@ What behaves differently from jdisrest 1.2.1.
 - A binary segment of a composite is written to the `VAR` traces as one bit string per variable, bit 0 first, as jMetal writes the variables of a flat `BinarySolution`, so a `VAR` row holds one token per jMetal variable whatever the encoding. 1.2.1 could not write such a composite: `CompositeSolutionListOutput` threw once the `FUN` file was written, so the local NSGA-II with a Java evaluator, which runs such a problem, failed at its first snapshot and left a complete `aFUN` next to an empty `aVAR`.
 - `CompositeSolutionListOutput` formats every row before it opens either file, so a solution it cannot write leaves both files as they were. It names the segment of the variable it cannot write and counts the position of the variable within that segment, where 1.2.1 counted it across the variables of every segment: after a segment of four variables, `segment 1: variables[1] is null` instead of `variables[5] is null`. It also rejects a binary variable of no bits. New `TraceWriter.check(solution)`, which tells whether the traces can hold a solution, a flat binary one included; with a traces folder, the local NSGA-II checks its first solution with it and throws `IllegalArgumentException` before evaluating anything ([Local mode](#local-mode)).
 - `watch_front.py` keeps the variables written with digits only as they are written: the bit strings of binary variables, which 1.2.1 read as decimal numbers (`001001` became `1001.0`, and a long one `inf`), and integers, which it saved as `3.0` in `front_extremes.csv` and now saves as `3`. Real variables are read, shown and saved as before ([`python/README.md`](../python/README.md)).
+
+**Binary variables** (sections 2.2, 2.3, 3 and 7.7)
+
+- New: binary problems (`BinarySolution`, such as jMetal's ZDT5) and composites with binary segments run in every bundled distributed algorithm, with both workers, and in local mode with `PythonSolutionListEvaluator`. 1.2.1 rejected them: a steady-state master threw from `run()`, after which the workers got `410`, and the local evaluator threw at the first solution. Each bit travels as a JSON integer `0` or `1`, bit 0 first, in the same flat `variables` vector, and the task payload carries `"encoding": "binary"` (or `"mixed"`), `"binary"` in `segmentEncodings` and a new last field, `bitsPerVariable`, with the length of every binary variable. `segmentSizes` counts the bits of a binary segment. A result sends repaired bits back as `0` and `1`; anything else gets `422`, and JSON `true` or `false` gets `400`.
+- The payloads of problems without binary variables are those of 1.2.1, byte for byte; `bitsPerVariable` is omitted for them. A `RestWorker` of 1.2 reports a binary task through `POST /error`, since `encoding` is always sent with bits; one of 1.0 or 1.1 checks no layout and must not be used with binary problems. The Python worker of 1.2 hands the bits to its evaluator as ints.
+- `RestWorker` also compares `bitsPerVariable` with the lengths of its problem's variables, writes the bits into `BinarySet`s of those lengths, and reports a task whose evaluation changes the layout of the solution, for instance by replacing a variable with a `BinarySet` of another length, instead of sending its result (section 4.1).
+- `SolutionVariables`: new `layoutOf(solution)` and its record `VectorLayout`, the single source of the segment widths; new `Encoding.BINARY`, so an exhaustive `switch` over `Encoding` in user code needs a case for it; `size(solution)` counts the bits of binary variables (1.2.1 counted each as one value), and rejects, as `flatten` does, a solution it cannot describe, where 1.2.1 returned the number of its variables; a binary variable of no bits is rejected everywhere; a custom flat solution may also hold only `BinarySet`s; and the message for an unsupported solution names `BinarySolution` among the supported types (section 7.7).
+- `TaskPayload` has a sixth component, `bitsPerVariable`. The five-argument constructor of 1.1 and 1.2 remains, for payloads without binary variables, so only a record pattern of `TaskPayload` needs the new component.

@@ -3,15 +3,21 @@ package es.unex.jdisrest.distributed;
 import org.junit.jupiter.api.Test;
 import org.uma.jmetal.component.catalogue.common.termination.impl.TerminationByEvaluations;
 import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
+import org.uma.jmetal.solution.Solution;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 import org.uma.jmetal.util.comparator.dominanceComparator.impl.DominanceWithConstraintsComparator;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import static es.unex.jdisrest.distributed.AbstractMasterTest.intSolution;
 import static es.unex.jdisrest.distributed.AbstractMasterTest.stderrOf;
@@ -20,9 +26,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * The parts of {@link SteadyStateEvolutionaryAlgorithm} that need no REST server: how the two
  * offspring of a task are taken from whatever the crossover returns ({@code child} and
- * {@code secondChild}), and what the master takes from the workers once the algorithm has ended
- * its run, tested on an algorithm built without its server (constructing a real one starts
- * Spring). The rest of the class is exercised end to end.
+ * {@code secondChild}), the duplicate filter on binary variables, and what the master takes from
+ * the workers once the algorithm has ended its run, tested on an algorithm built without its
+ * server (constructing a real one starts Spring). The rest of the class is exercised end to end.
  */
 class SteadyStateEvolutionaryAlgorithmTest {
 
@@ -66,6 +72,35 @@ class SteadyStateEvolutionaryAlgorithmTest {
             thread.interrupt();
             fail("run() did not return within " + TIMEOUT_S + " s");
         }
+    }
+
+    /**
+     * An algorithm without REST server whose population holds {@code members}, with their keys in
+     * {@code populationSignatures}, as {@code processComputedTask} leaves them.
+     */
+    @SafeVarargs
+    static <S extends Solution<?>> SteadyStateEvolutionaryAlgorithm<S> withPopulation(Supplier<S> factory, S... members) {
+        SteadyStateEvolutionaryAlgorithm<S> algorithm = new SteadyStateEvolutionaryAlgorithm<>(
+            new RestWorkerTest.TestProblem<>(factory, s -> { }), members.length, null, null, null,
+            new DominanceWithConstraintsComparator<>(), new TerminationByEvaluations(10));
+        synchronized (algorithm.population) {
+            algorithm.population.addAll(List.of(members));
+            algorithm.rebuildPopulationSignatures();
+        }
+        return algorithm;
+    }
+
+    /** A binary solution from the bit strings of its variables, bit 0 first. */
+    static BinarySolution binary(String... values) {
+        BinarySolution s = RestWorkerTest.binarySolution(Arrays.stream(values).map(String::length)
+            .toArray(Integer[]::new));
+        for (int i = 0; i < values.length; i++) {
+            BinarySet bits = s.variables().get(i);
+            for (int b = 0; b < values[i].length(); b++) {
+                if (values[i].charAt(b) == '1') bits.set(b);
+            }
+        }
+        return s;
     }
 
     /** Posts a result for the task, as {@code TaskController} does, with a fixed objective value. */
@@ -124,6 +159,47 @@ class SteadyStateEvolutionaryAlgorithmTest {
         assertThrows(IllegalStateException.class,
                 () -> SteadyStateEvolutionaryAlgorithm.secondChild(List.of("only"), List::<String>of),
                 "a second mating that yields no child fails as the first would");
+    }
+
+    // ── Duplicate filter ──────────────────────────────────────────────────────
+
+    @Test
+    void duplicateFilterComparesTheBitsOfBinaryVariables() {
+        SteadyStateEvolutionaryAlgorithm<BinarySolution> algorithm =
+            withPopulation(() -> binary("000", "00000"), binary("101", "00110"), binary("111", "00000"));
+
+        assertTrue(algorithm.solutionInThePopulation(binary("101", "00110")), "the same bits in another solution");
+        assertFalse(algorithm.solutionInThePopulation(binary("101", "00111")), "one bit apart");
+        assertFalse(algorithm.solutionInThePopulation(binary("000", "00000")));
+    }
+
+    @Test
+    void keyOfAMemberDoesNotFollowItsBitsWhenAMutationFlipsThemInPlace() {
+        BinarySolution member = binary("101", "00110");
+        SteadyStateEvolutionaryAlgorithm<BinarySolution> algorithm =
+            withPopulation(() -> binary("000", "00000"), member, binary("111", "00000"));
+
+        member.variables().get(1).flip(4);  // as BitFlipMutation does, on the live BinarySet
+
+        assertTrue(algorithm.solutionInThePopulation(binary("101", "00110")),
+            "the stored key is a copy of the bits: one holding the live set would no longer be found");
+        assertFalse(algorithm.solutionInThePopulation(binary("101", "00111")));
+        synchronized (algorithm.population) {
+            algorithm.rebuildPopulationSignatures();
+        }
+        assertTrue(algorithm.solutionInThePopulation(binary("101", "00111")), "until the keys are rebuilt");
+    }
+
+    @Test
+    void duplicateFilterComparesEverySegmentOfAnIntegerAndBinaryComposite() {
+        Supplier<CompositeSolution> zero = () -> new CompositeSolution(List.of(intSolution(0), binary("00")));
+        SteadyStateEvolutionaryAlgorithm<CompositeSolution> algorithm = withPopulation(zero,
+            new CompositeSolution(List.of(intSolution(3), binary("01"))), zero.get());
+
+        assertTrue(algorithm.solutionInThePopulation(new CompositeSolution(List.of(intSolution(3), binary("01")))));
+        assertFalse(algorithm.solutionInThePopulation(new CompositeSolution(List.of(intSolution(3), binary("11")))),
+            "the same integers, other bits");
+        assertFalse(algorithm.solutionInThePopulation(new CompositeSolution(List.of(intSolution(4), binary("01")))));
     }
 
     // ── End of the run ────────────────────────────────────────────────────────

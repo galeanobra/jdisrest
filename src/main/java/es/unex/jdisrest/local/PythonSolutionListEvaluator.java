@@ -22,8 +22,9 @@ import java.util.function.Function;
  *
  * <p>By default the decision vector sent to Python is
  * {@link SolutionVariables#flatten}, which handles {@code IntegerSolution},
- * {@code DoubleSolution} and {@code CompositeSolution} (segments concatenated
- * in declaration order). A custom extractor can be injected for other layouts.
+ * {@code DoubleSolution}, {@code BinarySolution} (one 0 or 1 per bit) and
+ * {@code CompositeSolution} (segments concatenated in declaration order). A
+ * custom extractor can be injected for other layouts.
  *
  * <p>If the Python evaluator returns a non-empty {@code variables} array
  * (Lamarckian repair / local search), the new decision is written back into the

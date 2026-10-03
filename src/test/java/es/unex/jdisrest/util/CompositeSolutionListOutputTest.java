@@ -119,7 +119,7 @@ class CompositeSolutionListOutputTest {
     @Test
     @SuppressWarnings({"unchecked", "rawtypes"})
     void aBinaryVariableOfAnotherTypeIsRejectedWithItsSegmentAndPosition() {
-        Solution<BinarySet> b = binarySetSolution("10", "01");
+        BinarySolution b = binarySolution("10", "01");
         ((List) b.variables()).set(1, 5);
         CompositeSolution c = new CompositeSolution(List.of(intSolution(3), b));
 
@@ -128,6 +128,20 @@ class CompositeSolutionListOutputTest {
                 "an IllegalArgumentException, not a ClassCastException");
         assertEquals("segment 1: variables[1] = 5 is a Integer but its segment is binary-encoded", e.getMessage(),
                 "worded as SolutionVariables words a variable of another type than its segment");
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void aSegmentMixingBinarySetsAndNumbersIsRejectedAsSolutionVariablesRejectsIt() {
+        Solution<BinarySet> b = binarySetSolution("10", "01");
+        ((List) b.variables()).set(1, 5);
+        CompositeSolution c = new CompositeSolution(List.of(intSolution(3), b));
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> CompositeSolutionListOutput.formatSolution(c));
+        assertTrue(e.getMessage().startsWith("segment 1: Unsupported solution type "), e.getMessage());
+        assertTrue(e.getMessage().endsWith("variables[0] is BinarySet but variables[1] is Integer; "
+                + "the variables of a flat solution must be all Integer, all Double or all BinarySet"), e.getMessage());
     }
 
     @Test

@@ -7,11 +7,14 @@ import es.unex.jdisrest.util.SolutionVariables;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.ResponseEntity;
 import org.uma.jmetal.solution.Solution;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.binarysolution.impl.DefaultBinarySolution;
 import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 import org.uma.jmetal.solution.doublesolution.impl.DefaultDoubleSolution;
 import org.uma.jmetal.solution.integersolution.IntegerSolution;
 import org.uma.jmetal.solution.integersolution.impl.DefaultIntegerSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 import org.uma.jmetal.util.bounds.Bounds;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -27,9 +30,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Wire-level behaviour of the task endpoints: the JSON the master emits for
- * each solution shape, backwards compatibility of the integer format, the
- * validation applied to results before they touch the master-held solution,
- * and the answer to a result that fails it.
+ * each solution shape, backwards compatibility of the integer, real and
+ * integer-and-real formats, the validation applied to results before they touch
+ * the master-held solution, and the answer to a result that fails it.
  *
  * <p>Serialization goes through the same Jackson 3 mapper family Spring
  * WebFlux uses at runtime ({@code tools.jackson}); the untyped-map round trip
@@ -55,6 +58,19 @@ class TaskControllerTest {
         List<Bounds<Double>> bounds = Collections.nCopies(values.length, Bounds.create(-1000.0, 1000.0));
         DoubleSolution s = new DefaultDoubleSolution(bounds, objectives, constraints);
         for (int i = 0; i < values.length; i++) s.variables().set(i, values[i]);
+        return s;
+    }
+
+    /** A binary solution from the bit strings of its variables, bit 0 first. */
+    static BinarySolution binarySolution(int objectives, String... values) {
+        BinarySolution s = new DefaultBinarySolution(Arrays.stream(values).map(String::length).toList(), objectives, 0);
+        for (int i = 0; i < values.length; i++) {
+            BinarySet bits = new BinarySet(values[i].length());
+            for (int b = 0; b < values[i].length(); b++) {
+                if (values[i].charAt(b) == '1') bits.set(b);
+            }
+            s.variables().set(i, bits);
+        }
         return s;
     }
 
@@ -114,6 +130,51 @@ class TaskControllerTest {
         assertEquals(List.of(2, 2), json.get("segmentSizes"));
         assertEquals(List.of("int", "double"), json.get("segmentEncodings"));
         assertEquals(List.of(1, 2, 0.5, 0.25), json.get("variables"));
+    }
+
+    @Test
+    void realAndMixedPayloadsAreTheBytesOfEarlierVersions() throws Exception {
+        String real = "{\"taskId\":43,\"variables\":[0.25,-1.5,3.0],\"encoding\":\"double\"}";
+        String mixed = "{\"taskId\":44,\"variables\":[3,-17,0.25],\"segmentSizes\":[2,1],\"encoding\":\"mixed\","
+            + "\"segmentEncodings\":[\"int\",\"double\"]}";
+        TaskPayload realPayload = TaskController.toPayload(43, doubleSolution(1, 0, 0.25, -1.5, 3.0));
+        TaskPayload mixedPayload = TaskController.toPayload(44,
+            new CompositeSolution(List.of(intSolution(1, 0, 3, -17), doubleSolution(1, 0, 0.25))));
+
+        assertEquals(real, JSON3.writeValueAsString(realPayload), "no bitsPerVariable without binary variables");
+        assertEquals(real, JSON2.writeValueAsString(realPayload));
+        assertEquals(mixed, JSON3.writeValueAsString(mixedPayload));
+        assertEquals(mixed, JSON2.writeValueAsString(mixedPayload));
+    }
+
+    @Test
+    void binaryPayloadCarriesOneIntegerPerBitTheEncodingAndTheLengthsOfItsVariables() throws Exception {
+        TaskPayload payload = TaskController.toPayload(45, binarySolution(1, "101", "00110"));
+
+        String json = "{\"taskId\":45,\"variables\":[1,0,1,0,0,1,1,0],\"encoding\":\"binary\",\"bitsPerVariable\":[3,5]}";
+        assertEquals(json, JSON3.writeValueAsString(payload),
+            "[1,0,1] is the variable a trace writes as 101; the encoding keeps a worker of an integer problem "
+                + "of 8 variables from evaluating the bits");
+        assertEquals(json, JSON2.writeValueAsString(payload));
+    }
+
+    @Test
+    void compositePayloadWithABinarySegmentCountsItsBits() {
+        CompositeSolution mixed = new CompositeSolution(List.of(intSolution(1, 0, 3, -7), doubleSolution(1, 0, 0.25),
+            binarySolution(1, "101", "00110")));
+        assertEquals("{\"taskId\":46,\"variables\":[3,-7,0.25,1,0,1,0,0,1,1,0],\"segmentSizes\":[2,1,8],"
+                + "\"encoding\":\"mixed\",\"segmentEncodings\":[\"int\",\"double\",\"binary\"],\"bitsPerVariable\":[3,5]}",
+            JSON3.writeValueAsString(TaskController.toPayload(46, mixed)));
+
+        CompositeSolution allBinary = new CompositeSolution(List.of(binarySolution(1, "101"), binarySolution(1, "00110")));
+        assertEquals("{\"taskId\":47,\"variables\":[1,0,1,0,0,1,1,0],\"segmentSizes\":[3,5],\"encoding\":\"binary\","
+                + "\"segmentEncodings\":[\"binary\",\"binary\"],\"bitsPerVariable\":[3,5]}",
+            JSON3.writeValueAsString(TaskController.toPayload(47, allBinary)));
+
+        CompositeSolution integerAndBinary = new CompositeSolution(List.of(intSolution(1, 0, 4), binarySolution(1, "1")));
+        Map<String, Object> json = asMap(JSON3.writeValueAsString(TaskController.toPayload(48, integerAndBinary)));
+        assertEquals("mixed", json.get("encoding"), "never left out with a binary variable, unlike an all-integer composite");
+        assertEquals(List.of(1), json.get("bitsPerVariable"));
     }
 
     @Test
@@ -252,6 +313,42 @@ class TaskControllerTest {
     }
 
     @Test
+    void bitsOfAResultMustBeZeroOrOneAndAsManyAsTheVariablesHave() {
+        BinarySolution s = binarySolution(1, "101", "00110");
+
+        assertNull(TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(0, 1, 1, 0, 0, 1, 1, 1)), s));
+        assertNull(TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(0.0, 1.0, 1, 0, 0, 1, 1, 1)), s),
+            "a float within the integrality tolerance of 0 or 1 is a bit");
+        assertEquals("variables[7] = 2 is not a bit (0 or 1) but its variable is binary", TaskController.rejectionReason(
+            result(List.of(1.0), List.of(), List.<Number>of(0, 1, 1, 0, 0, 1, 1, 2)), s));
+        assertEquals("variables[0] = 0.5 is not a bit (0 or 1) but its variable is binary", TaskController.rejectionReason(
+            result(List.of(1.0), List.of(), List.<Number>of(0.5, 1, 1, 0, 0, 1, 1, 0)), s));
+        assertEquals("variables has 2 values but the solution has 8", TaskController.rejectionReason(
+            result(List.of(1.0), List.of(), List.<Number>of(1, 1)), s), "one value per bit, not per variable");
+        assertEquals("[101, 00110]", s.variables().toString(), "validation must not modify the solution");
+    }
+
+    @Test
+    void jsonBooleansAreNotNumbersForTheMaster() {
+        // The DTO stays a list of numbers: a worker must send its bits as 0 and 1. The body cannot
+        // be decoded, so Spring answers 400 and onRejectedRequest counts a failed evaluation.
+        assertThrows(JacksonException.class, () -> JSON3.readValue(
+            "{\"workerId\":\"w\",\"objectives\":[1.0],\"constraints\":[],\"variables\":[true,false,1]}",
+            TaskResultPayload.class));
+    }
+
+    @Test
+    void recordWritesRepairedBitsIntoNewSetsOfTheVariablesLengths() {
+        BinarySolution s = binarySolution(1, "101", "00110");
+
+        TaskController.record(s, result(List.of(2.0), List.of(), List.<Number>of(0, 1, 1, 1, 0, 0, 0, 1)));
+
+        assertEquals("[011, 10001]", s.variables().toString());
+        assertEquals(3, s.variables().get(0).getBinarySetLength());
+        assertArrayEquals(new double[] {2.0}, s.objectives());
+    }
+
+    @Test
     void emptyVariablesListMeansKeepOriginalVariables() {
         IntegerSolution s = intSolution(1, 0, 5, 6);
         assertNull(TaskController.rejectionReason(result(List.of(1.0), List.of(), new ArrayList<>()), s));
@@ -351,10 +448,21 @@ class TaskControllerTest {
     }
 
     @Test
-    void segmentSizesAreUnchanged() {
-        assertNull(TaskController.segmentSizes(intSolution(1, 0, 1, 2)));
-        assertEquals(List.of(2, 3), TaskController.segmentSizes(new CompositeSolution(
-            List.of(intSolution(1, 0, 1, 2), doubleSolution(1, 0, 1, 2, 3)))));
+    void segmentSizesCountTheValuesOfEachSegment() {
+        assertNull(TaskController.toPayload(1, intSolution(1, 0, 1, 2)).segmentSizes());
+        assertEquals(List.of(2, 3), TaskController.toPayload(2, new CompositeSolution(
+            List.of(intSolution(1, 0, 1, 2), doubleSolution(1, 0, 1, 2, 3)))).segmentSizes());
+        assertEquals(List.of(2, 4), TaskController.toPayload(3, new CompositeSolution(
+            List.of(intSolution(1, 0, 1, 2), binarySolution(1, "1", "011")))).segmentSizes(), "bits, not variables");
+    }
+
+    @Test
+    void binaryVariableOfNoBitsIsRejectedInsteadOfSent() {
+        BinarySolution s = binarySolution(1, "101", "1");
+        s.variables().set(1, new BinarySet(0));
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> TaskController.toPayload(1, s));
+        assertEquals("variables[3] is a BinarySet of 0 bits; a binary variable needs at least one", e.getMessage());
     }
 
     @Test
@@ -363,10 +471,16 @@ class TaskControllerTest {
         assertNull(flat.segmentSizes());
         assertNull(flat.encoding());
         assertNull(flat.segmentEncodings());
+        assertNull(flat.bitsPerVariable());
         assertEquals(List.of(1, 2, 3), flat.variables());
 
         TaskPayload composite = new TaskPayload(2, List.of(1, 2, 3), List.of(2, 1));
         assertEquals(List.of(2, 1), composite.segmentSizes());
         assertNull(composite.encoding());
+        assertNull(composite.bitsPerVariable());
+
+        TaskPayload mixed = new TaskPayload(3, List.of(1, 0.5), List.of(1, 1), "mixed", List.of("int", "double"));
+        assertEquals("mixed", mixed.encoding());
+        assertNull(mixed.bitsPerVariable(), "the five components of 1.1 and 1.2 cannot describe a binary variable");
     }
 }

@@ -14,11 +14,14 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.solution.Solution;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.binarysolution.impl.DefaultBinarySolution;
 import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 import org.uma.jmetal.solution.doublesolution.impl.DefaultDoubleSolution;
 import org.uma.jmetal.solution.integersolution.IntegerSolution;
 import org.uma.jmetal.solution.integersolution.impl.DefaultIntegerSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 import org.uma.jmetal.util.bounds.Bounds;
 
 import java.io.IOException;
@@ -202,14 +205,13 @@ class RestWorkerTest {
      */
     @SuppressWarnings("unchecked")
     static Map<String, Object> payloadFor(long taskId, Solution<?> solution) {
-        List<Integer> sizes = solution instanceof CompositeSolution c
-                ? c.variables().stream().map(s -> s.variables().size()).toList()
-                : null;
-        String encoding = SolutionVariables.wireEncoding(solution);
+        SolutionVariables.VectorLayout layout = SolutionVariables.layoutOf(solution);
+        String encoding = layout.wireName();
+        List<Integer> bits = layout.bitsPerVariable();
         TaskPayload payload = SolutionVariables.Encoding.INT.wireName().equals(encoding)
-                ? new TaskPayload(taskId, SolutionVariables.flatten(solution), sizes, null, null)
-                : new TaskPayload(taskId, SolutionVariables.flatten(solution), sizes, encoding,
-                        SolutionVariables.wireNames(SolutionVariables.segmentEncodings(solution)));
+                ? new TaskPayload(taskId, SolutionVariables.flatten(solution), layout.segmentSizes(), null, null)
+                : new TaskPayload(taskId, SolutionVariables.flatten(solution), layout.segmentSizes(), encoding,
+                        layout.wireSegmentEncodings(), bits.isEmpty() ? null : bits);
         try {
             return JSON.readValue(JSON.writeValueAsString(payload), Map.class);
         } catch (IOException e) {
@@ -227,6 +229,18 @@ class RestWorkerTest {
 
     static CompositeSolution composite(Solution<?>... components) {
         return new CompositeSolution(List.of(components));
+    }
+
+    /** A binary solution with variables of the given lengths, all bits 0. */
+    static BinarySolution binarySolution(Integer... lengths) {
+        BinarySolution s = new DefaultBinarySolution(List.of(lengths), 1, 0);
+        for (int i = 0; i < lengths.length; i++) s.variables().set(i, new BinarySet(lengths[i]));
+        return s;
+    }
+
+    /** The number of bits set in a binary solution, as its objective. */
+    static void ones(BinarySolution s) {
+        s.objectives()[0] = s.variables().stream().mapToInt(BinarySet::cardinality).sum();
     }
 
     /** f(x) = Σ xᵢ² on whatever numeric variables the solution has. */
@@ -479,7 +493,11 @@ class RestWorkerTest {
                 () -> doubleSolution(3),
                 () -> composite(intSolution(2), intSolution(3)),
                 () -> composite(doubleSolution(2), doubleSolution(1)),
-                () -> composite(intSolution(2), doubleSolution(1)));
+                () -> composite(intSolution(2), doubleSolution(1)),
+                () -> binarySolution(3, 5),
+                () -> composite(intSolution(2), binarySolution(3, 5)),
+                () -> composite(binarySolution(3), binarySolution(5)),
+                () -> composite(intSolution(2), doubleSolution(1), binarySolution(3, 5)));
         for (Supplier<Solution<?>> shape : shapes) {
             Solution<?> solution = shape.get();
             assertNull(RestWorker.layoutMismatch(payloadFor(1, solution), shape.get()),
@@ -530,6 +548,42 @@ class RestWorkerTest {
         payload = new HashMap<>(payloadFor(1, intSolution(2)));
         payload.put("encoding", 3);
         assertTrue(RestWorker.layoutMismatch(payload, intSolution(2)).contains("encoding is not a string"));
+
+        for (Object bits : List.of("3,5", List.of(3, 0), List.of(3.0, 5.0), List.of(-3, 5))) {
+            payload = new HashMap<>(payloadFor(1, binarySolution(3, 5)));
+            payload.put("bitsPerVariable", bits);
+            assertEquals("bitsPerVariable is not a list of positive integers: " + (bits instanceof String t ? "\"" + t + "\"" : bits),
+                    RestWorker.layoutMismatch(payload, binarySolution(3, 5)));
+        }
+    }
+
+    @Test
+    void binaryVariablesSplitIntoOtherLengthsAreAMismatch() {
+        assertEquals("bitsPerVariable [3, 5] from the master, but the local solution has [5, 3]",
+                RestWorker.layoutMismatch(payloadFor(1, binarySolution(3, 5)), binarySolution(5, 3)),
+                "same eight bits, other variables: bits would land in the wrong variable");
+        assertEquals("bitsPerVariable [3, 5] from the master, but the local solution has [3, 4, 1]",
+                RestWorker.layoutMismatch(payloadFor(1, composite(intSolution(1), binarySolution(3, 5))),
+                        composite(intSolution(1), binarySolution(3, 4, 1))));
+    }
+
+    @Test
+    void binaryTaskWithoutTheLengthsOfItsVariablesDoesNotMatchABinaryProblem() {
+        Map<String, Object> payload = new HashMap<>(payloadFor(1, binarySolution(3, 5)));
+        payload.remove("bitsPerVariable");
+
+        assertEquals("bitsPerVariable none (no binary variable) from the master, but the local solution has [3, 5]",
+                RestWorker.layoutMismatch(payload, binarySolution(3, 5)), "the worker cannot tell where a variable ends");
+    }
+
+    @Test
+    void binaryTaskDoesNotMatchAnIntegerProblemOfTheSameLength() {
+        // The case for always sending the encoding of bits: without it, a worker of an integer
+        // problem of eight variables would evaluate the bits as integers.
+        assertEquals("encoding \"binary\" from the master, but the local solution is \"int\"",
+                RestWorker.layoutMismatch(payloadFor(1, binarySolution(3, 5)), intSolution(8)));
+        assertEquals("encoding \"int\" from the master, but the local solution is \"binary\"",
+                RestWorker.layoutMismatch(payloadFor(1, intSolution(8)), binarySolution(3, 5)));
     }
 
     @Test
@@ -566,6 +620,26 @@ class RestWorkerTest {
         assertEquals(List.of(9.25), result.get("objectives"));
     }
 
+    @Test
+    void binaryTaskIsEvaluatedOnSetsOfTheProblemsLengths() throws Exception {
+        Map<String, Object> payload = new LinkedHashMap<>(payloadFor(4, binarySolution(3, 5)));
+        payload.put("variables", List.of(1, 0, 1, 0, 0, 1, 1, 0));
+        master.next.add(task(payload));
+        List<String> received = new CopyOnWriteArrayList<>();
+        TestProblem<BinarySolution> problem = new TestProblem<>(() -> binarySolution(3, 5), s -> {
+            received.add(s.variables() + " of " + s.variables().stream().map(BinarySet::getBinarySetLength).toList());
+            ones(s);
+        });
+
+        runToCompletion(worker(problem));
+
+        assertTrue(master.requests("/error").isEmpty(), "a matching layout must not be reported");
+        assertEquals(List.of("[101, 00110] of [3, 5]"), received, "bit 0 first, in variables of the problem's lengths");
+        Map<String, Object> result = master.requests("/result").get(0).body();
+        assertEquals(List.of(4.0), result.get("objectives"));
+        assertFalse(result.containsKey("variables"), "bits that did not change are not sent back");
+    }
+
     // ── Lamarckian variables ──────────────────────────────────────────────────
 
     @Test
@@ -593,6 +667,61 @@ class RestWorkerTest {
         assertEquals(List.of("workerId", "objectives", "constraints", "evaluationTimeMs"), new ArrayList<>(result.keySet()),
                 "without a repair the body must be the one earlier versions sent");
         assertEquals(List.of(14.0), result.get("objectives"));
+    }
+
+    @Test
+    void repairedBitsAreSentBackAsZerosAndOnes() throws Exception {
+        IntegerSolution seven = intSolution(1);
+        seven.variables().set(0, 7);
+        master.next.add(task(payloadFor(6, composite(seven, binarySolution(3, 5)))));
+        TestProblem<CompositeSolution> problem = new TestProblem<>(() -> composite(intSolution(1), binarySolution(3, 5)), s -> {
+            ((BinarySolution) s.variables().get(1)).variables().get(1).set(4);  // a repair in place
+            s.objectives()[0] = 1.0;
+        });
+
+        runToCompletion(worker(problem));
+
+        Map<String, Object> result = master.requests("/result").get(0).body();
+        assertEquals(List.of(7, 0, 0, 0, 0, 0, 0, 0, 1), result.get("variables"),
+                "the whole vector, the repaired bit as the integer 1, not true");
+    }
+
+    @Test
+    void evaluationThatSplitsTheBitsIntoOtherLengthsIsReportedInsteadOfItsResult() throws Exception {
+        master.next.add(task(payloadFor(8, binarySolution(3, 5))));
+        TestProblem<BinarySolution> problem = new TestProblem<>(() -> binarySolution(3, 5), s -> {
+            s.variables().set(0, new BinarySet(5));
+            s.variables().set(1, new BinarySet(3));
+            ones(s);
+        });
+
+        runToCompletion(worker(problem));
+
+        assertTrue(master.requests("/result").isEmpty(),
+                "the master would write the eight bits into its variables of 3 and 5 bits");
+        assertEquals("the evaluation changed the layout of the solution: bitsPerVariable [3, 5] before it, [5, 3] after",
+                master.requests("/error").get(0).body().get("errorMessage"));
+    }
+
+    @Test
+    void layoutChangeNamesWhatTheEvaluationChanged() {
+        SolutionVariables.VectorLayout three = SolutionVariables.layoutOf(intSolution(3));
+
+        assertNull(RestWorker.layoutChange(three, intSolution(3)));
+        assertEquals("the evaluation changed the layout of the solution: 3 values before it, 4 after",
+                RestWorker.layoutChange(three, intSolution(4)));
+        assertEquals("the evaluation changed the layout of the solution: segmentSizes [2, 1] before it, [1, 2] after",
+                RestWorker.layoutChange(SolutionVariables.layoutOf(composite(intSolution(2), binarySolution(1))),
+                        composite(intSolution(1), binarySolution(2))));
+        assertEquals("the evaluation changed the layout of the solution: bitsPerVariable [2, 1] before it, [1, 2] after",
+                RestWorker.layoutChange(SolutionVariables.layoutOf(composite(intSolution(2), binarySolution(2, 1))),
+                        composite(intSolution(2), binarySolution(1, 2))));
+
+        BinarySolution broken = binarySolution(3, 5);
+        broken.variables().set(1, null);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> RestWorker.layoutChange(SolutionVariables.layoutOf(binarySolution(3, 5)), broken));
+        assertEquals("variables[3] is null", e.getMessage());
     }
 
     @Test
