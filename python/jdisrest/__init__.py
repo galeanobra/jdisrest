@@ -70,4 +70,4 @@ from ._worker import Worker
 
 __all__ = ["Worker", "EvalResult", "Evaluator", "Variables", "FunctionEvaluator", "load_function",
            "add_worker_arguments", "configure_logging", "run_worker"]
-__version__ = "1.2.0"
+__version__ = "1.2.1"

@@ -102,7 +102,7 @@ deployment patterns, monitoring and control, and internals.
 ### Java (Maven)
 
 ```
-git clone --branch v1.2.0 https://github.com/galeanobra/jdisrest.git
+git clone --branch v1.2.1 https://github.com/galeanobra/jdisrest.git
 cd jdisrest
 mvn install        # deposits into ~/.m2/repository
 ```
@@ -117,7 +117,7 @@ Consumers reference it via:
 <dependency>
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.2.0</version>
+    <version>1.2.1</version>
 </dependency>
 ```
 
@@ -240,7 +240,7 @@ them.
 
 ```
 jdisrest/
-├── pom.xml                       # Maven library (es.unex:jdisrest:1.2.0)
+├── pom.xml                       # Maven library (es.unex:jdisrest:1.2.1)
 ├── src/main/java/es/unex/jdisrest/
 │   ├── config/                   # Configuration files, launcher, runtime reconfiguration
 │   ├── distributed/              # Master, algorithms, REST controllers

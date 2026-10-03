@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jdisrest"
-version = "1.2.0"
+version = "1.2.1"
 description = "Python client for the jdisrest distributed evolutionary optimization framework"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
