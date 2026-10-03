@@ -313,7 +313,8 @@ implementations in Java/Python/MATLAB, master wiring and shutdown with
 the available algorithms and operators, the local mode and its Python
 child protocol, configuration files and the `ConfiguredMaster` launcher,
 SLURM deployment patterns, monitoring and control (status, stop and
-configuration endpoints), internals, and what changed in 1.2 and 1.2.1.
+configuration endpoints), internals, and what changed in 1.2, 1.2.1
+and 1.3.
 [`python/README.md`](python/README.md) covers the Python client, its
 command-line worker and the trace tools.
 

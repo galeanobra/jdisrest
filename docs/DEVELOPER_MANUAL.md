@@ -36,6 +36,7 @@ language capable of making HTTP requests).
    - [`status.json` file](#statusjson-file)
 9. [Changes in 1.2](#9-changes-in-12)
 10. [Changes in 1.2.1](#10-changes-in-121)
+11. [Changes in 1.3](#11-changes-in-13)
 
 ---
 
@@ -335,7 +336,7 @@ public class SphereRealProblem extends AbstractDoubleProblem {
 }
 ```
 
-The workers receive its variables as JSON floats and the task payload carries `"encoding": "double"` (section 2.2). Operators must match the encoding: `SBXCrossover` + `PolynomialMutation` (or the variants in `es.unex.jdisrest.operator`) for `DoubleSolution`, `IntegerSBXCrossover` + `IntegerPolynomialMutation` (or `es.unex.jdisrest.operator.IntegerSimpleRandomMutation`) for `IntegerSolution`. jMetal 7.1 has an `IntegerSimpleRandomMutation` too, with the same constructors and a biased draw, so check the import (section 5, [Extra operators](#extra-operators)).
+The workers receive its variables as JSON floats and the task payload carries `"encoding": "double"` (section 2.2). Operators must match the encoding: jMetal's `SBXCrossover` + `PolynomialMutation` (or the variants in `es.unex.jdisrest.operator`) for `DoubleSolution`, and `IntegerSBXCrossover` + `IntegerPolynomialMutation` from `es.unex.jdisrest.operator` (or its `IntegerBLXCrossover`, `IntegerSimpleRandomMutation` and `IntegerGaussianMutation`) for `IntegerSolution`. Check the imports: jMetal 7.1 has an `IntegerSBXCrossover`, an `IntegerPolynomialMutation` and an `IntegerSimpleRandomMutation` too, with the same constructors, which compile in their place but turn each new value into an `int` with a cast. The cast truncates toward zero, so the values they produce are about half a unit too low on average (too high for negative values), and a variable in [0, 1] drifts to 0: their mutations never turn a 0 into a 1, and their crossover turns the parents 0 and 1 into two 0s whenever it crosses them (section 5, [Extra operators](#extra-operators)). For variables with only a few values, such as 0/1, prefer `IntegerSimpleRandomMutation`: a polynomial step is a fraction of the range, so at the default distribution index of 20 it seldom reaches the next value.
 
 ### Strategy B: evaluation on the worker (external problem)
 
@@ -609,16 +610,16 @@ A minimal master:
 ```java
 import es.unex.jdisrest.distributed.algorithms.steadystate.NSGAII;
 import es.unex.jdisrest.distributed.rest.MasterFacade;
-import es.unex.jdisrest.operator.IntegerSimpleRandomMutation;   // not jMetal's class of the same name
+import es.unex.jdisrest.operator.IntegerPolynomialMutation;     // not jMetal's class of the same name
+import es.unex.jdisrest.operator.IntegerSBXCrossover;           // not jMetal's class of the same name
 import org.uma.jmetal.component.catalogue.common.termination.impl.TerminationByEvaluations;
-import org.uma.jmetal.operator.crossover.impl.IntegerSBXCrossover;
 import es.unex.example.SphereProblem;
 
 public class SphereMaster {
     public static void main(String[] args) {
         var problem     = new SphereProblem(10);
         var crossover   = new IntegerSBXCrossover(0.9, 20.0);
-        var mutation    = new IntegerSimpleRandomMutation(1.0 / 10);
+        var mutation    = new IntegerPolynomialMutation(1.0 / 10, 20.0);
         var termination = new TerminationByEvaluations(5000);
 
         var algo = new NSGAII<>(
@@ -812,6 +813,7 @@ for line in sys.stdin:                           # ends at EOF, when Java closes
 
 Under `es.unex.jdisrest.operator.*`:
 
+- `IntegerSBXCrossover(probability[, distributionIndex[, randomGenerator]])` and `IntegerPolynomialMutation([probability[, distributionIndex[, repair[, randomGenerator]]]])`, or `IntegerPolynomialMutation(problem, distributionIndex)` with a probability of 1/n: jMetal's SBX crossover and polynomial mutation for `IntegerSolution`, draw for draw, with every new value rounded to the nearest integer. jMetal 7.1 has classes with the same simple names, constructors and methods, so changing the import is enough to switch, and the wrong import compiles: check that it is `es.unex.jdisrest.operator`. Their argument checks are stricter than jMetal's: a negative value gets the exception jMetal throws, but they also reject a NaN distribution index or mutation probability (the crossover with an `InvalidConditionException`), and their setters check their argument as the constructors do, where jMetal's accept any value. jMetal's classes truncate toward zero: with probability 1 and distribution index 20, jMetal's mutation of 5 in [0, 10] gives 4.50 on average and its crossover of the parents 3 and 7 in [0, 10] gives children of 4.75 on average (it crosses half of the variables and swaps the others), against 5.00 for both classes here; on a variable in [0, 1], jMetal's mutation never turns a 0 into a 1 and turns a 1 into a 0 about half of the time, and its crossover turns the parents 0 and 1 into two 0s whenever it crosses them, where the crossover here gives one child of each. The crossover also compares the parent values in `double`, where jMetal's `int` subtraction takes two values 2³¹ apart for equal and copies them, and it clamps a child after rounding it, so the child stays within the bounds even when a parent outside them (a warm start can give one) makes the spread factor NaN, which jMetal turns into a child of 0. The mutation's default repair clamps to the bounds (`RepairDoubleSolutionWithBoundValue`, as in jMetal), the rounded value is clamped to the bounds whatever the repair returns, and a variable whose lower and upper bounds are equal takes that value without calling the repair, which for jMetal's bound repair would throw. A polynomial step is a fraction of the range, so with the default distribution index of 20 a mutation of a variable in [0, 1] changes it about once in four million: `IntegerSimpleRandomMutation` suits such variables better.
 - `IntegerSimpleRandomMutation(probability[, randomGenerator])`: uniform reset mutation for `IntegerSolution`, every value of `[lb, ub]` equally likely, for any `int` range. jMetal 7.1 has a class with the same simple name and constructors whose draw never produces `ub` for a non-negative range, so check that the import is `es.unex.jdisrest.operator`: the other one compiles and silently changes the search.
 - `IntegerGaussianMutation(probability[, randomGenerator])`: adds Gaussian noise with σ = max(2, (ub − lb)/2) to the value, rounded and clamped to the bounds. The steps are wide (about a third of the range from mid-range), and at least half of the mutations of a value on a bound leave it there.
 - `IntegerBLXCrossover(probability[, alpha[, repair[, randomGenerator]]])`: BLX-α for `IntegerSolution`; the children are rounded to the nearest integer after the repair, and a variable whose lower and upper bounds are equal keeps that value.
@@ -1506,3 +1508,13 @@ The changes at the end of a run apply to the bundled algorithms (they extend `St
 - After a stop or the end of the run, a failure report counts nothing: after a `POST /error`, or a `400`, `413` or `415` answer to a result, the task leaves flight without being requeued or discarded, and a result that fails validation gets `404` instead of `422`. 1.2.0 counted them as failed evaluations, requeueing the task into a queue nobody served, or discarding it with an ERROR line, a call to `onTaskDiscarded` and one more `discardedTasks`. The watchdog no longer requeues the task of a silent worker then either (sections 2.3, 2.4 and 7.4).
 - A steady-state master hands out no task once the algorithm has ended its run, as after a stop: 1.2.0 could still give a worker that asked at that moment one of the tasks left in the queue, whose result was then accepted and counted although nobody processed it (a wasted evaluation). That worker now gets `204`, and `410` on its next request. A generational master returns at once after a stop, without taking a queued task or waiting for the long-poll (sections 7.3 and 7.5).
 - New `AbstractMaster.needsNoMoreResults()`, `true` once a stop has been requested or the algorithm has ended its run, which decides all of the above (section 7.2).
+
+---
+
+## 11. Changes in 1.3
+
+What behaves differently from jdisrest 1.2.1.
+
+**Operators** ([Extra operators](#extra-operators))
+
+- New: `IntegerSBXCrossover` and `IntegerPolynomialMutation` in `es.unex.jdisrest.operator`, jMetal's SBX crossover and polynomial mutation for `IntegerSolution` with every new value rounded to the nearest integer. jMetal's classes of the same names truncate toward zero, which moves the values they produce about half a unit toward 0 and drives a variable in [0, 1] to 0; section 3 and the minimal master of section 5 now use the new classes. They have the constructors and methods of jMetal's, so changing the import is enough. A source file that imports both `es.unex.jdisrest.operator.*` and `org.uma.jmetal.operator.crossover.impl.*` or `org.uma.jmetal.operator.mutation.impl.*` no longer compiles where it uses one of these names, which are now ambiguous, as `IntegerSimpleRandomMutation` already was: import the class by its full name.
