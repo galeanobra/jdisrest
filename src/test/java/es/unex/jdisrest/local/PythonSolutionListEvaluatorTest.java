@@ -2,13 +2,21 @@ package es.unex.jdisrest.local;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.uma.jmetal.solution.Solution;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.binarysolution.impl.DefaultBinarySolution;
+import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 import org.uma.jmetal.solution.doublesolution.impl.DefaultDoubleSolution;
+import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import org.uma.jmetal.solution.integersolution.impl.DefaultIntegerSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 import org.uma.jmetal.util.bounds.Bounds;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.BiConsumer;
@@ -16,16 +24,19 @@ import java.util.function.Function;
 
 import static es.unex.jdisrest.local.PythonProcessEvaluatorTest.REPAIR;
 import static es.unex.jdisrest.local.PythonProcessEvaluatorTest.SUM;
+import static es.unex.jdisrest.local.PythonProcessEvaluatorTest.requests;
 import static es.unex.jdisrest.local.PythonProcessEvaluatorTest.start;
+import static es.unex.jdisrest.local.PythonProcessEvaluatorTest.startLayoutChild;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * {@link PythonSolutionListEvaluator} against the fake child of
+ * {@link PythonSolutionListEvaluator} against the fake children of
  * {@link PythonProcessEvaluatorTest}: objectives and constraints are copied into
  * the solutions, repaired variables are written back in the layout the
- * decision extractor produced and only within the bounds of their variables, and
- * a vector with a non-finite variable is never sent. The tests that start the
- * child are skipped without a Python 3 interpreter.
+ * decision extractor produced and only within the bounds of their variables, a
+ * vector with a non-finite variable is never sent, and the default extractor sends
+ * the layout of binary and composite solutions and takes repaired bits back. The
+ * tests that start a child are skipped without a Python 3 interpreter.
  */
 class PythonSolutionListEvaluatorTest {
 
@@ -46,6 +57,19 @@ class PythonSolutionListEvaluatorTest {
         bounds.addAll(Collections.nCopies(values.length - 1, Bounds.create(-limit, limit)));
         DoubleSolution s = new DefaultDoubleSolution(bounds, 1, 1);
         for (int i = 0; i < values.length; i++) s.variables().set(i, values[i]);
+        return s;
+    }
+
+    /** A binary solution with one objective and one constraint, from the bit strings of its variables. */
+    static BinarySolution binary(String... values) {
+        BinarySolution s = new DefaultBinarySolution(Arrays.stream(values).map(String::length).toList(), 1, 1);
+        for (int i = 0; i < values.length; i++) {
+            BinarySet bits = new BinarySet(values[i].length());
+            for (int b = 0; b < values[i].length(); b++) {
+                if (values[i].charAt(b) == '1') bits.set(b);
+            }
+            s.variables().set(i, bits);
+        }
         return s;
     }
 
@@ -105,6 +129,52 @@ class PythonSolutionListEvaluatorTest {
         }
         assertEquals(List.of((double) REPAIR, 1.0, 2.0), s.variables(), "a rejected repair must not be written");
         assertArrayEquals(new double[] {0.0}, s.objectives(), "a rejected result must not write objectives");
+    }
+
+    // ── Layout and bits ───────────────────────────────────────────────────────
+
+    @Test
+    void binarySolutionTravelsWithItsLayoutAndARepairedBitComesBack(@TempDir Path dir) throws IOException {
+        BinarySolution s = binary("101", "00110");
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "flip-last")) {
+            new PythonSolutionListEvaluator<BinarySolution>(python).evaluate(List.of(s), null);
+        }
+        assertEquals(List.of("{\"id\":0,\"vars\":[1,0,1,0,0,1,1,0],\"encoding\":\"binary\",\"bitsPerVariable\":[3,5]}"),
+                requests(dir));
+        assertEquals("[101, 00111]", s.variables().toString(), "the last bit, sent back as true, is set");
+        assertEquals(5, s.variables().get(1).getBinarySetLength());
+        assertArrayEquals(new double[] {8.0}, s.objectives());
+    }
+
+    @Test
+    void compositeWithEveryKindOfSegmentTravelsWithItsLayout(@TempDir Path dir) throws IOException {
+        IntegerSolution integers = new DefaultIntegerSolution(Collections.nCopies(2, Bounds.create(-10, 10)), 1, 1);
+        integers.variables().set(0, 3);
+        integers.variables().set(1, -7);
+        DoubleSolution reals = new DefaultDoubleSolution(List.of(Bounds.create(-1.0, 1.0)), 1, 1);
+        reals.variables().set(0, 0.25);
+        CompositeSolution s = new CompositeSolution(List.<Solution<?>>of(integers, reals, binary("101", "00110")));
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "flip-last")) {
+            new PythonSolutionListEvaluator<CompositeSolution>(python).evaluate(List.of(s), null);
+        }
+        assertEquals(List.of("{\"id\":0,\"vars\":[3,-7,0.25,1,0,1,0,0,1,1,0],\"segmentSizes\":[2,1,8],"
+                + "\"encoding\":\"mixed\",\"segmentEncodings\":[\"int\",\"double\",\"binary\"],\"bitsPerVariable\":[3,5]}"),
+                requests(dir));
+        assertEquals("[101, 00111]", s.variables().get(2).variables().toString());
+        assertEquals(List.of(3, -7), s.variables().get(0).variables(), "the other values are written back as they were");
+        assertArrayEquals(new double[] {11.0}, s.objectives());
+    }
+
+    @Test
+    void customExtractorSendsNoLayout(@TempDir Path dir) throws IOException {
+        DoubleSolution s = solution(SUM, 1.0, 2.0);
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "echo")) {
+            new PythonSolutionListEvaluator<>(python, EVEN_POSITIONS).evaluate(List.of(s), null);
+            new PythonSolutionListEvaluator<DoubleSolution>(python).evaluate(List.of(s), null);
+        }
+        assertEquals(List.of("{\"id\":0,\"vars\":[0.0,2.0]}",
+                "{\"id\":1,\"vars\":[0.0,1.0,2.0],\"encoding\":\"double\"}"), requests(dir),
+                "the layout of a custom extractor's vector is unknown");
     }
 
     // ── Bounds and finite values ──────────────────────────────────────────────

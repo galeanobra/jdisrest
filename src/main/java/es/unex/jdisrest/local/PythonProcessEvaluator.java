@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.SynchronousQueue;
@@ -41,16 +42,26 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>handshake: the first line the child prints must be a JSON object with
  *       {@code "ready": true} (other fields are ignored)</li>
  *   <li>request:  {@code {"id": <long>, "vars": [<number>, ...]}} — integer
- *       variables are written as JSON integers, real ones as JSON floats; the key
- *       order is unspecified, and the key is {@code vars} (not {@code variables}
- *       as in the REST payload) for compatibility with existing children. A
- *       {@code null}, {@code NaN} or infinite variable is never sent (JSON has no
- *       such number): the call fails with an {@link IllegalArgumentException}
- *       before writing anything, as the REST master fails a task whose payload it
- *       cannot build, and the evaluator stays usable</li>
+ *       variables are written as JSON integers, real ones as JSON floats, and a
+ *       binary variable as one JSON integer 0 or 1 per bit; the key order is
+ *       unspecified, and the key is {@code vars} (not {@code variables} as in the
+ *       REST payload) for compatibility with existing children. With a layout
+ *       ({@link #evaluate(List, SolutionVariables.VectorLayout)}) the request also
+ *       carries the layout keys of the REST payload, with its names and omission
+ *       rules: {@code segmentSizes} for a composite, {@code encoding} and
+ *       {@code segmentEncodings} unless every variable is an integer one, and
+ *       {@code bitsPerVariable} when a variable is binary. A {@code null},
+ *       {@code NaN} or infinite variable is never sent (JSON has no such number):
+ *       the call fails with an {@link IllegalArgumentException} before writing
+ *       anything, as the REST master fails a task whose payload it cannot build,
+ *       and the evaluator stays usable</li>
  *   <li>response: {@code {"id": <long>, "objectives": [...], "constraints": [...],
  *       "variables": [...]}} ({@code constraints} and {@code variables} optional);
- *       {@code id} must echo the request's</li>
+ *       {@code id} must echo the request's. At the positions of the binary
+ *       variables of a request that carried its layout, {@code variables} may hold
+ *       JSON {@code true} and {@code false}, which are taken as 1 and 0, so that a
+ *       child that repairs bits as booleans can send them as {@code json.dumps}
+ *       writes them; anywhere else they are not numbers</li>
  *   <li>error:    {@code {"id": <long>, "error": "<msg>"}} — the call fails with an
  *       {@link IOException} carrying {@code msg}, and the protocol stays in step, so
  *       the next call works. Only a non-empty string counts as an error: an
@@ -322,7 +333,19 @@ public final class PythonProcessEvaluator implements AutoCloseable {
     }
 
     /**
-     * Sends one decision vector to the child and waits for its result.
+     * Convenience overload for real decision vectors, written as JSON floats.
+     *
+     * @param decision the decision vector
+     * @return the evaluation result
+     * @throws IllegalArgumentException if an element is {@code NaN} or infinite
+     * @throws IOException              on protocol or process failure
+     */
+    public Result evaluate(double[] decision) throws IOException {
+        return evaluate(Arrays.stream(decision).boxed().toList());
+    }
+
+    /**
+     * Sends one decision vector to the child, without its layout, and waits for its result.
      *
      * @param decision flat decision vector; {@link Integer} elements are written as
      *                 JSON integers and {@link Double} elements as JSON floats
@@ -339,16 +362,41 @@ public final class PythonProcessEvaluator implements AutoCloseable {
      *                                a non-finite objective or constraint
      */
     public Result evaluate(List<? extends Number> decision) throws IOException {
+        return evaluate(decision, null);
+    }
+
+    /**
+     * Sends one decision vector to the child with the keys of its layout, as the REST payload
+     * carries them (see "Child protocol" in the class description), and waits for its result. The
+     * child can then tell the segments and the binary variables of the vector apart, and may
+     * return the bits of a repair as JSON booleans.
+     *
+     * @param decision flat decision vector, for instance {@code SolutionVariables.flatten(solution)}
+     * @param layout   its layout, for instance {@code SolutionVariables.layoutOf(solution)}, or
+     *                 {@code null} to send none
+     * @return the evaluation result
+     * @throws IllegalArgumentException if an element is {@code null}, {@code NaN} or infinite,
+     *                                  or the vector does not have the width of its layout;
+     *                                  nothing is sent and the evaluator stays usable
+     * @throws InterruptedIOException   if the thread was interrupted while waiting (the child is
+     *                                  destroyed)
+     * @throws IOException              under the conditions of {@link #evaluate(List)}
+     */
+    public Result evaluate(List<? extends Number> decision, SolutionVariables.VectorLayout layout)
+            throws IOException {
         String reason = unusableReason;
         if (reason != null) {
             throw new IOException("Python evaluator is no longer usable: " + reason);
         }
         String unsendable = unsendable(decision);
+        if (unsendable == null && layout != null && decision.size() != layout.width()) {
+            unsendable = "it has " + decision.size() + " values but its layout has " + layout.width();
+        }
         if (unsendable != null) {
             throw new IllegalArgumentException("Cannot send the decision to the Python evaluator: " + unsendable);
         }
         long id = nextId.getAndIncrement();
-        String request = json.writeValueAsString(Map.of("id", id, "vars", decision));
+        String request = json.writeValueAsString(request(id, decision, layout));
         try {
             stdin.write(request);
             stdin.write('\n');
@@ -386,8 +434,42 @@ public final class PythonProcessEvaluator implements AutoCloseable {
 
         // Optional repaired decision; absent for evaluators that don't modify variables.
         Object varsRaw = resp.get("variables");
-        List<Number> v = (varsRaw instanceof List<?>) ? toNumberList((List<?>) varsRaw) : null;
+        List<Number> v = (varsRaw instanceof List<?>) ? toNumberList((List<?>) varsRaw, binaryPositions(layout)) : null;
         return new Result(o, c, v);
+    }
+
+    /**
+     * The request for one decision vector: {@code id}, {@code vars} and, with a layout, its keys
+     * with the omission rules of the REST payload ({@code TaskPayload}), in the order of that
+     * payload.
+     */
+    static Map<String, Object> request(long id, List<? extends Number> decision, SolutionVariables.VectorLayout layout) {
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("id", id);
+        request.put("vars", decision);
+        if (layout == null) return request;
+        if (layout.composite()) request.put("segmentSizes", layout.segmentSizes());
+        String encoding = layout.wireName();
+        if (!SolutionVariables.Encoding.INT.wireName().equals(encoding)) {
+            request.put("encoding", encoding);
+            if (layout.composite()) request.put("segmentEncodings", layout.wireSegmentEncodings());
+        }
+        if (!layout.bitsPerVariable().isEmpty()) request.put("bitsPerVariable", layout.bitsPerVariable());
+        return request;
+    }
+
+    /** Which positions of the vector hold a bit, or {@code null} without a layout. */
+    private static boolean[] binaryPositions(SolutionVariables.VectorLayout layout) {
+        if (layout == null) return null;
+        boolean[] binary = new boolean[layout.width()];
+        int offset = 0;
+        for (SolutionVariables.VectorLayout.Segment segment : layout.segments()) {
+            if (segment.encoding() == SolutionVariables.Encoding.BINARY) {
+                Arrays.fill(binary, offset, offset + segment.width(), true);
+            }
+            offset += segment.width();
+        }
+        return binary;
     }
 
     /**
@@ -504,10 +586,21 @@ public final class PythonProcessEvaluator implements AutoCloseable {
         return out;
     }
 
-    private static List<Number> toNumberList(List<?> list) throws IOException {
+    /**
+     * The repaired variables of a response, as numbers: a JSON {@code true} or {@code false} at a
+     * binary position becomes the {@link Integer} 1 or 0.
+     *
+     * @param list   the {@code variables} array of the response
+     * @param binary which positions hold a bit, or {@code null} when the request had no layout
+     */
+    private static List<Number> toNumberList(List<?> list, boolean[] binary) throws IOException {
         List<Number> out = new ArrayList<>(list.size());
         for (int i = 0; i < list.size(); i++) {
             Object e = list.get(i);
+            if (e instanceof Boolean bit && binary != null && i < binary.length && binary[i]) {
+                out.add(bit ? 1 : 0);
+                continue;
+            }
             if (!(e instanceof Number n)) {
                 throw new IOException("Python evaluator returned variables[" + i + "] = " + e + " (not a number)");
             }

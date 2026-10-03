@@ -23,8 +23,13 @@ import java.util.function.Function;
  * <p>By default the decision vector sent to Python is
  * {@link SolutionVariables#flatten}, which handles {@code IntegerSolution},
  * {@code DoubleSolution}, {@code BinarySolution} (one 0 or 1 per bit) and
- * {@code CompositeSolution} (segments concatenated in declaration order). A
- * custom extractor can be injected for other layouts.
+ * {@code CompositeSolution} (segments concatenated in declaration order), and the
+ * request also carries the keys of its layout ({@link SolutionVariables#layoutOf}),
+ * as the REST payload does: see
+ * {@link PythonProcessEvaluator#evaluate(List, SolutionVariables.VectorLayout)}. A
+ * request for a flat integer solution is still {@code {"id", "vars"}}. A custom
+ * extractor can be injected for other layouts; its requests carry no layout keys, since
+ * the evaluator does not know the layout it produces.
  *
  * <p>If the Python evaluator returns a non-empty {@code variables} array
  * (Lamarckian repair / local search), the new decision is written back into the
@@ -52,10 +57,10 @@ import java.util.function.Function;
  * <p>Fail-fast: the first failure — an {@code error} reply or a protocol problem
  * ({@link UncheckedIOException}), a decision vector that cannot be sent (a
  * {@code null}, {@code NaN} or infinite variable, an {@link IllegalArgumentException}
- * from {@link PythonProcessEvaluator#evaluate(List)}), a count mismatch
- * ({@link IllegalStateException}), a repaired vector the applier rejects (for the
- * default one an {@link IllegalArgumentException}) — ends the whole {@link #evaluate}
- * call, and with it the algorithm's run. The solutions before it in the list are already
+ * from {@link PythonProcessEvaluator#evaluate(List, SolutionVariables.VectorLayout)}),
+ * a count mismatch ({@link IllegalStateException}), a repaired vector the applier
+ * rejects (for the default one an {@link IllegalArgumentException}) — ends the whole
+ * {@link #evaluate} call, and with it the algorithm's run. The solutions before it in the list are already
  * updated; the failing one keeps its old objectives, since counts are checked and
  * the vector applied before they are written (the default applier
  * validates the whole vector before writing any of it). There is no retry or penalty,
@@ -79,16 +84,19 @@ public final class PythonSolutionListEvaluator<S extends Solution<?>> implements
     private final PythonProcessEvaluator python;
     private final Function<S, List<? extends Number>> decisionExtractor;
     private final BiConsumer<S, List<Number>> variablesApplier;
+    /** Whether the requests carry the layout of the vector: only with the default extractor. */
+    private final boolean sendLayout;
 
     /**
      * Evaluator using {@link SolutionVariables#flatten} as the decision extractor
      * and {@link SolutionVariables#apply}, after a bounds check, to write repaired
-     * variables back (see the class description).
+     * variables back (see the class description). Each request carries the keys of the
+     * layout of the solution.
      *
      * @param python the Python child process
      */
     public PythonSolutionListEvaluator(PythonProcessEvaluator python) {
-        this(python, SolutionVariables::flatten);
+        this(python, SolutionVariables::flatten, PythonSolutionListEvaluator::applyWithinBounds, true);
     }
 
     /**
@@ -122,16 +130,25 @@ public final class PythonSolutionListEvaluator<S extends Solution<?>> implements
     public PythonSolutionListEvaluator(PythonProcessEvaluator python,
                                        Function<S, List<? extends Number>> decisionExtractor,
                                        BiConsumer<S, List<Number>> variablesApplier) {
+        this(python, decisionExtractor, variablesApplier, false);
+    }
+
+    private PythonSolutionListEvaluator(PythonProcessEvaluator python,
+                                        Function<S, List<? extends Number>> decisionExtractor,
+                                        BiConsumer<S, List<Number>> variablesApplier, boolean sendLayout) {
         this.python = Objects.requireNonNull(python, "python must not be null");
         this.decisionExtractor = Objects.requireNonNull(decisionExtractor, "decisionExtractor must not be null");
         this.variablesApplier = Objects.requireNonNull(variablesApplier, "variablesApplier must not be null");
+        this.sendLayout = sendLayout;
     }
 
     @Override
     public List<S> evaluate(List<S> solutionList, Problem<S> problem) {
         for (S sol : solutionList) {
             try {
-                PythonProcessEvaluator.Result r = python.evaluate(decisionExtractor.apply(sol));
+                List<? extends Number> decision = decisionExtractor.apply(sol);
+                PythonProcessEvaluator.Result r =
+                    python.evaluate(decision, sendLayout ? SolutionVariables.layoutOf(sol) : null);
                 if (r.objectives.length != sol.objectives().length) {
                     throw new IllegalStateException("Python evaluator returned " + r.objectives.length
                         + " objectives but the problem defines " + sol.objectives().length);
