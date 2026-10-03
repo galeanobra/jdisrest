@@ -34,7 +34,7 @@ class _NoTaskId(requests.RequestException):
 
 class Worker:
     """
-    Python worker for the jDisREST distributed optimization framework.
+    Python worker for the jdisrest distributed optimization framework.
 
     Connects to a Java master, requests tasks, evaluates them, and returns results.
     Handles heartbeats, master-dead detection, and evaluation error reporting

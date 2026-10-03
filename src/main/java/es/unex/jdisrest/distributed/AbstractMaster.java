@@ -492,14 +492,21 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      * This method is thread-safe; the underlying {@link ConcurrentHashMap#compute} call
      * is atomic.
      *
+     * <p>The message reports the size of the registry read after the entry has been added,
+     * because a size read inside {@code compute} does not count the workers that other threads
+     * are registering at the same moment (four workers that start together would all report
+     * {@code 1}). Workers that register at the same moment may report the same total, but the
+     * largest total reported is the real count.
+     *
      * @param workerId a unique identifier string for the worker (assigned by the worker
      *                 process at startup)
      * @param address  the worker's IP address, used for logging and diagnostics
      */
     public void registerHeartbeat(String workerId, String address) {
+        boolean[] created = {false};
         workerRegistry.compute(workerId, (id, entry) -> {
             if (entry == null) {
-                Log.info("Worker connected: " + workerId + " (" + address + ")" + " — total workers: " + (workerRegistry.size() + 1));
+                created[0] = true;
                 return new WorkerEntry(workerId, address);
             }
             // Upgrade a placeholder address if the worker registered via claimNextTask first.
@@ -509,6 +516,9 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
             entry.lastSeen = Instant.now();
             return entry;
         });
+        if (created[0]) {
+            Log.info("Worker connected: " + workerId + " (" + address + ")" + " — total workers: " + workerRegistry.size());
+        }
     }
 
     /**

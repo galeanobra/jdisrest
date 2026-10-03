@@ -1,4 +1,4 @@
-# jdisrest — Python client
+# jdisrest: Python client
 
 Python worker client for the **jdisrest** distributed evolutionary optimization
 framework. See the top-level [jdisrest repository](https://github.com/galeanobra/jdisrest)

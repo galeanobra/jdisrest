@@ -6,7 +6,7 @@
 
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.2.0-SNAPSHOT</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <licenses>
@@ -23,6 +23,11 @@
             <organization>GITACA – Universidad de Extremadura</organization>
             <organizationUrl>https://gitaca.unex.es/</organizationUrl>
         </developer>
+        <developer>
+            <name>Francisco Luna</name>
+            <url>https://orcid.org/0000-0002-0455-7223</url>
+            <organization>Universidad de Málaga</organization>
+        </developer>
     </developers>
 
     <name>jdisrest</name>
@@ -34,6 +39,7 @@
         configuration files and a launcher for real-coded problems; and a
         Java worker.
     </description>
+    <url>https://github.com/galeanobra/jdisrest</url>
 
     <properties>
         <maven.compiler.source>25</maven.compiler.source>
@@ -44,6 +50,20 @@
     </properties>
 
     <build>
+        <!-- Declaring resources replaces Maven's default, so src/main/resources is listed too. -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <!-- The license travels inside the jar, as META-INF/LICENSE. -->
+            <resource>
+                <directory>${project.basedir}</directory>
+                <includes>
+                    <include>LICENSE</include>
+                </includes>
+                <targetPath>META-INF</targetPath>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

@@ -161,6 +161,14 @@ def main(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
     return EXIT_MASTER_LOST if reason == _MASTER_LOST else 0
 
 
+def console_main() -> int:
+    """
+    Entry point of the ``jdisrest-worker`` console script: :func:`main` with the script's own
+    name in its usage and error messages, instead of the path of the launcher that runs it.
+    """
+    return main(prog="jdisrest-worker")
+
+
 def _parser(prog: str | None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog, description="jdisrest worker: evaluates the tasks of a master with a Python function "

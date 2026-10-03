@@ -21,8 +21,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,9 +32,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * The parts of {@link AbstractMaster} that need no REST server: the default failure limit, the
  * decision vector written to the log when a task is discarded, the server's default properties,
- * the advertised host and endpoint file, and the task pipeline itself (dispatch, results,
- * failures, the watchdog, readiness and shutdown), exercised on a master built without its
- * server (constructing a real one starts Spring).
+ * the advertised host and endpoint file, the log of worker registrations, and the task pipeline
+ * itself (dispatch, results, failures, the watchdog, readiness and shutdown), exercised on a
+ * master built without its server (constructing a real one starts Spring).
  */
 class AbstractMasterTest {
 
@@ -250,6 +252,56 @@ class AbstractMasterTest {
         master.running = () -> false;
 
         assertTrue(master.isFinished(), "once ready, a met stopping condition finishes the run");
+    }
+
+    // ── Worker registration ───────────────────────────────────────────────────
+
+    @Test
+    void firstHeartbeatOfEachWorkerLogsTheTotalInTheLayoutToolsParse() {
+        TestMaster master = new TestMaster();
+
+        String log = stderrOf(() -> {
+            master.registerHeartbeat("w1", "10.0.0.5");
+            master.registerHeartbeat("w2", "10.0.0.6");
+            master.registerHeartbeat("w1", "10.0.0.5");
+        });
+
+        assertTrue(log.contains("INFO: Worker connected: w1 (10.0.0.5) — total workers: 1 ["), log);
+        assertTrue(log.contains("INFO: Worker connected: w2 (10.0.0.6) — total workers: 2 ["), log);
+        assertEquals(2, log.split("Worker connected", -1).length - 1, "a later heartbeat logs nothing: " + log);
+    }
+
+    @Test
+    void workersThatRegisterTogetherReportTheRealTotal() {
+        int workers = 8;
+        for (int round = 0; round < 25; round++) {
+            TestMaster master = new TestMaster();
+            CyclicBarrier start = new CyclicBarrier(workers);
+
+            String log = stderrOf(() -> {
+                List<Thread> threads = IntStream.range(0, workers).mapToObj(i -> Thread.ofPlatform().start(() -> {
+                    try {
+                        start.await();
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                    master.registerHeartbeat("w" + i, "10.0.0." + i);
+                })).toList();
+                for (Thread thread : threads) {
+                    try {
+                        thread.join();
+                    } catch (InterruptedException e) {
+                        throw new IllegalStateException(e);
+                    }
+                }
+            });
+
+            List<Integer> totals = Pattern.compile("— total workers: (\\d+) \\[").matcher(log).results()
+                .map(match -> Integer.parseInt(match.group(1))).toList();
+            assertEquals(workers, totals.size(), "one line per worker: " + log);
+            assertEquals(workers, Collections.max(totals),
+                "a size read inside compute missed the workers registering at the same time: " + log);
+        }
     }
 
     // ── Dispatch ──────────────────────────────────────────────────────────────

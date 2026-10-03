@@ -1,8 +1,8 @@
 {
     "title": "jdisrest: distributed REST-based master/worker framework for jMetal-encoded optimization problems",
-    "description": "Distributed REST-based master/worker framework for jMetal-encoded optimization problems. A Spring WebFlux master dispatches solution evaluations to remote workers implemented in Java or Python.",
+    "description": "Distributed REST-based master/worker framework for jMetal-encoded optimization problems. A Spring WebFlux master runs steady-state NSGA-II, MOEA/D, SMS-EMOA and PAES and dispatches the solution evaluations to remote workers, which can be written in Java, Python (with the bundled client and command-line worker), MATLAB or any other language that can make HTTP requests. Configuration files with a launcher run real-coded problems without writing a master.",
     "upload_type": "software",
-    "license": "AGPL-3.0",
+    "license": "AGPL-3.0-or-later",
     "creators": [
         {
             "name": "Galeano Brajones, Jesús",
@@ -21,6 +21,12 @@
         "distributed computing",
         "jMetal",
         "master-worker",
-        "REST"
+        "REST",
+        "NSGA-II",
+        "MOEA/D",
+        "SMS-EMOA",
+        "PAES",
+        "metaheuristics",
+        "HPC"
     ]
 }

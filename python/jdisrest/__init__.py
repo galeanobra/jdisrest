@@ -1,5 +1,5 @@
 """
-jdisrest — Python client for the jDisREST distributed optimization framework.
+jdisrest: Python client for the jdisrest distributed optimization framework.
 
 Minimal usage
 -------------
@@ -70,4 +70,4 @@ from ._worker import Worker
 
 __all__ = ["Worker", "EvalResult", "Evaluator", "Variables", "FunctionEvaluator", "load_function",
            "add_worker_arguments", "configure_logging", "run_worker"]
-__version__ = "1.2.0.dev0"
+__version__ = "1.2.0"

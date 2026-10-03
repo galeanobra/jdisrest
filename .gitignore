@@ -17,3 +17,10 @@ venv/
 .pytest_cache/
 build/
 dist/
+
+# What the README quick start writes when the master runs in the clone root
+/VAR.csv
+/FUN.csv
+/status.json
+/.master-endpoint
+/traces/

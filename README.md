@@ -72,10 +72,11 @@ to cite jMetal itself.
 *(or any other HTTP client)*
 
 1. The master starts and waits for workers to register via heartbeat.
-2. Each worker long-polls `GET /tasks/next` for a solution to evaluate.
+2. Each worker long-polls `GET /api/v1/tasks/next` for a solution to
+   evaluate.
 3. The worker evaluates it (however long that takes) and posts the
-   result back to `POST /tasks/{id}/result`, or reports a failed
-   evaluation to `POST /tasks/{id}/error`. The master requeues a task
+   result back to `POST /api/v1/tasks/{id}/result`, or reports a failed
+   evaluation to `POST /api/v1/tasks/{id}/error`. The master requeues a task
    whose evaluation failed (an error report, or a result it rejects), and
    discards it after three failed evaluations
    (`AbstractMaster.setMaxTaskFailures` changes the limit).
@@ -101,7 +102,7 @@ deployment patterns, monitoring and control, and internals.
 ### Java (Maven)
 
 ```
-git clone https://github.com/galeanobra/jdisrest.git
+git clone --branch v1.2.0 https://github.com/galeanobra/jdisrest.git
 cd jdisrest
 mvn install        # deposits into ~/.m2/repository
 ```
@@ -112,7 +113,7 @@ Consumers reference it via:
 <dependency>
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
 </dependency>
 ```
 
@@ -120,8 +121,12 @@ Consumers reference it via:
 
 ```
 cd jdisrest/python
-pip install -e .
+pip install .
 ```
+
+To work on the client itself, install it in editable mode instead
+(`pip install -e .`), so that changes to its sources take effect without
+reinstalling.
 
 The Python `jdisrest` package exposes `Worker`, `Evaluator`, and
 `EvalResult` used by worker processes to connect to a running Java master,
@@ -231,7 +236,7 @@ them.
 
 ```
 jdisrest/
-├── pom.xml                       # Maven library (es.unex:jdisrest:1.1.0)
+├── pom.xml                       # Maven library (es.unex:jdisrest:1.2.0)
 ├── src/main/java/es/unex/jdisrest/
 │   ├── config/                   # Configuration files, launcher, runtime reconfiguration
 │   ├── distributed/              # Master, algorithms, REST controllers
@@ -374,4 +379,4 @@ If you use jdisrest, please also cite jMetal itself:
 
 Distributed under the GNU Affero General Public License v3.0 or later.
 See [`LICENSE`](LICENSE) for the full text. For commercial licensing,
-contact the author.
+contact the authors.

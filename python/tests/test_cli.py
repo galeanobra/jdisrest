@@ -1,10 +1,12 @@
 """The command-line worker, python -m jdisrest, with a stand-in Worker and code folders written by the tests."""
 import argparse
+import importlib
 import logging
 import os
 import signal
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -333,3 +335,39 @@ def test_python_dash_m_jdisrest_runs_the_command_line():
     assert shown.returncode == 0 and shown.stdout.startswith("usage: python -m jdisrest")
     assert "--evaluator MODULE:ATTR" in shown.stdout
     assert missing.returncode == 2 and "--evaluator" in missing.stderr
+
+
+def test_the_console_script_shows_its_own_name_whatever_launcher_runs_it(monkeypatch, capsys):
+    # Python 3.14 colours the help when FORCE_COLOR or PYTHON_COLORS=1 is set, even when captured.
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(sys, "argv", [str(Path("venv", "Scripts", "jdisrest-worker.exe")), "--help"])
+
+    with pytest.raises(SystemExit) as shown:
+        _cli.console_main()
+    usage = capsys.readouterr().out
+    monkeypatch.setattr(sys, "argv", ["jdisrest-worker.exe"])
+    with pytest.raises(SystemExit) as missing:
+        _cli.console_main()
+    error = capsys.readouterr().err
+
+    assert shown.value.code == 0 and usage.startswith("usage: jdisrest-worker [-h] --evaluator MODULE:ATTR")
+    assert missing.value.code == 2 and "jdisrest-worker: error:" in error and ".exe" not in error
+
+
+def test_the_console_script_is_declared_with_its_entry_point():
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    module, _, attribute = pyproject["project"]["scripts"]["jdisrest-worker"].partition(":")
+
+    assert getattr(importlib.import_module(module), attribute) is _cli.console_main
+
+
+def test_the_package_carries_the_license_of_the_repository():
+    package_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((package_root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["license-files"] == ["LICENSE"]
+    assert (package_root / "LICENSE").is_file()
+    repository_license = package_root.parent / "LICENSE"
+    if not repository_license.is_file():
+        pytest.skip("not in a repository checkout, e.g. an unpacked sdist")
+    assert (package_root / "LICENSE").read_bytes() == repository_license.read_bytes()
