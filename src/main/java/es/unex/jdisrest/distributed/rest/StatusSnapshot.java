@@ -18,7 +18,10 @@ import com.fasterxml.jackson.annotation.Nulls;
  * @param finished                  {@code true} once the stopping criterion has been met
  *                                  or a stop has been requested
  *                                  ({@code POST /api/v1/stop})
- * @param evaluations               cumulative evaluations accepted by the master
+ * @param evaluations               cumulative evaluations accepted by the master; once a
+ *                                  stop has been requested or the algorithm has ended its
+ *                                  run, only those it used, without the results still
+ *                                  queued (since 1.2.1)
  * @param maxEvaluations            evaluation budget configured at startup; {@code -1}
  *                                  if not yet initialized
  * @param progress                  {@code evaluations / maxEvaluations}, clamped to

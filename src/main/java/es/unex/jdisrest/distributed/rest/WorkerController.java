@@ -73,7 +73,10 @@ public class WorkerController {
      *   <li>{@code aliveWorkers} — number of workers heard from within the last
      *       {@link Timings#WORKER_TIMEOUT_S} seconds.</li>
      *   <li>{@code totalEvaluations} — cumulative number of evaluations successfully
-     *       submitted since the master started.</li>
+     *       submitted since the master started: the {@code evaluations} of
+     *       {@code GET /api/v1/status}, so once a stop has been requested or the algorithm
+     *       has ended its run it leaves out the {@code queuedResults}, which the algorithm
+     *       will never process.</li>
      *   <li>{@code totalDispatched} — cumulative number of tasks sent out to workers
      *       (includes tasks that were later requeued due to worker failure).</li>
      *   <li>{@code pendingTasks} — current size of {@code pendingTaskQueue}
@@ -81,7 +84,8 @@ public class WorkerController {
      *   <li>{@code inFlightTasks} — current size of {@code inFlightTasks}
      *       (tasks claimed by workers but not yet returned).</li>
      *   <li>{@code queuedResults} — current size of {@code completedTaskQueue}
-     *       (evaluations completed but not yet consumed by the algorithm thread).</li>
+     *       (evaluations completed but not yet consumed by the algorithm thread; after a
+     *       stop or the end of the run, never consumed).</li>
      *   <li>{@code workers} — the full worker registry map (worker id → metadata),
      *       sorted by worker id, including workers that may now be considered dead.</li>
      * </ul>

@@ -1,9 +1,11 @@
 package es.unex.jdisrest.distributed.rest;
 
 import es.unex.jdisrest.distributed.rest.dto.TaskPayload;
+import es.unex.jdisrest.distributed.rest.dto.TaskRejectionPayload;
 import es.unex.jdisrest.distributed.rest.dto.TaskResultPayload;
 import es.unex.jdisrest.util.SolutionVariables;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.ResponseEntity;
 import org.uma.jmetal.solution.Solution;
 import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
@@ -25,8 +27,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Wire-level behaviour of the task endpoints: the JSON the master emits for
- * each solution shape, backwards compatibility of the integer format, and the
- * validation applied to results before they touch the master-held solution.
+ * each solution shape, backwards compatibility of the integer format, the
+ * validation applied to results before they touch the master-held solution,
+ * and the answer to a result that fails it.
  *
  * <p>Serialization goes through the same Jackson 3 mapper family Spring
  * WebFlux uses at runtime ({@code tools.jackson}); the untyped-map round trip
@@ -273,6 +276,24 @@ class TaskControllerTest {
         assertNull(TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(-1000, 1000)), integer),
             "the bounds themselves are allowed");
         assertEquals(List.of(5, 6), integer.variables(), "validation must not modify the solution");
+    }
+
+    @Test
+    void invalidResultIsAnsweredAsALateOneOnceNoMoreResultsAreNeeded() {
+        String reason = "objectives[0] is not finite: NaN";
+
+        ResponseEntity<TaskRejectionPayload> late = TaskController.invalidResultAnswer(7, reason, false, true);
+        assertEquals(404, late.getStatusCode().value(), "after a stop or the end the master no longer expects it");
+        assertNull(late.getBody(), "the bodiless 404 of any late result");
+
+        ResponseEntity<TaskRejectionPayload> counted = TaskController.invalidResultAnswer(7, reason, true, false);
+        assertEquals(422, counted.getStatusCode().value());
+        assertEquals(new TaskRejectionPayload(7, reason), counted.getBody());
+
+        assertEquals(422, TaskController.invalidResultAnswer(7, reason, false, false).getStatusCode().value(),
+            "ignored because another worker holds the task: still a rejection");
+        assertEquals(422, TaskController.invalidResultAnswer(7, reason, true, true).getStatusCode().value(),
+            "counted just before a stop: the worker learns why");
     }
 
     @Test

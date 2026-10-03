@@ -50,7 +50,9 @@ final class StopRequest {
      * <p>Once a stop has been requested it returns {@code null}, <em>even if an element is
      * already waiting</em> in the queue: the results that arrive after a stop are discarded, so
      * the algorithm finishes with the state it had when the stop was requested. The element, if
-     * any, is left in the queue (or, when the stop lands while it is being taken, dropped).
+     * any, is left in the queue; one taken at the very moment the stop lands is put back, so
+     * that the queue holds every result the algorithm never processed (the status endpoints
+     * leave them out of {@code evaluations}).
      *
      * <p>The stop is therefore noticed at most {@code checkInterval} after it is requested; the
      * interval trades that latency against wake-ups of an idle algorithm thread.
@@ -67,6 +69,12 @@ final class StopRequest {
         while (element == null && !requested) {
             element = queue.poll(checkInterval.toMillis(), TimeUnit.MILLISECONDS);
         }
-        return requested ? null : element;
+        if (requested) {
+            if (element != null) {
+                queue.offer(element);  // taken as the stop landed: unprocessed, like the rest
+            }
+            return null;
+        }
+        return element;
     }
 }

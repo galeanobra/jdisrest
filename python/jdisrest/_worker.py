@@ -23,8 +23,9 @@ log = logging.getLogger("jdisrest")
 # the rejections 400, 413, 415 and 422, where the master could not apply the report and has
 # already counted a failed evaluation of the task (requeued, or discarded after its failure limit),
 # or, for a 422, ignored it because another worker holds the task now (a 400, 413 or 415 counts
-# whoever holds the task: the master cannot read the workerId of a body it has not decoded). The
-# Java RestWorker handles the same answers, and resets its count of failed requests on the same ones.
+# whoever holds the task: the master cannot read the workerId of a body it has not decoded). After
+# a stop or the end of the run, the master counts nothing and answers 404 instead of 422. The Java
+# RestWorker handles the same answers, and resets its count of failed requests on the same ones.
 _HANDLED_ANSWERS = (400, 404, 413, 415, 422)
 
 
@@ -187,9 +188,11 @@ class Worker:
         and on any answer other than 2xx. The count of failed requests starts
         again whenever the master answers as the protocol expects: 204 to a task
         request, or an answer to the report of a task, whether it took it (2xx)
-        or not (404, the task is no longer in flight; 400, 413, 415 or 422, the
-        master could not apply the report and counted a failed evaluation). A
-        task received is not enough, since its result still has to get through.
+        or not (404, the task is no longer in flight or the run has been
+        stopped or has ended; 400, 413, 415 or 422, the master could not apply
+        the report and counted a failed evaluation, unless the run has been
+        stopped or has ended). A task received is not enough, since its result
+        still has to get through.
 
         Failures of a task are reported to the master
         (``POST /api/v1/tasks/{id}/error``), which then requeues the task at once,
@@ -415,8 +418,9 @@ class Worker:
         # or the run is over (stopping criterion met, or POST /api/v1/stop) and late
         # results are dropped.
         # 400/413/415/422 = master could not apply the result and has requeued the task
-        # (or discarded it after the failure limit); its body says why. None of them is
-        # a network problem, so none counts towards the dead-master threshold.
+        # (or discarded it after the failure limit; neither once the run has been stopped
+        # or has ended); its body says why. None of them is a network problem, so none
+        # counts towards the dead-master threshold.
         # Anything else (a 5xx, another 4xx) does.
         if post_resp.status_code == 404:
             log.warning(

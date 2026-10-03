@@ -46,7 +46,9 @@ import es.unex.jdisrest.util.Timings;
  * <h2>Counters</h2>
  * {@link #totalEvaluations} and {@link #totalTasksDispatched} are maintained
  * here (not inside the master classes) so that monitoring code has a single,
- * algorithm-agnostic source of truth.
+ * algorithm-agnostic source of truth. Once the master needs no more results, the status
+ * endpoints report the results the algorithm used rather than those accepted (see
+ * {@link #evaluations(long, boolean, int)}).
   * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public class MasterFacade {
@@ -64,7 +66,9 @@ public class MasterFacade {
      * confirms the result was accepted (i.e. the
      * task had not already been requeued by the watchdog, no stop had been requested and,
      * for a {@code SteadyStateEvolutionaryAlgorithm}, the run had not ended), so it stops
-     * growing once a stop is requested or such an algorithm has ended its run.
+     * growing once a stop is requested or such an algorithm has ended its run. From then on
+     * the status endpoints subtract the results still queued, which the algorithm will never
+     * process (see {@link #evaluations(long, boolean, int)}).
      */
     private static final AtomicLong totalEvaluations    = new AtomicLong(0);
 
@@ -181,9 +185,39 @@ public class MasterFacade {
      */
     public static StatusSnapshot currentStatus() {
         BlockingQueue<?> pending = getPendingTaskQueue();
-        return snapshot(isFinished(), totalEvaluations.get(), maxEvaluations.get(), startTime.get(),
-                Instant.now(), aliveWorkerCount(Timings.WORKER_TIMEOUT_S), inFlightCount(),
+        BlockingQueue<?> completed = getCompletedTaskQueue();
+        long accepted = totalEvaluations.get();  // before the queue: see evaluations()
+        int queued = completed != null ? completed.size() : 0;
+        return snapshot(isFinished(), evaluations(accepted, needsNoMoreResults(), queued),
+                maxEvaluations.get(), startTime.get(), Instant.now(),
+                aliveWorkerCount(Timings.WORKER_TIMEOUT_S), inFlightCount(),
                 pending != null ? pending.size() : 0, discardedTaskCount());
+    }
+
+    /**
+     * The evaluations the status endpoints report: {@code evaluations} in
+     * {@code GET /api/v1/status} and {@code status.json}, {@code totalEvaluations} in
+     * {@code GET /api/v1/workers/status}. While the run goes on, the results the master has
+     * accepted, including those still queued for the algorithm, which it will process. Once the
+     * master needs no more results (a stop has been requested or the algorithm has ended its
+     * run, see {@link es.unex.jdisrest.distributed.AbstractMaster#needsNoMoreResults()}), only
+     * the results the algorithm used: the accepted ones minus those still queued, which it will
+     * never process. A run of the bundled algorithms that ends on its evaluation budget therefore
+     * reports that budget, not the results that were still queued on top of it.
+     *
+     * <p>The callers read the queue whenever they build a snapshot, rather than draining it or
+     * adjusting the counter when the run ends, so that a result queued at the very moment the
+     * run ends is left out too. They read the accepted count first: a result is queued before
+     * it is counted, so in that order a result being accepted at that moment is never taken
+     * for a used one.
+     *
+     * @param accepted            results accepted so far ({@link #getTotalEvaluations()})
+     * @param needsNoMoreResults  whether the master needs no more results
+     * @param queuedResults       results waiting in the master's completed queue
+     * @return the evaluations to report; never negative
+     */
+    static long evaluations(long accepted, boolean needsNoMoreResults, int queuedResults) {
+        return needsNoMoreResults ? Math.max(0L, accepted - queuedResults) : accepted;
     }
 
     /**
@@ -197,7 +231,7 @@ public class MasterFacade {
      * other than the budget).
      *
      * @param finished       whether the run is over
-     * @param evaluations    results accepted so far
+     * @param evaluations    the evaluations to report ({@link #evaluations(long, boolean, int)})
      * @param maxEvals       the budget; {@code 0} or less when unknown
      * @param start          when the run started; {@code null} before {@link #init}
      * @param now            the current instant
@@ -224,20 +258,25 @@ public class MasterFacade {
      * worker registry, with the keys always in the same order ({@code aliveWorkers},
      * {@code totalEvaluations}, {@code totalDispatched}, {@code pendingTasks},
      * {@code inFlightTasks}, {@code queuedResults}, {@code workers}) and the workers sorted by
-     * id. Without a master the counts are {@code 0} and {@code workers} is empty.
+     * id. {@code totalEvaluations} is the {@code evaluations} of {@code GET /api/v1/status}
+     * ({@link #evaluations(long, boolean, int)}), so once the master needs no more results it
+     * leaves out the {@code queuedResults}, which stay visible. Without a master the counts are
+     * {@code 0} and {@code workers} is empty.
      *
      * @return a new ordered map, ready to be serialized
      */
     static Map<String, Object> clusterStatus() {
         BlockingQueue<?> pending = getPendingTaskQueue();
         BlockingQueue<?> completed = getCompletedTaskQueue();
+        long accepted = getTotalEvaluations();  // before the queue: see evaluations()
+        int queued = completed != null ? completed.size() : 0;
         Map<String, Object> status = new LinkedHashMap<>();
         status.put("aliveWorkers", aliveWorkerCount(Timings.WORKER_TIMEOUT_S));
-        status.put("totalEvaluations", getTotalEvaluations());
+        status.put("totalEvaluations", evaluations(accepted, needsNoMoreResults(), queued));
         status.put("totalDispatched", getTotalTasksDispatched());
         status.put("pendingTasks", pending != null ? pending.size() : 0);
         status.put("inFlightTasks", inFlightCount());
-        status.put("queuedResults", completed != null ? completed.size() : 0);
+        status.put("queuedResults", queued);
         status.put("workers", new TreeMap<>(getWorkerRegistry()));
         return status;
     }
@@ -510,8 +549,10 @@ public class MasterFacade {
      * <p>This is faster than waiting for the {@link WatchdogScheduler} to detect the problem
      * after its {@link Timings#WORKER_TIMEOUT_S}-second timeout. If the {@code taskId} is not
      * present in {@code inFlightTasks} (e.g. already requeued by a concurrent watchdog cycle)
-     * the call is a no-op. It does not check which worker reports the failure;
-     * {@link TaskController} uses {@link #failInFlightTask(long, String)}, which does.
+     * the call is a no-op. Once the master needs no more results (a stop, or the end of the
+     * run) the task only leaves flight, and nothing is counted. It does not check which worker
+     * reports the failure; {@link TaskController} uses {@link #failInFlightTask(long, String)},
+     * which does.
      *
      * @param taskId the identifier of the task whose evaluation failed
      * @throws IllegalStateException if neither master instance is available
@@ -531,8 +572,11 @@ public class MasterFacade {
      *
      * @param taskId   the identifier of the task whose evaluation failed
      * @param workerId the worker that reports it; {@code null} when unknown
-     * @return {@code true} if the report counted; {@code false} if the task was not in flight
-     *         or is held by another worker
+     * @return {@code true} if the report was accepted while the master still needed results
+     *         (it then counts, unless a stop or the end of the run lands meanwhile);
+     *         {@code false} if the task was not in flight or is held by another worker, or if
+     *         the master needs no more results (a stop, or the end of the run: the task has then
+     *         left flight, counting nothing)
      * @throws IllegalStateException if neither master instance is available
      */
     public static boolean failInFlightTask(long taskId, String workerId) {
@@ -550,7 +594,8 @@ public class MasterFacade {
      *             delegates. The task is no longer requeued unconditionally: the call
      *             counts as a failed evaluation and discards the task once it reaches the
      *             master's failure limit
-     *             ({@link es.unex.jdisrest.distributed.AbstractMaster#setMaxTaskFailures}).
+     *             ({@link es.unex.jdisrest.distributed.AbstractMaster#setMaxTaskFailures}),
+     *             and counts nothing once the master needs no more results.
      */
     @Deprecated(since = "1.2.0")
     public static void requeueInFlightTask(long taskId) {
@@ -559,7 +604,8 @@ public class MasterFacade {
 
     /**
      * Requeues all in-flight tasks whose owning workers have not sent a heartbeat
-     * within {@code timeoutSeconds} seconds.
+     * within {@code timeoutSeconds} seconds (drops them instead once the master needs no
+     * more results: a stop, or the end of the run).
      *
      * <p>Called periodically by the {@link WatchdogScheduler}. Tasks that belong
      * to still-alive workers are left untouched. Workers are removed from the
@@ -594,6 +640,23 @@ public class MasterFacade {
     public static boolean isFinished() {
         if (ss() != null) return ss().isFinished();
         if (g() != null) return g().isFinished();
+        return false;
+    }
+
+    /**
+     * Returns whether the active master needs no more results: a stop has been requested or
+     * its algorithm has ended its run (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#needsNoMoreResults()}). Unlike
+     * {@link #isFinished()}, it is never {@code true} while the algorithm may still wait for a
+     * result. Used by {@link TaskController}, which answers a result it cannot apply then with
+     * the {@code 404} of a late result, and by the status endpoints.
+     *
+     * @return {@code true} once no more results are needed; {@code false} while the run may
+     *         still use one, or if no master instance is set
+     */
+    static boolean needsNoMoreResults() {
+        if (ss() != null) return ss().needsNoMoreResults();
+        if (g() != null) return g().needsNoMoreResults();
         return false;
     }
 
@@ -678,7 +741,9 @@ public class MasterFacade {
      * <p>This counter is only incremented when
      * {@link #submitResult(long, String, Consumer)} returns
      * {@code true}, so tasks that were requeued by the watchdog and re-evaluated
-     * are not double-counted.
+     * are not double-counted. Once the master needs no more results, the status endpoints
+     * report fewer: only the results the algorithm used, without those still queued (see
+     * {@link #evaluations(long, boolean, int)}).
      *
      * @return total accepted evaluations
      */

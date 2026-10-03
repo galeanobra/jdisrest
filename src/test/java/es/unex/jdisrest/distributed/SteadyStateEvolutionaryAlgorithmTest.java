@@ -9,6 +9,7 @@ import org.uma.jmetal.util.comparator.dominanceComparator.impl.DominanceWithCons
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -19,9 +20,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * The parts of {@link SteadyStateEvolutionaryAlgorithm} that need no REST server: how the two
  * offspring of a task are taken from whatever the crossover returns ({@code child} and
- * {@code secondChild}), and which results the master refuses once the algorithm has ended its
- * run, tested on an algorithm built without its server (constructing a real one starts Spring).
- * The rest of the class is exercised end to end.
+ * {@code secondChild}), and what the master takes from the workers once the algorithm has ended
+ * its run, tested on an algorithm built without its server (constructing a real one starts
+ * Spring). The rest of the class is exercised end to end.
  */
 class SteadyStateEvolutionaryAlgorithmTest {
 
@@ -179,5 +180,84 @@ class SteadyStateEvolutionaryAlgorithmTest {
         assertTrue(algorithm.getCompletedTaskQueue().isEmpty());
         assertEquals(0, algorithm.getEvaluations());
         assertTrue(algorithm.runEnded(), "a run ended by a stop has ended too");
+    }
+
+    @Test
+    void failureReportAfterTheRunHasEndedCountsNothing() throws InterruptedException {
+        SteadyStateEvolutionaryAlgorithm<IntegerSolution> algorithm = algorithm(1);
+        algorithm.setMaxTaskFailures(1);  // a counted failure would discard the task at once
+        Thread thread = start(algorithm);
+        ParallelTask<IntegerSolution> first = algorithm.claimNextTask("w1", 1);
+        ParallelTask<IntegerSolution> second = algorithm.claimNextTask("w2", 1);
+        assertTrue(post(algorithm, first, "w1"));
+        awaitEnd(thread);
+        int pending = algorithm.getPendingTaskQueue().size();
+
+        String log = stderrOf(() -> assertFalse(algorithm.failInFlightTask(second.getIdentifier(), "w2"),
+            "not counted, as a result would not be"));
+
+        assertTrue(algorithm.inFlightTasks.isEmpty(), "the task leaves flight");
+        assertEquals(pending, algorithm.getPendingTaskQueue().size(), "not requeued");
+        assertEquals(0, algorithm.getDiscardedTaskCount(), "not discarded");
+        assertEquals("", log);
+    }
+
+    @Test
+    void taskIsNotHandedOutOnceTheRunHasEnded() throws InterruptedException {
+        // The initial tasks the run did not need are still queued: a request that passed the
+        // controller's check just before the end must not get one, since its result would be
+        // refused.
+        SteadyStateEvolutionaryAlgorithm<IntegerSolution> algorithm = algorithm(1);
+        Thread thread = start(algorithm);
+        ParallelTask<IntegerSolution> first = algorithm.claimNextTask("w1", 1);
+        assertTrue(post(algorithm, first, "w1"));
+        awaitEnd(thread);
+        assertFalse(algorithm.getPendingTaskQueue().isEmpty());
+
+        assertNull(algorithm.claimNextTask("w2", 1), "204, then 410 on the next request");
+        assertTrue(algorithm.inFlightTasks.isEmpty());
+    }
+
+    @Test
+    void resultsStillQueuedWhenTheRunEndsAreTheOnlyOnesLeftUnused() throws Exception {
+        // Two results arrive while the algorithm thread is still busy with the one that spends the
+        // budget: both are accepted, since the loop has not noticed the end yet, and neither is
+        // ever processed. This pins the end state the status endpoints rely on when they report
+        // accepted minus queued once the master needs no more results: the results left unused
+        // are exactly those still queued. The reported value itself is not checked here, since
+        // MasterFacade reads it from a registered master, which no unit test sets up.
+        SteadyStateEvolutionaryAlgorithm<IntegerSolution> algorithm = algorithm(1);
+        CountDownLatch processing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        algorithm.observable().register((observable, attributes) -> {
+            if (algorithm.getEvaluations() == 1) {  // after the first result, before the loop checks
+                processing.countDown();
+                try {
+                    release.await(TIMEOUT_S, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        Thread thread = start(algorithm);
+        List<ParallelTask<IntegerSolution>> tasks = new ArrayList<>();
+        for (String worker : List.of("w1", "w2", "w3")) {
+            tasks.add(algorithm.claimNextTask(worker, 1));
+        }
+
+        assertTrue(post(algorithm, tasks.get(0), "w1"));
+        assertTrue(processing.await(TIMEOUT_S, TimeUnit.SECONDS), "the first result never reached the algorithm");
+        assertFalse(algorithm.needsNoMoreResults(), "the loop has not noticed the end yet");
+        assertTrue(post(algorithm, tasks.get(1), "w2"), "so the results that arrive now are accepted");
+        assertTrue(post(algorithm, tasks.get(2), "w3"));
+        release.countDown();
+        awaitEnd(thread);
+        int accepted = 3;
+
+        assertTrue(algorithm.needsNoMoreResults());
+        assertEquals(1, algorithm.getEvaluations());
+        assertEquals(2, algorithm.getCompletedTaskQueue().size(), "the two late ones were never taken");
+        assertEquals(algorithm.getEvaluations(), accepted - algorithm.getCompletedTaskQueue().size(),
+            "accepted minus queued is what the algorithm used");
     }
 }

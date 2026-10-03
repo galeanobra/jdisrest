@@ -56,6 +56,9 @@ import java.util.function.Consumer;
  *   <li>Finishing early on request ({@code POST /api/v1/stop}, see {@link #requestStop()}):
  *       {@link #isFinished()} reports the run as finished and the default {@code run()} loops
  *       return with the current result.</li>
+ *   <li>Taking nothing more from the workers once a stop has been requested or the algorithm
+ *       has ended its run ({@link #needsNoMoreResults()}): no task is handed out, results are
+ *       refused and failure reports count nothing.</li>
  * </ul>
  *
  * <h2>Arbitration</h2>
@@ -631,7 +634,9 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      *       with a task it has just been given.</li>
      *   <li>If the worker held an in-flight task ({@link WorkerEntry#currentTaskId} ≥ 0),
      *       that task is removed from {@link #inFlightTasks} and added back to
-     *       {@link #pendingTaskQueue}.</li>
+     *       {@link #pendingTaskQueue}; once the master needs no more results
+     *       ({@link #needsNoMoreResults()}) it is dropped instead, since nobody would hand it
+     *       out again.</li>
      * </ol>
      * When at least one worker was removed, a summary with their number and the queue sizes is
      * logged.
@@ -662,7 +667,11 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
             long taskId = deadWorker.currentTaskId;
             if (taskId >= 0) {
                 T orphan = inFlightTasks.remove(taskId);
-                if (orphan != null) {
+                if (orphan != null && needsNoMoreResults()) {
+                    taskFailures.forget(taskId);
+                    Log.info("Dropping task " + taskId + " from dead worker " + deadWorker.workerId
+                            + " — the run needs no more results");
+                } else if (orphan != null) {
                     Log.info("Requeueing task " + taskId + " from dead worker " + deadWorker.workerId);
                     pendingTaskQueue.add(orphan);
                 }
@@ -716,14 +725,16 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      *   <li>The task ID is not found in {@link #inFlightTasks}, typically because the watchdog
      *       re-enqueued it after the reporting worker was considered dead. The late result is
      *       discarded to avoid double-processing, and a warning is logged.</li>
-     *   <li>A stop has been requested ({@link #requestStop()}), or the algorithm has ended its
-     *       run ({@link #runEnded()}). The task leaves {@link #inFlightTasks} but its result is
+     *   <li>The master needs no more results ({@link #needsNoMoreResults()}): a stop has been
+     *       requested ({@link #requestStop()}), or the algorithm has ended its run
+     *       ({@link #runEnded()}). The task leaves {@link #inFlightTasks} but its result is
      *       dropped: the algorithm finishes with the state it had when the stop was requested,
      *       or has left its loop already, and refusing the result here stops the
      *       {@code evaluations} counter of {@code GET /api/v1/status} from growing after the
      *       stop or the end. Results accepted before then that the algorithm thread has not
-     *       taken yet (and one being recorded at that very moment) are still counted, then
-     *       dropped.</li>
+     *       taken yet (and one being recorded at that very moment) stay unprocessed in
+     *       {@link #completedTaskQueue}, which the status endpoints then leave out of
+     *       {@code evaluations}.</li>
      * </ul>
      *
      * <p>Whenever the task was in flight, every worker's {@link WorkerEntry#currentTaskId} that
@@ -735,7 +746,8 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      *
      * <p>If {@code recorder} throws, the result could not be recorded: the task is handled as a
      * failed evaluation (requeued, or discarded after too many failures, as in
-     * {@link #failInFlightTask(long)}) and the exception is rethrown.
+     * {@link #failInFlightTask(long)}; nothing is counted if the master needs no more results by
+     * then) and the exception is rethrown.
      *
      * @param taskId   the identifier of the completed task
      * @param workerId the ID of the worker submitting the result; may be {@code null}
@@ -765,7 +777,7 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
             });
         }
 
-        if (isStopRequested() || runEnded()) {
+        if (needsNoMoreResults()) {
             taskFailures.forget(taskId);
             return false;  // the run is over: nobody will process this result
         }
@@ -800,6 +812,13 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      * sees it: a steady-state algorithm simply loses that offspring, and a generational
      * algorithm receives a generation with fewer than {@code populationSize} results.
      *
+     * <p>Once the master needs no more results ({@link #needsNoMoreResults()}: a stop has been
+     * requested or the algorithm has ended its run), the failure counts nothing: the task still
+     * leaves flight and its holder is released, but it is neither requeued into a queue nobody
+     * serves any more nor discarded (no ERROR line, no {@link #onTaskDiscarded} call, nothing
+     * added to {@link #getDiscardedTaskCount()}), and the failures recorded for it are
+     * forgotten, as for a result refused at that point.
+     *
      * <p>No-op if the task is no longer in flight (the watchdog already requeued it, or another
      * report for the same dispatch won the race), so each dispatch counts at most once.
      *
@@ -825,13 +844,19 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      * <p>The report is accepted when {@code workerId} is the task's holder (the worker whose
      * {@link WorkerEntry#currentTaskId} points at it), when no registered worker holds the task,
      * or when {@code workerId} is {@code null} (the reporter is unknown, for instance because the
-     * request body could not be decoded).
+     * request body could not be decoded). Once the master needs no more results
+     * ({@link #needsNoMoreResults()}) an accepted report still goes to
+     * {@link #failInFlightTask(long)}, which takes the task out of flight, but it counts nothing,
+     * and this method returns {@code false}.
      *
      * @param taskId   the identifier of the task whose evaluation failed
      * @param workerId the worker that reports the failure; may be {@code null}
-     * @return {@code true} if the report was accepted and handed to
-     *         {@link #failInFlightTask(long)}; {@code false} if the task was not in flight or
-     *         is held by another worker
+     * @return {@code true} if the report was accepted while the master still needed results, and
+     *         handed to {@link #failInFlightTask(long)}, which counts it as a failed evaluation
+     *         unless the task has left flight in the meantime or a stop or the end of the run
+     *         lands during the call; {@code false} if the task was not in flight or is held by
+     *         another worker (nothing happens then), or the master already needed no more
+     *         results (the task has left flight, counting nothing)
      */
     public boolean failInFlightTask(long taskId, String workerId) {
         if (!inFlightTasks.containsKey(taskId)) {
@@ -849,18 +874,30 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
                     + " ignored — the task is now held by " + holder);
             return false;
         }
+        // Read before the call. Once no more results are needed that never changes, so false here
+        // is exact: the call counts nothing. A stop or the end of the run landing during the call
+        // can still leave it true although nothing was counted; TaskController then answers 422
+        // and logs the failure as counted, for a task that has only left flight.
+        boolean counted = !needsNoMoreResults();
         failInFlightTask(taskId);
-        return true;
+        return counted;
     }
 
     /**
      * Counts one failed evaluation of a task that has just been taken out of
-     * {@link #inFlightTasks}, then requeues or discards it.
+     * {@link #inFlightTasks}, then requeues or discards it; once the master needs no more
+     * results ({@link #needsNoMoreResults()}), only forgets the task's failures. Every failure
+     * goes through here: {@link #failInFlightTask(long)} and its callers, and a result that
+     * {@link #submitResult(long, String, Consumer)} could not record.
      *
      * @param task the task whose evaluation failed
      */
     private void failedEvaluation(T task) {
         long taskId = task.getIdentifier();
+        if (needsNoMoreResults()) {
+            taskFailures.forget(taskId);
+            return;  // nobody would hand the task out again or process its result
+        }
         // Winning the remove that took the task out of flight makes this the only failure of the
         // dispatch, so the count read here cannot change before recordFailure.
         int attempt = taskFailures.failures(taskId) + 1;
@@ -879,7 +916,8 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
 
     /**
      * Records a failed evaluation of an in-flight task, which is requeued or, after too many
-     * failures, discarded.
+     * failures, discarded; nothing is counted once the master needs no more results (see
+     * {@link #failInFlightTask(long)}).
      *
      * @param taskId the identifier of the task whose evaluation failed
      * @deprecated since 1.2.0, renamed to {@link #failInFlightTask(long)}, to which it
@@ -1074,15 +1112,17 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      *   <li>{@link #isFinished()} is {@code true}, so workers get {@code 410 Gone} on their
      *       next {@code GET /api/v1/tasks/next} and shut down. Requests already being served
      *       may still receive one task each.</li>
-     *   <li>Results of the evaluations still in flight are refused
+     *   <li>The master needs no more results ({@link #needsNoMoreResults()}): results of the
+     *       evaluations still in flight are refused
      *       ({@link #submitResult(long, String, Consumer)} returns {@code false}, the worker
-     *       gets {@code 404}) and dropped.</li>
+     *       gets {@code 404}) and dropped, and their failure reports count nothing.</li>
      *   <li>The default {@code run()} loops return with the current result, which the caller
      *       of {@code run()} writes as at a normal finish:
      *       {@link SteadyStateMaster#waitForComputedTask()} returns {@code null} within a
      *       fraction of a second, and {@link GenerationalMaster#waitForEvaluatedTasks()}
      *       returns the part of the generation it has already taken within about a second.
-     *       Results still waiting in {@link #completedTaskQueue} are not processed.</li>
+     *       Results still waiting in {@link #completedTaskQueue} are not processed, and the
+     *       status endpoints leave them out of {@code evaluations}.</li>
      * </ul>
      *
      * <p>It does not stop the REST server or the {@code status.json} writer; {@link #shutdown()}
@@ -1116,10 +1156,10 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
 
     /**
      * Whether the algorithm has ended its run: {@code true} once it has left its loop for good,
-     * whatever ended it, with or without a stop. From then on
-     * {@link #submitResult(long, String, Consumer)} refuses results as it does after
-     * {@link #requestStop()}, so that a result still in flight when the run ended is answered
-     * {@code 404} and not counted, instead of being accepted into a queue nobody reads.
+     * whatever ended it, with or without a stop. From then on the master needs no more results
+     * ({@link #needsNoMoreResults()}), as after {@link #requestStop()}: a result still in flight
+     * when the run ended is answered {@code 404} and not counted, instead of being accepted into
+     * a queue nobody reads, and a failure report counts nothing.
      *
      * <p>It must not become {@code true} any earlier: a stopping condition that REST threads
      * already see met ({@link #isFinished()}) is not enough, because the loop may still be
@@ -1131,6 +1171,37 @@ public abstract class AbstractMaster<T extends ParallelTask<?>, R> {
      */
     boolean runEnded() {
         return false;
+    }
+
+    /**
+     * Whether the master needs no more results from the workers: a stop has been requested
+     * ({@link #requestStop()}) or the algorithm has ended its run ({@link #runEnded()}). Once
+     * {@code true} it stays {@code true}. Nothing the workers deliver from then on is used, so the
+     * master takes nothing more from them:
+     * <ul>
+     *   <li>{@link SteadyStateMaster#claimNextTask} and {@link GenerationalMaster#claimNextTask}
+     *       hand out no task;</li>
+     *   <li>a result is refused ({@link #submitResult(long, String, Consumer)}, {@code 404}), and
+     *       a failure report counts nothing ({@link #failInFlightTask(long)}): either way the task
+     *       leaves flight, and it is neither requeued nor discarded;</li>
+     *   <li>the watchdog drops the task of a silent worker instead of requeueing it
+     *       ({@link #requeueOrphanTasks(long)});</li>
+     *   <li>the results still waiting in {@link #completedTaskQueue} will never be processed, so
+     *       {@code GET /api/v1/status} and {@code status.json} leave them out of
+     *       {@code evaluations}.</li>
+     * </ul>
+     *
+     * <p>Unlike {@link #isFinished()}, it is not {@code true} merely because the stopping
+     * condition is met as REST threads see it: the loop may still be waiting for the result that
+     * lets it notice (see {@link #runEnded()}), and taking nothing more could hang the run. A
+     * master that does not extend {@link SteadyStateEvolutionaryAlgorithm}, the class of the
+     * framework that reports the end of its run, needs no more results only after a stop. Final,
+     * so that all of the above always agree.
+     *
+     * @return {@code true} once a stop has been requested or the algorithm has ended its run
+     */
+    public final boolean needsNoMoreResults() {
+        return isStopRequested() || runEnded();
     }
 
     /**

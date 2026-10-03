@@ -125,7 +125,8 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * returns or throws. From then on {@link #stoppingConditionIsNotMet()} is {@code false}
      * whatever {@link #termination} says, so a later {@link #setTermination} cannot reopen the
      * run and a failed run stops handing out tasks nobody would collect. {@link #runEnded()}
-     * returns it, so the master also refuses the results still in flight.
+     * returns it, so the master also takes nothing more from the workers
+     * ({@link #needsNoMoreResults()}).
      */
     private volatile boolean runFinished;
     /**
@@ -574,9 +575,11 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
     /**
      * {@code true} once the algorithm has left its loop for good: its thread has found the
      * termination met, or {@link #run()} has returned or thrown, with or without a stop. No
-     * result is processed after that, so the master refuses the results still in flight
-     * ({@code 404}, not counted in the {@code evaluations} of {@code GET /api/v1/status}), as
-     * after a stop.
+     * result is processed after that, so the master needs no more results
+     * ({@link #needsNoMoreResults()}), as after a stop: it hands out no task, refuses the
+     * results still in flight ({@code 404}, not counted in the {@code evaluations} of
+     * {@code GET /api/v1/status}), counts no failure report, and leaves the results still
+     * queued out of those {@code evaluations}.
      */
     @Override
     boolean runEnded() {

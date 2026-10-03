@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -72,16 +73,22 @@ class AbstractMasterTest {
 
     /**
      * A master without REST server or discovery file, whose readiness, stopping condition and end
-     * of run the test sets.
+     * of run the test sets, and which records the tasks it hands to {@code onTaskDiscarded}.
      */
     static final class TestMaster extends AbstractMaster<ParallelTask<IntegerSolution>, Void> {
         volatile boolean ready = true;
         volatile BooleanSupplier running = () -> true;
         volatile boolean ended = false;
+        final List<Long> discardHooks = new CopyOnWriteArrayList<>();
 
         @Override public boolean isReady() { return ready; }
         @Override public boolean stoppingConditionIsNotMet() { return running.getAsBoolean(); }
         @Override boolean runEnded() { return ended; }
+
+        @Override
+        protected void onTaskDiscarded(ParallelTask<IntegerSolution> task) {
+            discardHooks.add(task.getIdentifier());
+        }
 
         long pointerOf(String workerId) {
             WorkerEntry entry = workerRegistry.get(workerId);
@@ -488,6 +495,22 @@ class AbstractMasterTest {
         assertEquals(1, master.getCompletedTaskQueue().size());
     }
 
+    @Test
+    void masterNeedsNoMoreResultsOnlyOnceAStopIsRequestedOrTheRunHasEnded() {
+        TestMaster master = new TestMaster();
+        master.running = () -> false;  // met as REST threads see it
+
+        assertTrue(master.isFinished());
+        assertFalse(master.needsNoMoreResults(), "the loop may still be waiting for the result that lets it notice");
+
+        master.ended = true;
+        assertTrue(master.needsNoMoreResults());
+
+        TestMaster stopped = new TestMaster();
+        stderrOf(stopped::requestStop);
+        assertTrue(stopped.needsNoMoreResults());
+    }
+
     // ── Failures ──────────────────────────────────────────────────────────────
 
     @Test
@@ -554,6 +577,83 @@ class AbstractMasterTest {
         assertTrue(master.getPendingTaskQueue().isEmpty());
     }
 
+    @Test
+    void failureReportIsStillCountedWhileOnlyTheStoppingConditionIsMet() {
+        // As for a result: the loop may still be waiting for one more result to notice its
+        // criterion, so the task goes back to the queue for another worker.
+        TestMaster master = new TestMaster();
+        master.recordDispatch("w1", task(1));
+        master.running = () -> false;
+
+        boolean[] counted = new boolean[1];
+        stderrOf(() -> counted[0] = master.failInFlightTask(1L, "w1"));
+
+        assertTrue(master.isFinished());
+        assertTrue(counted[0], "counted until the algorithm has left its loop");
+        assertEquals(1, master.getPendingTaskQueue().size(), "requeued for another worker");
+    }
+
+    @Test
+    void failureReportAfterTheRunHasEndedCountsNothing() {
+        // Task 1 failed on w1 after another worker's result had ended the run: nobody would hand
+        // it out again, so requeueing or discarding it would only distort the counts.
+        TestMaster master = new TestMaster();
+        master.setMaxTaskFailures(1);  // a counted failure would discard the task at once
+        master.recordDispatch("w1", task(1));
+        master.ended = true;
+
+        boolean[] counted = new boolean[1];
+        String log = stderrOf(() -> counted[0] = master.failInFlightTask(1L, "w1"));
+
+        assertFalse(counted[0], "not counted");
+        assertTrue(master.inFlightTasks.isEmpty(), "the task leaves flight");
+        assertEquals(-1L, master.pointerOf("w1"), "the worker is idle again");
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "not requeued into a queue nobody serves");
+        assertEquals(0, master.getDiscardedTaskCount(), "not discarded either");
+        assertEquals(List.of(), master.discardHooks, "so onTaskDiscarded is not called");
+        assertEquals("", log, "and no discard is logged");
+        assertFalse(master.isStopRequested(), "a normal end is not turned into a stop");
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void failureAfterAStopCountsNothingWhicheverWayItIsReported() {
+        TestMaster master = new TestMaster();
+        master.setMaxTaskFailures(1);
+        master.recordDispatch("w1", task(1));
+        master.recordDispatch("w2", task(2));
+        master.recordDispatch("w3", task(3));
+        stderrOf(master::requestStop);
+
+        String log = stderrOf(() -> {
+            assertFalse(master.failInFlightTask(1L, null), "a body that could not be decoded: not counted");
+            master.failInFlightTask(2L);
+            master.requeueInFlightTask(3L);
+        });
+
+        assertTrue(master.inFlightTasks.isEmpty(), "every task leaves flight");
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "none is requeued");
+        assertEquals(0, master.getDiscardedTaskCount(), "none is discarded");
+        assertEquals(List.of(), master.discardHooks);
+        assertEquals("", log);
+    }
+
+    @Test
+    void resultThatCannotBeRecordedWhenAStopLandsCountsNothing() {
+        // The stop lands while the result is written, after submitResult has checked for one:
+        // the failure goes through the same check as every other failure.
+        TestMaster master = new TestMaster();
+        master.recordDispatch("w1", task(1));
+
+        assertThrows(IllegalArgumentException.class, () -> stderrOf(() -> master.submitResult(1L, "w1", t -> {
+            master.requestStop();
+            throw new IllegalArgumentException("objectives[0] is not finite: NaN");
+        })));
+
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "not requeued into a queue nobody serves");
+        assertTrue(master.getCompletedTaskQueue().isEmpty());
+    }
+
     // ── Watchdog ──────────────────────────────────────────────────────────────
 
     @Test
@@ -573,6 +673,35 @@ class AbstractMasterTest {
         assertTrue(log.contains("Watchdog: 2 worker(s) removed"),
             "the summary reports the real number of evicted workers: " + log);
         assertEquals("", stderrOf(() -> master.requeueOrphanTasks(45)), "nothing to report when nobody died");
+    }
+
+    @Test
+    void watchdogStillRequeuesWhileOnlyTheStoppingConditionIsMet() {
+        TestMaster master = new TestMaster();
+        master.recordDispatch("dead", task(1));
+        master.workerRegistry.get("dead").lastSeen = Instant.now().minusSeconds(3600);
+        master.running = () -> false;
+
+        String log = stderrOf(() -> master.requeueOrphanTasks(45));
+
+        assertTrue(master.isFinished());
+        assertEquals(1, master.getPendingTaskQueue().size(), "the loop may still be waiting for its result");
+        assertTrue(log.contains("Requeueing task 1 from dead worker dead"), log);
+    }
+
+    @Test
+    void watchdogDropsTheTaskOfASilentWorkerOnceTheRunHasEnded() {
+        TestMaster master = new TestMaster();
+        master.recordDispatch("dead", task(1));
+        master.workerRegistry.get("dead").lastSeen = Instant.now().minusSeconds(3600);
+        master.ended = true;
+
+        String log = stderrOf(() -> master.requeueOrphanTasks(45));
+
+        assertTrue(master.getWorkerRegistry().isEmpty(), "the silent worker is removed as before");
+        assertTrue(master.inFlightTasks.isEmpty());
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "but its task is not requeued: nobody would hand it out");
+        assertTrue(log.contains("Dropping task 1 from dead worker dead"), log);
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────────

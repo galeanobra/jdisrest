@@ -145,10 +145,12 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * {@code MasterSpringApp.virtualThreadScheduler()}) — never from the WebFlux event-loop
      * thread — so blocking is safe, and many workers can wait in the long-poll at once.
      *
-     * <p>A task obtained during the long-poll after a stop has been requested
-     * ({@link #requestStop()}) is dropped instead of being put in flight, as in
-     * {@link SteadyStateMaster#claimNextTask}: a task requeued after the stop, by a failed
-     * evaluation or the watchdog, must not keep a waiting worker busy for nothing.
+     * <p>Once the master needs no more results ({@link #needsNoMoreResults()}, which for a
+     * generational master means once a stop has been requested) it hands out nothing, as
+     * {@link SteadyStateMaster#claimNextTask} does: it returns {@code null} at once, and drops
+     * the task it obtains if the stop lands during the long-poll instead of putting it in
+     * flight, so that a task whose result would be refused does not keep a worker busy for
+     * nothing.
      *
      * <p>Until the algorithm is ready ({@link #isReady()}) it returns {@code null} at once. A task
      * handed out is registered with {@link #recordDispatch}, which also requeues the worker's
@@ -163,11 +165,11 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * @throws InterruptedException if the thread is interrupted while waiting
      */
     public T claimNextTask(String workerId, int timeoutSeconds) throws InterruptedException {
-        if (!isReady()) {
-            return null;  // 204: the worker asks again a few seconds later
+        if (needsNoMoreResults() || !isReady()) {
+            return null;  // 410 Gone, or 204 until the algorithm can serve
         }
         T task = pendingTaskQueue.poll(timeoutSeconds, TimeUnit.SECONDS);
-        if (task != null && isStopRequested()) {
+        if (task != null && needsNoMoreResults()) {
             return null;  // a stop arrived while the worker was waiting: hand nothing out
         }
         if (task != null) {

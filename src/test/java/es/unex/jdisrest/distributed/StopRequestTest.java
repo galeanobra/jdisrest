@@ -113,6 +113,23 @@ class StopRequestTest {
     }
 
     @Test
+    void elementTakenAsTheStopLandsIsPutBack() throws InterruptedException {
+        StopRequest stop = new StopRequest();
+        BlockingQueue<String> queue = new LinkedBlockingQueue<>(List.of("result")) {
+            @Override
+            public String poll(long timeout, TimeUnit unit) throws InterruptedException {
+                String element = super.poll(timeout, unit);
+                stop.request();  // lands right after the element was taken
+                return element;
+            }
+        };
+
+        assertNull(stop.takeUnlessStopped(queue, CHECK_INTERVAL), "the stop wins: nothing more is processed");
+        assertEquals(List.of("result"), List.copyOf(queue),
+            "back in the queue, which holds every result the algorithm never processed");
+    }
+
+    @Test
     void stopFromAnotherThreadEndsAWaitOnAnEmptyQueue() throws Exception {
         StopRequest stop = new StopRequest();
         FutureTask<String> wait = waitInBackground(stop, queueOf());
