@@ -1,9 +1,14 @@
 package es.unex.jdisrest.distributed;
 
 import org.junit.jupiter.api.Test;
+import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.compositesolution.CompositeSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.FutureTask;
@@ -12,12 +17,16 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static es.unex.jdisrest.distributed.AbstractMasterTest.intSolution;
+import static es.unex.jdisrest.distributed.AbstractMasterTest.stringSolution;
+import static es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithmTest.binary;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * The generation barrier of {@link GenerationalMaster#waitForEvaluatedTasks()}: discarded tasks
  * and a stop must end the wait, which would otherwise block on results that never come. Tested
  * through {@link GenerationalMaster#awaitGeneration}, since constructing a master starts Spring.
+ * And the check of the first generation submitted, on a master built without its server.
  */
 class GenerationalMasterTest {
 
@@ -31,6 +40,24 @@ class GenerationalMasterTest {
 
     static BlockingQueue<String> completed(String... tasks) {
         return new LinkedBlockingQueue<>(List.of(tasks));
+    }
+
+    /** A master without REST server whose generations the tests submit themselves. */
+    static final class TestMaster extends GenerationalMaster<ParallelTask<Object>, Void> {
+        TestMaster() {
+            super(null, 2);
+        }
+
+        @Override public List<ParallelTask<Object>> createInitialTasks() { return List.of(); }
+        @Override public void evolution(List<ParallelTask<Object>> population) { }
+        @Override public boolean stoppingConditionIsNotMet() { return false; }
+        @Override public Void getResult() { return null; }
+    }
+
+    static List<ParallelTask<Object>> generation(Object... contents) {
+        List<ParallelTask<Object>> tasks = new ArrayList<>();
+        for (int i = 0; i < contents.length; i++) tasks.add(ParallelTask.create(i, contents[i]));
+        return tasks;
     }
 
     static List<String> await(BlockingQueue<String> completed, int expected, int discarded, boolean stopped) {
@@ -55,6 +82,48 @@ class GenerationalMasterTest {
             Thread.sleep(1);
         }
         return wait;
+    }
+
+    // ── Submission ────────────────────────────────────────────────────────────
+
+    @Test
+    void solutionThatCannotTravelFailsTheFirstSubmissionBeforeAnythingIsQueued() {
+        TestMaster master = new TestMaster();
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> master.submitTasks(generation(stringSolution(), intSolution(1))),
+            "every task would fail with a 500 and be discarded, and a budget-driven run would never end");
+        assertTrue(e.getMessage().startsWith("Unsupported solution type "), e.getMessage());
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "nothing is queued");
+    }
+
+    @Test
+    void binaryVariableOfNoBitsFailsTheFirstSubmission() {
+        TestMaster master = new TestMaster();
+        BinarySolution s = binary("101", "1");
+        s.variables().set(1, new BinarySet(0));
+
+        assertThrows(IllegalArgumentException.class, () -> master.submitTasks(generation(s)));
+        assertTrue(master.getPendingTaskQueue().isEmpty(), "nothing is queued");
+    }
+
+    @Test
+    void solutionsOfEveryEncodingAreQueued() {
+        TestMaster master = new TestMaster();
+
+        master.submitTasks(generation(binary("101", "00110"),
+            new CompositeSolution(List.of(intSolution(3), binary("01")))));
+
+        assertEquals(2, master.getPendingTaskQueue().size());
+    }
+
+    @Test
+    void contentsThatAreNotSolutionsAreQueuedUnchecked() {
+        TestMaster master = new TestMaster();
+
+        master.submitTasks(generation("a task of another kind"));
+
+        assertEquals(1, master.getPendingTaskQueue().size());
     }
 
     // ── Full generation ───────────────────────────────────────────────────────
