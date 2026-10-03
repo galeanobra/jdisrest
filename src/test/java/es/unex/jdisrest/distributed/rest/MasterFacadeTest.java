@@ -12,7 +12,8 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * The arithmetic of the progress snapshot, the evaluations both status endpoints report, and
  * the body of {@code GET /api/v1/workers/status}, with and without a master. Unit tests never
- * construct a master (its constructor starts Spring), so the facade has none here.
+ * construct a master (its constructor starts Spring), so the facade has none here; the
+ * integration tests ({@code EndOfRunScenario}) read both endpoints from a real one.
  */
 class MasterFacadeTest {
 

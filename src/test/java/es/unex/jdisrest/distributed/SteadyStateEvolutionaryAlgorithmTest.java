@@ -225,7 +225,8 @@ class SteadyStateEvolutionaryAlgorithmTest {
         // ever processed. This pins the end state the status endpoints rely on when they report
         // accepted minus queued once the master needs no more results: the results left unused
         // are exactly those still queued. The reported value itself is not checked here, since
-        // MasterFacade reads it from a registered master, which no unit test sets up.
+        // MasterFacade reads it from a registered master, which no unit test sets up; the
+        // integration tests (EndOfRunScenario) check it over HTTP.
         SteadyStateEvolutionaryAlgorithm<IntegerSolution> algorithm = algorithm(1);
         CountDownLatch processing = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);

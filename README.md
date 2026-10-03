@@ -107,6 +107,10 @@ cd jdisrest
 mvn install        # deposits into ~/.m2/repository
 ```
 
+`mvn test` runs the unit tests. `mvn verify`, and so `mvn install`, also
+runs the integration tests (the `*IT` classes), each class in a JVM of its
+own: they start a real master on a free port and talk to it over HTTP.
+
 Consumers reference it via:
 
 ```xml
@@ -243,7 +247,7 @@ jdisrest/
 │   ├── local/                    # Sequential (non-REST) mode for debugging
 │   ├── operator/                 # Custom jMetal operators
 │   └── util/                     # Logging, timings, variable encodings, trace output
-├── src/test/java/                # JUnit tests (encodings, wire format, algorithms, configuration)
+├── src/test/java/                # JUnit unit tests, and *IT integration tests (mvn verify)
 ├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D
 ├── python/
 │   ├── pyproject.toml            # PEP 621 metadata
