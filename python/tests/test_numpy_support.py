@@ -33,6 +33,12 @@ def test_numpy_scalar_return_value_is_a_single_objective():
     assert _coerce(np.int64(7)).objectives == [7.0]
 
 
+def test_numpy_array_return_value_is_a_list_of_objectives():
+    body = _result_body("w", _coerce(np.array([1.5, 2.0])), 0)
+    assert body["objectives"] == [1.5, 2.0]
+    assert all(type(v) is float for v in body["objectives"])
+
+
 def test_numpy_nan_is_rejected_with_index():
     with pytest.raises(ValueError, match=r"objectives\[0\]"):
         _result_body("w", EvalResult(objectives=np.array([np.nan])), 0)

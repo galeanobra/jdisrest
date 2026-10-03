@@ -20,11 +20,19 @@ import org.uma.jmetal.util.pseudorandom.RandomGenerator;
  * probability, the effective probability used for each call to
  * {@link #execute(DoubleSolution)} is randomized as:
  * <pre>
- *   p_eff = mutationProbability + U[0,1] * (5 / 36)
+ *   p_eff = mutationProbability + U[0,1] * jitter
  * </pre>
- * where {@code 5/36 ≈ 0.139}. The additive jitter is re-sampled on every call,
- * introducing diversity in the mutation rate across evaluations. This can help
- * maintain population diversity and avoid premature convergence.
+ * where {@code jitter} defaults to {@code 5/36 ≈ 0.139} (a constructor parameter since
+ * 1.2.0). The additive jitter is re-sampled on every call, introducing diversity in the
+ * mutation rate across evaluations. This can help maintain population diversity and avoid
+ * premature convergence.
+ *
+ * <p>The jitter is a probability, not divided by the number of variables {@code n}: it adds
+ * {@code jitter × n / 2} mutated variables per call on average, 2.5 for the default and
+ * {@code n = 36}, and more on larger problems (unlike {@link RandomMutationWithRandomProbability},
+ * whose jitter is divided by {@code n}). The default is an empirical value; pass a jitter that
+ * suits the problem's dimension to the full constructor. Inside a {@code CompositeSolution}
+ * mutated through jMetal's {@code CompositeMutation}, each segment draws its own jitter.
  *
  * <h2>Polynomial mutation formula</h2>
  * <p>For a variable {@code y} with bounds {@code [yl, yu]}, let:
@@ -62,6 +70,9 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
      */
     private static final double DEFAULT_DISTRIBUTION_INDEX = 20.0;
 
+    /** Default jitter added to the base probability: up to {@code 5/36 ≈ 0.139}. */
+    public static final double DEFAULT_JITTER = 5.0 / 36;
+
     /**
      * Distribution index η_m ≥ 0. Controls the shape of the polynomial
      * perturbation distribution:
@@ -74,9 +85,12 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
 
     /**
      * Base mutation probability. The effective per-call probability will be at
-     * least this value and at most {@code mutationProbability + 5/36}.
+     * least this value and below {@code mutationProbability + jitter}.
      */
     private double mutationProbability;
+
+    /** Width of the jitter added to the base probability, finite and ≥ 0. */
+    private final double jitter;
 
     /**
      * Repair strategy applied after mutation to clamp values outside the
@@ -154,7 +168,7 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
     }
 
     /**
-     * Full constructor.
+     * Constructor with the default jitter ({@link #DEFAULT_JITTER}).
      *
      * @param mutationProbability base per-variable mutation probability in [0,1]
      * @param distributionIndex   polynomial distribution index (η_m ≥ 0)
@@ -166,10 +180,37 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
             double distributionIndex,
             RepairDoubleSolution solutionRepair,
             RandomGenerator<Double> randomGenerator) {
+        this(mutationProbability, distributionIndex, DEFAULT_JITTER, solutionRepair, randomGenerator);
+    }
+
+    /**
+     * Full constructor.
+     *
+     * @param mutationProbability base per-variable mutation probability in [0,1]
+     * @param distributionIndex   polynomial distribution index (η_m ≥ 0)
+     * @param jitter              width of the jitter: the effective probability is
+     *                            {@code mutationProbability + U[0,1] * jitter}; finite and ≥ 0,
+     *                            where 0 disables the jitter
+     * @param solutionRepair      strategy to clamp out-of-bounds values
+     * @param randomGenerator     supplier of uniform random doubles in [0,1)
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidConditionException
+     *         if the distribution index is negative or the jitter is negative or not finite
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidProbabilityValueException
+     *         if the probability is not in [0, 1]
+     */
+    public PolynomialMutationRandomProbability(
+            double mutationProbability,
+            double distributionIndex,
+            double jitter,
+            RepairDoubleSolution solutionRepair,
+            RandomGenerator<Double> randomGenerator) {
         Check.that(distributionIndex >= 0, "Distribution index is negative: " + distributionIndex);
         Check.probabilityIsValid(mutationProbability);
+        Check.that(Double.isFinite(jitter) && jitter >= 0,
+                "The jitter must be finite and not negative: " + jitter);
         this.mutationProbability = mutationProbability;
         this.distributionIndex = distributionIndex;
+        this.jitter = jitter;
         this.solutionRepair = solutionRepair;
         this.randomGenerator = randomGenerator;
     }
@@ -195,6 +236,15 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
      */
     public double getDistributionIndex() {
         return distributionIndex;
+    }
+
+    /**
+     * Returns the width of the jitter added to the base probability.
+     *
+     * @return the jitter: the effective probability is {@code p + U[0,1] * jitter}
+     */
+    public double jitter() {
+        return jitter;
     }
 
     /**
@@ -225,7 +275,8 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
      *
      * @param solution the solution to mutate
      * @return the mutated solution (same object, modified in-place)
-     * @throws JMetalException if {@code solution} is {@code null}
+     * @throws org.uma.jmetal.util.errorchecking.exception.NullParameterException
+     *         if {@code solution} is {@code null}
      */
     @Override
     public DoubleSolution execute(DoubleSolution solution) throws JMetalException {
@@ -241,7 +292,7 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
      *
      * <p>A fresh effective probability is drawn once per call:
      * <pre>
-     *   p_eff = mutationProbability + U[0,1] * (5/36)
+     *   p_eff = mutationProbability + U[0,1] * jitter
      * </pre>
      * Then, for each variable:
      * <ol>
@@ -255,9 +306,9 @@ public class PolynomialMutationRandomProbability implements MutationOperator<Dou
      */
     private void doMutation(DoubleSolution solution) {
         // Randomize the effective mutation probability for this call.
-        // The additive term U[0,1] * 5/36 (≈ 0–0.139) introduces per-call diversity
-        // in how aggressively the solution is mutated.
-        double randomMutation = mutationProbability + randomGenerator.getRandomValue() * 5 / 36;
+        // The additive term U[0,1] * jitter (≈ 0–0.139 by default) introduces per-call
+        // diversity in how aggressively the solution is mutated.
+        double randomMutation = mutationProbability + randomGenerator.getRandomValue() * jitter;
 
         for (int i = 0; i < solution.variables().size(); i++) {
             if (randomGenerator.getRandomValue() <= randomMutation) {

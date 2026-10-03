@@ -12,9 +12,10 @@ import java.util.Map;
  * cluster-state diagnostics.
  *
  * <p>Workers are not pre-registered; they announce themselves to the master on
- * their first {@code POST /heartbeat} call and continue sending heartbeats every
- * ~15 seconds to prove they are still alive. The {@link WatchdogScheduler} uses
- * the absence of a heartbeat for more than 45 seconds as the signal that a
+ * their first {@code POST /heartbeat} call (or their first task claim) and continue
+ * sending heartbeats every {@link Timings#HEARTBEAT_INTERVAL_S} seconds to prove they
+ * are still alive. The {@link WatchdogScheduler} uses the absence of any contact for
+ * more than {@link Timings#WORKER_TIMEOUT_S} seconds as the signal that a
  * worker has crashed or lost network connectivity.
  *
  * <p>All methods return non-blocking {@link Mono} pipelines. The heartbeat
@@ -39,11 +40,12 @@ public class WorkerController {
      * Because both registration and renewal go through the same code path, workers
      * do not need a separate "register" step — they simply start heartbeating.
      *
-     * <p>The {@link WatchdogScheduler} considers a worker dead when no heartbeat
-     * has been seen for {@link Timings#WORKER_TIMEOUT_S} (45 s), which allows for
-     * three consecutive missed intervals at the default 15-second cadence.
+     * <p>The {@link WatchdogScheduler} considers a worker dead when it has not been
+     * heard from for {@link Timings#WORKER_TIMEOUT_S} seconds, three times
+     * {@link Timings#HEARTBEAT_INTERVAL_S}.
      *
-     * <p>Always returns {@code 200 OK}.
+     * <p>Returns {@code 200 OK}; {@code 400} (Spring's default error body) when
+     * {@code workerId} is missing, and {@code 500} when no master is registered.
      *
      * @param workerId opaque worker identifier (e.g. {@code "worker-01"}); must be
      *                 unique across the cluster for correct per-worker tracking
@@ -68,8 +70,8 @@ public class WorkerController {
      *
      * <p>Returns a JSON object with the following fields:
      * <ul>
-     *   <li>{@code aliveWorkers} — number of workers that have sent a heartbeat
-     *       within the last 45 seconds.</li>
+     *   <li>{@code aliveWorkers} — number of workers heard from within the last
+     *       {@link Timings#WORKER_TIMEOUT_S} seconds.</li>
      *   <li>{@code totalEvaluations} — cumulative number of evaluations successfully
      *       submitted since the master started.</li>
      *   <li>{@code totalDispatched} — cumulative number of tasks sent out to workers
@@ -81,8 +83,10 @@ public class WorkerController {
      *   <li>{@code queuedResults} — current size of {@code completedTaskQueue}
      *       (evaluations completed but not yet consumed by the algorithm thread).</li>
      *   <li>{@code workers} — the full worker registry map (worker id → metadata),
-     *       including workers that may now be considered dead.</li>
+     *       sorted by worker id, including workers that may now be considered dead.</li>
      * </ul>
+     * The keys always come in this order. Before a master is registered every count is
+     * {@code 0} and {@code workers} is empty.
      *
      * <p>This endpoint runs on the Netty event-loop thread because all
      * {@link MasterFacade} reads involved are non-blocking atomic reads.
@@ -92,16 +96,6 @@ public class WorkerController {
      */
     @GetMapping("/status")
     public Mono<ResponseEntity<Map<String, Object>>> status() {
-        return Mono.fromCallable(() ->
-                ResponseEntity.ok(Map.of(
-                        "aliveWorkers",      MasterFacade.aliveWorkerCount(Timings.WORKER_TIMEOUT_S),
-                        "totalEvaluations",  MasterFacade.getTotalEvaluations(),
-                        "totalDispatched",   MasterFacade.getTotalTasksDispatched(),
-                        "pendingTasks",      MasterFacade.getPendingTaskQueue().size(),
-                        "inFlightTasks",     MasterFacade.inFlightCount(),
-                        "queuedResults",     MasterFacade.getCompletedTaskQueue().size(),
-                        "workers",           MasterFacade.getWorkerRegistry()
-                ))
-        );
+        return Mono.fromCallable(() -> ResponseEntity.ok(MasterFacade.clusterStatus()));
     }
 }

@@ -1,6 +1,7 @@
-# Normalize line endings across OSes: store everything as LF in the repo,
-# let git convert to the native EOL on checkout on Windows (core.autocrlf=true)
-# and keep LF on Linux/Mac.
+# Normalize line endings: text files are stored with LF in the repository and,
+# because eol=lf takes precedence over core.autocrlf and core.eol, checked out
+# with LF on every OS, Windows included. Only the scripts listed further down
+# get CRLF.
 * text=auto eol=lf
 
 # Explicitly text with LF endings (safe for scripts that must run on Linux)

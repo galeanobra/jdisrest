@@ -1,15 +1,17 @@
 package es.unex.jdisrest.distributed.rest;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import es.unex.jdisrest.distributed.SteadyStateMaster;
 import es.unex.jdisrest.distributed.GenerationalMaster;
 import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
 import org.uma.jmetal.solution.Solution;
 
-import java.nio.file.*;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.Consumer;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,8 +27,8 @@ import es.unex.jdisrest.util.Timings;
  *
  * <h2>Why a static bridge?</h2>
  * Spring creates its beans (controllers, watchdog, etc.) eagerly at application
- * context startup, <em>before</em> the algorithm object has been constructed by
- * the calling code in {@code Main.java}. A static singleton pattern avoids a
+ * context startup, which happens inside the master's own constructor, <em>before</em> the
+ * master has finished constructing itself. A static singleton pattern avoids a
  * circular dependency: the algorithm registers itself (via its constructor) and the Spring
  * beans query {@link #ss()} / {@link #g()} on every request, always obtaining
  * the latest reference without needing constructor injection.
@@ -37,7 +39,9 @@ import es.unex.jdisrest.util.Timings;
  * delegates to whichever master is currently active, checking {@link SteadyStateMaster}
  * first and falling back to {@link GenerationalMaster}. Exactly one of the two must be
  * non-null during normal operation; both being null is valid only in the brief
- * window between Spring startup and algorithm initialization.
+ * window between Spring startup and the end of the master's constructor. A master that
+ * exists but is not ready yet ({@link #isReady()}) is not finished and hands out no task,
+ * so the endpoints answer normally from the moment the server starts.
  *
  * <h2>Counters</h2>
  * {@link #totalEvaluations} and {@link #totalTasksDispatched} are maintained
@@ -55,9 +59,11 @@ public class MasterFacade {
 
     /**
      * Total number of evaluations that have been successfully completed and
-     * accepted since the master started. Incremented by {@link #submitResult}
-     * only when the underlying master confirms the result was accepted (i.e. the
-     * task had not already been requeued by the watchdog).
+     * accepted since the master started. Incremented by
+     * {@link #submitResult(long, String, Consumer)} only when the underlying master
+     * confirms the result was accepted (i.e. the
+     * task had not already been requeued by the watchdog, and no stop had been
+     * requested), so it stops growing once the run is stopped.
      */
     private static final AtomicLong totalEvaluations    = new AtomicLong(0);
 
@@ -68,15 +74,24 @@ public class MasterFacade {
      */
     private static final AtomicLong totalTasksDispatched = new AtomicLong(0);
 
-    // ── Experiment metadata (set by Main before running the algorithm) ────────
+    // ── Experiment metadata (set by the program before running the algorithm) ─
 
     /**
      * The maximum number of evaluations configured for this experiment run.
      * Initialized to {@code -1} (unknown) and set to the actual value by
-     * {@link #init}. Used by {@link StatusController} and
-     * {@link #writeStatusFile()} to compute {@code progress} and ETA.
+     * {@link #init}. Used by {@link #currentStatus()} (for {@link StatusController} and
+     * {@code status.json}) to compute {@code progress} and ETA.
      */
     private static final AtomicInteger maxEvaluations  = new AtomicInteger(-1);
+
+    /**
+     * Reads and changes the configuration of the running algorithm for
+     * {@link ConfigController}. {@code null} until the program registers one with
+     * {@link #setConfigurationHandler}; while it is {@code null}, {@code /api/v1/config}
+     * answers {@code 501 Not Implemented}. {@code volatile} because it is set by the
+     * program's thread and read by REST threads.
+     */
+    private static volatile ConfigurationHandler configurationHandler;
 
     /**
      * The {@link Instant} at which {@link #init} was called, i.e. the moment
@@ -93,22 +108,26 @@ public class MasterFacade {
     private static final AtomicBoolean initialized = new AtomicBoolean(false);
 
     /**
-     * Latches once the first {@code status.json} write failure has been logged, so the
-     * algorithm log isn't spammed with one warning per writer tick when {@code dataPath}
-     * is misconfigured.
+     * The periodic {@code status.json} writer started by {@link #init}, or {@code null} if
+     * none was started; stopped by {@link #stopStatusFileWriter()}.
      */
-    private static final AtomicBoolean statusWriteErrorLogged = new AtomicBoolean(false);
-
-    /** Shared Jackson mapper for serializing {@link StatusSnapshot} to {@code status.json}. */
-    private static final ObjectMapper JSON = new ObjectMapper();
+    private static volatile StatusFileWriter statusFileWriter;
 
     /**
      * Initializes experiment metadata and optionally starts the periodic
      * {@code status.json} writer.
      *
-     * <p>Must be called by {@code Main.java} exactly once, immediately before
-     * starting the algorithm (i.e. before {@code algorithm.run()} or equivalent).
-     * Calling this method sets the experiment clock to {@link Instant#now()}.
+     * <p>Must be called by the program that runs the algorithm exactly once, after
+     * constructing the master and immediately before starting the algorithm (i.e. before
+     * {@code algorithm.run()} or equivalent). Calling this method sets the experiment clock to
+     * {@link Instant#now()}.
+     *
+     * <p>The writer writes {@code status.json} to the {@code jdisrest.dataPath} folder (the
+     * working directory by default), creating the folder if needed, once right away and then
+     * every {@code statusFileIntervalSec} seconds, atomically (write-then-rename) so that
+     * readers never see a partial file. The JSON is the one of {@code GET /api/v1/status}. A
+     * write is best-effort: a failure never stops the algorithm, and only the first failure is
+     * logged. {@code AbstractMaster.shutdown()} writes a last snapshot and stops the writer.
      *
      * @param maxEvals              the total number of evaluations the algorithm
      *                              will perform; used as the denominator when
@@ -129,114 +148,97 @@ public class MasterFacade {
         maxEvaluations.set(maxEvals);
         startTime.set(Instant.now());
         if (statusFileIntervalSec > 0) {
-            startStatusFileWriter(statusFileIntervalSec);
+            StatusFileWriter writer = new StatusFileWriter(MasterFacade::currentStatus,
+                    Path.of(System.getProperty("jdisrest.dataPath", ".")), statusFileIntervalSec * 1000L);
+            statusFileWriter = writer;
+            writer.start();
         }
     }
 
     // ── Periodic status.json writer ───────────────────────────────────────────
 
     /**
-     * Starts a daemon thread that calls {@link #writeStatusFile()} every
-     * {@code intervalSeconds} seconds until interrupted, then writes a final
-     * status snapshot when the algorithm finishes.
-     *
-     * @param intervalSeconds seconds between successive writes
+     * Writes a last {@code status.json} snapshot and stops the periodic writer started by
+     * {@link #init}, waiting a few seconds at most for that last write. Called by
+     * {@code AbstractMaster.shutdown()}, after the run has finished, so that the file ends up
+     * reporting the final state instead of whatever the last periodic write saw. Does nothing
+     * if no writer was started; repeated calls are harmless.
      */
-    private static void startStatusFileWriter(int intervalSeconds) {
-        long intervalMs = intervalSeconds * 1000L;
-        Thread t = new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                writeStatusFile();
-                try {
-                    Thread.sleep(intervalMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            // Write a final snapshot so monitoring tools see the completed state.
-            writeStatusFile();
-        });
-        t.setDaemon(true);
-        t.setName("status-file-writer");
-        t.start();
+    public static void stopStatusFileWriter() {
+        StatusFileWriter writer = statusFileWriter;
+        if (writer != null) {
+            writer.stop();
+        }
     }
 
     /**
-     * Writes a JSON progress snapshot to {@code status.json} in the shared data
-     * directory, using an atomic write-then-rename strategy to prevent readers
-     * from seeing a partially written file.
-     *
-     * <p>The file is first written to a temporary path ({@code status.json.tmp})
-     * in the same directory, then atomically renamed to {@code status.json} via
-     * {@link StandardCopyOption#ATOMIC_MOVE}. On POSIX filesystems this rename
-     * is guaranteed to be atomic from the reader's perspective.
-     *
-     * <p>The output directory is controlled by the system property
-     * {@code jdisrest.dataPath} (defaults to {@code "."} if unset). This should
-     * be set to a shared filesystem path visible to monitoring tools and to
-     * worker nodes.
-     *
-     * <p>The JSON format is identical to that of
-     * {@code GET /api/v1/status} (see {@link StatusController#status()}) so that
-     * {@code monitor.py} can parse both sources with the same logic.
-     *
-     * <p>This method is best-effort: any {@link Exception} during the write is
-     * silently swallowed so that a transient I/O error never interrupts the
-     * algorithm.
-     */
-    /**
      * Builds the live progress snapshot consumed by both {@link StatusController}
-     * and {@link #writeStatusFile()}. Centralised here so the two surfaces share
+     * and {@code status.json}. Centralised here so the two surfaces share
      * the exact same field values.
      *
      * @return a fresh {@link StatusSnapshot} for the current master state
      */
     public static StatusSnapshot currentStatus() {
-        long    evaluations    = totalEvaluations.get();
-        int     maxEvals       = maxEvaluations.get();
-        Instant start          = startTime.get();
-        boolean finished       = isFinished();
-        long    elapsedSeconds = start != null ? Duration.between(start, Instant.now()).getSeconds() : 0L;
-        double  progress       = (maxEvals > 0) ? (double) evaluations / maxEvals : 0.0;
+        BlockingQueue<?> pending = getPendingTaskQueue();
+        return snapshot(isFinished(), totalEvaluations.get(), maxEvaluations.get(), startTime.get(),
+                Instant.now(), aliveWorkerCount(Timings.WORKER_TIMEOUT_S), inFlightCount(),
+                pending != null ? pending.size() : 0, discardedTaskCount());
+    }
+
+    /**
+     * Builds a progress snapshot from its raw values: the arithmetic of {@link #currentStatus()}.
+     *
+     * <p>{@code progress} is {@code evaluations / maxEvals} clamped to {@code [0, 1]}, and the
+     * ETA is extrapolated from that same clamped value: {@code -1} until 1 % of the budget is
+     * done, once the run has finished, or before any time has elapsed; otherwise never
+     * negative, and {@code 0} once the budget has been reached while the run has not finished
+     * yet (results accepted but not processed by the algorithm yet, or a stopping criterion
+     * other than the budget).
+     *
+     * @param finished       whether the run is over
+     * @param evaluations    results accepted so far
+     * @param maxEvals       the budget; {@code 0} or less when unknown
+     * @param start          when the run started; {@code null} before {@link #init}
+     * @param now            the current instant
+     * @param aliveWorkers   workers heard from recently
+     * @param inFlightTasks  tasks held by workers
+     * @param pendingTasks   tasks waiting to be handed out
+     * @param discardedTasks tasks discarded after failing too often
+     * @return the snapshot
+     */
+    static StatusSnapshot snapshot(boolean finished, long evaluations, int maxEvals, Instant start, Instant now,
+                                   int aliveWorkers, int inFlightTasks, int pendingTasks, long discardedTasks) {
+        long elapsedSeconds = start != null ? Math.max(0L, Duration.between(start, now).getSeconds()) : 0L;
+        double progress = (maxEvals > 0) ? Math.min(1.0, (double) evaluations / maxEvals) : 0.0;
         // Only compute ETA once enough progress has been made to avoid wild extrapolations.
         long etaSeconds = (progress > 0.01 && !finished && elapsedSeconds > 0)
                 ? (long) (elapsedSeconds / progress * (1.0 - progress))
                 : -1L;
-        BlockingQueue<?> pending = getPendingTaskQueue();
-        int pendingTasks = pending != null ? pending.size() : 0;
-
-        return new StatusSnapshot(
-                !finished,
-                finished,
-                evaluations,
-                maxEvals,
-                Math.min(1.0, progress),
-                elapsedSeconds,
-                etaSeconds,
-                aliveWorkerCount(Timings.WORKER_TIMEOUT_S),
-                inFlightCount(),
-                pendingTasks
-        );
+        return new StatusSnapshot(!finished, finished, evaluations, maxEvals, progress, elapsedSeconds,
+                etaSeconds, aliveWorkers, inFlightTasks, pendingTasks, discardedTasks);
     }
 
-    private static void writeStatusFile() {
-        try {
-            String json = JSON.writeValueAsString(currentStatus());
-            // Write to the shared data directory, not to the local scratch area.
-            String dataPath = System.getProperty("jdisrest.dataPath", ".");
-            Path tmp  = Path.of(dataPath, "status.json.tmp");
-            Path dest = Path.of(dataPath, "status.json");
-            Files.writeString(tmp, json);
-            // ATOMIC_MOVE guarantees readers never see a partial file.
-            Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (Exception e) {
-            // Best-effort: a failed status write must never crash the algorithm.
-            // Log only the first occurrence to surface misconfigured dataPath without spamming.
-            if (statusWriteErrorLogged.compareAndSet(false, true)) {
-                Log.warn("Could not write status.json (further failures will be silent): " + e.getMessage());
-            }
-        }
+    /**
+     * Builds the body of {@code GET /api/v1/workers/status}: counters, queue sizes and the
+     * worker registry, with the keys always in the same order ({@code aliveWorkers},
+     * {@code totalEvaluations}, {@code totalDispatched}, {@code pendingTasks},
+     * {@code inFlightTasks}, {@code queuedResults}, {@code workers}) and the workers sorted by
+     * id. Without a master the counts are {@code 0} and {@code workers} is empty.
+     *
+     * @return a new ordered map, ready to be serialized
+     */
+    static Map<String, Object> clusterStatus() {
+        BlockingQueue<?> pending = getPendingTaskQueue();
+        BlockingQueue<?> completed = getCompletedTaskQueue();
+        Map<String, Object> status = new LinkedHashMap<>();
+        status.put("aliveWorkers", aliveWorkerCount(Timings.WORKER_TIMEOUT_S));
+        status.put("totalEvaluations", getTotalEvaluations());
+        status.put("totalDispatched", getTotalTasksDispatched());
+        status.put("pendingTasks", pending != null ? pending.size() : 0);
+        status.put("inFlightTasks", inFlightCount());
+        status.put("queuedResults", completed != null ? completed.size() : 0);
+        status.put("workers", new TreeMap<>(getWorkerRegistry()));
+        return status;
     }
 
     /**
@@ -311,25 +313,49 @@ public class MasterFacade {
      * inside the active master, unblocking the algorithm thread that is waiting
      * for computed results. The evaluation counter is incremented only if the
      * master confirms the result was accepted (i.e. the task had not already been
-     * requeued by the watchdog while the worker was evaluating).
+     * requeued by the watchdog while the worker was evaluating, and no stop had been
+     * requested).
      *
-     * <p><strong>Important:</strong> the caller ({@link TaskController#submitResult})
-     * must write the objectives and constraints directly into the
-     * {@link Solution} object retrieved from {@link #inFlightTasks()}
-     * <em>before</em> calling this method, because the master moves the same
-     * solution reference into the completed queue.
+     * <p>The caller must have written the objectives and constraints into the
+     * {@link Solution} object retrieved from {@link #inFlightTasks()} <em>before</em>
+     * calling this method; {@link TaskController} uses
+     * {@link #submitResult(long, String, Consumer)} instead, which writes them only once the
+     * master has accepted the result.
      *
      * @param taskId   the numeric identifier of the completed task
-     * @param workerId the identifier of the submitting worker (for logging)
+     * @param workerId the identifier of the submitting worker; may be {@code null}
      * @return {@code true} if the result was accepted; {@code false} if the task
      *         was no longer in {@code inFlightTasks} (watchdog had already
-     *         requeued it)
+     *         requeued it) or a stop has been requested, in which case the result is
+     *         dropped and not counted
      * @throws IllegalStateException if neither master instance is available
      */
     public static boolean submitResult(long taskId, String workerId) {
+        return submitResult(taskId, workerId, task -> { });
+    }
+
+    /**
+     * Records a completed evaluation result submitted by a worker, writing it into the task's
+     * solution only once the master has accepted it (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#submitResult(long, String, Consumer)}):
+     * the task is taken out of {@code inFlightTasks} first, then {@code recorder} writes the
+     * result, then the task is moved to {@code completedTaskQueue}. The evaluation counter is
+     * incremented only if the result was accepted.
+     *
+     * @param taskId   the numeric identifier of the completed task
+     * @param workerId the identifier of the submitting worker; may be {@code null}
+     * @param recorder writes the result into the task's solution; called at most once
+     * @return {@code true} if the result was accepted and recorded; {@code false} if the task
+     *         was not in flight or a stop has been requested
+     * @throws IllegalStateException if neither master instance is available
+     * @throws RuntimeException      whatever {@code recorder} throws; the task has then been
+     *                               handled as a failed evaluation
+     */
+    public static boolean submitResult(long taskId, String workerId,
+                                       Consumer<? super ParallelTask<Solution<?>>> recorder) {
         boolean accepted;
-        if (ss() != null) accepted = ss().submitResult(taskId, workerId);
-        else if (g() != null) accepted = g().submitResult(taskId, workerId);
+        if (ss() != null) accepted = ss().submitResult(taskId, workerId, recorder);
+        else if (g() != null) accepted = g().submitResult(taskId, workerId, recorder);
         else throw new IllegalStateException("No master instance available");
         if (accepted) totalEvaluations.incrementAndGet();
         return accepted;
@@ -337,13 +363,16 @@ public class MasterFacade {
 
     /**
      * Provides direct access to the master's {@code inFlightTasks} map so that
-     * {@link TaskController} can write evaluation results into the solution object
-     * before calling {@link #submitResult}.
+     * {@link TaskController} can validate a result against the solution object it
+     * targets before calling {@link #submitResult(long, String, Consumer)}, which
+     * writes it.
      *
      * <p>The solution object stays on the master throughout the entire evaluation
-     * cycle — workers never send variables back, only objectives and constraints.
-     * Writing directly into the map entry avoids an extra copy and keeps the
-     * solution reference stable across the three-stage pipeline.
+     * cycle: workers receive a copy of its variables and send back objectives,
+     * constraints and, optionally, a repaired decision vector, which
+     * {@link TaskController} copies into it. Writing directly into the solution avoids
+     * an extra copy and keeps the solution reference stable across the three-stage
+     * pipeline.
      *
      * @return the live {@link ConcurrentHashMap} mapping task id to in-flight task
      * @throws IllegalStateException if neither master instance is available
@@ -444,10 +473,9 @@ public class MasterFacade {
      * Returns the number of tasks currently in-flight (claimed by workers but
      * not yet returned with a result or error).
      *
-     * <p>Returns {@code 0} when no master instance is set yet — this can happen
-     * during the brief startup window between {@link #init} and the algorithm
-     * actually constructing its master, which is when the periodic status
-     * writer fires its first snapshot. Symmetric with {@link #aliveWorkerCount}
+     * <p>Returns {@code 0} when no master instance is set, as in the brief window
+     * between the start of the REST server and the end of the master's constructor, or
+     * when nothing ever constructed one. Symmetric with {@link #aliveWorkerCount}
      * and {@link #getPendingTaskQueue}, both of which already tolerate that
      * window.
      *
@@ -460,21 +488,70 @@ public class MasterFacade {
     }
 
     /**
-     * Immediately requeues an in-flight task back to {@code pendingTaskQueue}.
+     * Returns how many tasks the active master has discarded after too many failed
+     * evaluations (see {@link es.unex.jdisrest.distributed.AbstractMaster#failInFlightTask(long)}).
      *
-     * <p>Called by {@link TaskController#reportError} when a worker explicitly
-     * reports an evaluation failure. This is faster than waiting for the
-     * {@link WatchdogScheduler} to detect the problem after its 45-second
-     * timeout. If the {@code taskId} is not present in {@code inFlightTasks}
-     * (e.g. already requeued by a concurrent watchdog cycle) the call is a
-     * no-op.
-     *
-     * @param taskId the identifier of the task to requeue
+     * @return discarded tasks; {@code 0} if no master is set
      */
-    public static void requeueInFlightTask(long taskId) {
-        if (ss() != null) { ss().requeueInFlightTask(taskId); return; }
-        if (g() != null)  {  g().requeueInFlightTask(taskId); return; }
+    public static long discardedTaskCount() {
+        if (ss() != null) return ss().getDiscardedTaskCount();
+        if (g() != null) return g().getDiscardedTaskCount();
+        return 0L;
+    }
+
+    /**
+     * Records a failed evaluation of an in-flight task, which is requeued at once or, after
+     * too many failures, discarded (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#failInFlightTask(long)}).
+     *
+     * <p>This is faster than waiting for the {@link WatchdogScheduler} to detect the problem
+     * after its {@link Timings#WORKER_TIMEOUT_S}-second timeout. If the {@code taskId} is not
+     * present in {@code inFlightTasks} (e.g. already requeued by a concurrent watchdog cycle)
+     * the call is a no-op. It does not check which worker reports the failure;
+     * {@link TaskController} uses {@link #failInFlightTask(long, String)}, which does.
+     *
+     * @param taskId the identifier of the task whose evaluation failed
+     * @throws IllegalStateException if neither master instance is available
+     */
+    public static void failInFlightTask(long taskId) {
+        if (ss() != null) { ss().failInFlightTask(taskId); return; }
+        if (g() != null)  {  g().failInFlightTask(taskId); return; }
         throw new IllegalStateException("No master instance available");
+    }
+
+    /**
+     * Records a failed evaluation reported by a worker, unless that worker no longer holds the
+     * task (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#failInFlightTask(long, String)}).
+     * Called by {@link TaskController} when a worker reports an evaluation error, sends a
+     * result the master rejects, or the task cannot be serialized.
+     *
+     * @param taskId   the identifier of the task whose evaluation failed
+     * @param workerId the worker that reports it; {@code null} when unknown
+     * @return {@code true} if the report counted; {@code false} if the task was not in flight
+     *         or is held by another worker
+     * @throws IllegalStateException if neither master instance is available
+     */
+    public static boolean failInFlightTask(long taskId, String workerId) {
+        if (ss() != null) return ss().failInFlightTask(taskId, workerId);
+        if (g() != null)  return  g().failInFlightTask(taskId, workerId);
+        throw new IllegalStateException("No master instance available");
+    }
+
+    /**
+     * Records a failed evaluation of an in-flight task.
+     *
+     * @param taskId the identifier of the task whose evaluation failed
+     * @throws IllegalStateException if neither master instance is available
+     * @deprecated since 1.2.0, renamed to {@link #failInFlightTask(long)}, to which it
+     *             delegates. The task is no longer requeued unconditionally: the call
+     *             counts as a failed evaluation and discards the task once it reaches the
+     *             master's failure limit
+     *             ({@link es.unex.jdisrest.distributed.AbstractMaster#setMaxTaskFailures}).
+     */
+    @Deprecated(since = "1.2.0")
+    public static void requeueInFlightTask(long taskId) {
+        failInFlightTask(taskId);
     }
 
     /**
@@ -501,8 +578,9 @@ public class MasterFacade {
     }
 
     /**
-     * Returns {@code true} if the algorithm has completed all its evaluations or
-     * otherwise reached its termination criterion.
+     * Returns {@code true} if the algorithm has completed all its evaluations,
+     * otherwise reached its termination criterion, or been asked to stop
+     * ({@link #requestStop()}).
      *
      * <p>Used by {@link TaskController#getNextTask} to return {@code 410 Gone}
      * and signal workers to shut down.
@@ -517,10 +595,85 @@ public class MasterFacade {
     }
 
     /**
+     * Returns {@code true} once a master is registered and ready to serve workers (see
+     * {@link es.unex.jdisrest.distributed.AbstractMaster#isReady()}). Before that the run has
+     * not started: no task is handed out and {@link #isFinished()} is {@code false}.
+     *
+     * @return {@code true} if a master is registered and ready; {@code false} otherwise
+     */
+    public static boolean isReady() {
+        if (ss() != null) return ss().isReady();
+        if (g() != null) return g().isReady();
+        return false;
+    }
+
+    /**
+     * Returns whether a master is registered.
+     *
+     * @return {@code true} once a master has finished constructing itself
+     */
+    static boolean hasMaster() {
+        return ss() != null || g() != null;
+    }
+
+    /**
+     * Asks the active master to finish now, as if it had met its stopping criterion
+     * (see {@link es.unex.jdisrest.distributed.AbstractMaster#requestStop()}): from then
+     * on {@link #isFinished()} is {@code true} and results still in flight are refused.
+     * Used by {@link StopController}; repeated calls are harmless.
+     *
+     * @return {@code true} if a master is running; {@code false} if no master instance is set
+     */
+    public static boolean requestStop() {
+        boolean active = true;
+        if (ss() != null) ss().requestStop();
+        else if (g() != null) g().requestStop();
+        else active = false;
+        return active;
+    }
+
+    /**
+     * Updates the evaluation budget reported by {@code GET /api/v1/status} and
+     * {@code status.json} when it changes while the run goes on (for example, after a new
+     * configuration is applied through {@link ConfigController}), so that
+     * {@code progress} and the ETA follow the new budget. Unlike {@link #init} it may be
+     * called any number of times and does not touch the start time.
+     *
+     * @param maxEvals the new maximum number of evaluations; a value of {@code 0} or less
+     *                 marks the budget as unknown ({@code progress} is then {@code 0})
+     */
+    public static void setMaxEvaluations(int maxEvals) {
+        maxEvaluations.set(maxEvals);
+    }
+
+    /**
+     * Registers the object that reads and changes the configuration of the running algorithm
+     * for {@link ConfigController}. The program that builds the algorithm registers it,
+     * because only it knows how the configuration maps to the algorithm. A later call
+     * replaces the handler.
+     *
+     * @param handler the handler, or {@code null} to disable {@code /api/v1/config} (it then
+     *                answers {@code 501 Not Implemented})
+     */
+    public static void setConfigurationHandler(ConfigurationHandler handler) {
+        configurationHandler = handler;
+    }
+
+    /**
+     * Returns the handler registered with {@link #setConfigurationHandler}.
+     *
+     * @return the handler, or {@code null} if none is registered
+     */
+    public static ConfigurationHandler configurationHandler() {
+        return configurationHandler;
+    }
+
+    /**
      * Returns the cumulative number of evaluations successfully completed and
      * accepted by the master since startup.
      *
-     * <p>This counter is only incremented when {@link #submitResult} returns
+     * <p>This counter is only incremented when
+     * {@link #submitResult(long, String, Consumer)} returns
      * {@code true}, so tasks that were requeued by the watchdog and re-evaluated
      * are not double-counted.
      *

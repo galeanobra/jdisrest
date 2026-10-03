@@ -6,18 +6,30 @@ package es.unex.jdisrest.util;
  * <p>All values are in seconds unless suffixed with {@code _MS}. The relationships
  * encoded here are deliberate:
  * <ul>
- *   <li>{@link #WORKER_TIMEOUT_S} is exactly three times {@link #HEARTBEAT_INTERVAL_S},
- *       so a worker must miss at least three consecutive heartbeats before it is
- *       considered dead.</li>
- *   <li>{@link #WATCHDOG_INTERVAL_S} is shorter than {@link #WORKER_TIMEOUT_S} so a
- *       dead worker is detected within roughly one timeout window.</li>
+ *   <li>{@link #WORKER_TIMEOUT_S} is three times {@link #HEARTBEAT_INTERVAL_S}: a worker
+ *       is considered dead after that long without any contact (heartbeat, task claim or
+ *       result), which is about three missed heartbeats. Workers wait the interval
+ *       <em>after</em> each heartbeat request completes, so on a slow network the real
+ *       period is a little longer and slightly fewer beats fit in the timeout.</li>
+ *   <li>{@link #WATCHDOG_INTERVAL_S} is shorter than {@link #WORKER_TIMEOUT_S}, so a dead
+ *       worker is detected between {@link #WORKER_TIMEOUT_S} and
+ *       {@link #WORKER_TIMEOUT_S} + {@link #WATCHDOG_INTERVAL_S} seconds after it was last
+ *       heard from.</li>
  *   <li>{@link #TASK_LONGPOLL_S} is the long-poll window opened by
- *       {@code GET /api/v1/tasks/next}; workers should set their HTTP read timeout a
- *       few seconds above this value to absorb network latency.</li>
+ *       {@code GET /api/v1/tasks/next}; workers must set their HTTP read timeout a
+ *       few seconds above this value to absorb network latency. A worker whose poll
+ *       times out first asks again while the master may still hand the first poll a
+ *       task, which then sits in flight until that worker's next claim requeues it.</li>
  * </ul>
  *
- * <p>If you change any of these, also update the matching constants on the worker
- * side ({@code Worker.HEARTBEAT_INTERVAL} in Python and {@code RestWorker} in Java).
+ * <p>The Java worker derives its timings from these constants ({@code RestWorker}: the
+ * read timeout of {@code GET /next} is {@link #TASK_LONGPOLL_S} plus 10 s, and a heartbeat
+ * waits, and is retried after, a third of {@link #HEARTBEAT_INTERVAL_S}). The Python
+ * worker cannot read them: if you change any of these, also update the matching class
+ * constants of {@code jdisrest.Worker} ({@code HEARTBEAT_INTERVAL}, {@code HEARTBEAT_TIMEOUT},
+ * {@code HEARTBEAT_RETRY_DELAY} and {@code REQUEST_TIMEOUT}). They are compile-time constants,
+ * so Java code compiled against them (including a downstream project's) keeps the old values
+ * until it is recompiled.
  *
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */

@@ -19,9 +19,16 @@ import java.util.List;
  * <ol>
  *   <li>Create and submit the initial population tasks.</li>
  *   <li>Wait for all initial evaluations to complete.</li>
- *   <li>While the stopping condition is not met: apply evolution (selection + variation +
- *       task submission), then wait for the full generation to be evaluated.</li>
+ *   <li>While no stop has been requested, the thread has not been interrupted and the
+ *       stopping condition is not met: call {@link #evolution(List)}, which applies selection
+ *       and variation, submits the offspring ({@link #submitTasks(List)}) and waits for them
+ *       ({@link #waitForEvaluatedTasks()}) itself.</li>
  * </ol>
+ *
+ * <p>A generation may come back with fewer results than tasks submitted: tasks discarded
+ * after failing too many evaluations never return, and a stop ends the wait early (see
+ * {@link #waitForEvaluatedTasks()}). Implementations of {@link #evolution(List)} must
+ * therefore not assume one result per submitted task or index results by position.
  *
  * @param <T> type of {@link ParallelTask} being computed by the workers
  * @param <R> type of the final result returned by {@link #getResult()}
@@ -54,24 +61,28 @@ public interface GenerationalAlgorithm<T extends ParallelTask<?>, R> {
      * Blocks until every task submitted for the current generation has been evaluated and
      * its result delivered to the master.
      *
-     * <p>This call drains exactly {@code populationSize} entries from the
-     * {@code completedTaskQueue}. Liveness is guaranteed by the watchdog: if a worker dies
-     * while holding a task, the watchdog re-enqueues that task so another worker can
-     * complete it, preventing this method from blocking forever.
+     * <p>This call drains up to {@code populationSize} entries from the
+     * {@code completedTaskQueue}: fewer when tasks of the generation were discarded after
+     * failing too many evaluations, which never arrive, or when a stop is requested
+     * ({@link #isStopRequested()}), after which it returns the tasks it has already taken.
+     * Liveness is guaranteed by the watchdog: if a worker dies while holding a task, the
+     * watchdog re-enqueues that task so another worker can complete it, preventing this
+     * method from blocking forever.
      *
      * @return the list of fully evaluated tasks in the order they were completed
-     *         (not necessarily the original submission order)
+     *         (not necessarily the original submission order); possibly shorter than the
+     *         generation, as explained above
      */
     List<T> waitForEvaluatedTasks();
 
     /**
      * Applies one full generation of evolutionary operators (selection, crossover, mutation)
-     * to the evaluated population and submits the resulting offspring tasks for the next
-     * generation.
+     * to the evaluated population, submits the resulting offspring tasks and waits for them.
      *
-     * <p>This method is responsible for both transforming the population <em>and</em> calling
-     * {@link #submitTasks(List)} with the new offspring so the loop can continue. After this
-     * method returns, the caller blocks again in {@link #waitForEvaluatedTasks()}.
+     * <p>This method is responsible for transforming the population, calling
+     * {@link #submitTasks(List)} with the new offspring <em>and</em> waiting for them with
+     * {@link #waitForEvaluatedTasks()} before returning: the default {@link #run()} does not
+     * wait between two calls, and passes the same list every time, so update it in place.
      *
      * @param population the fully evaluated population from the previous generation
      */
@@ -84,6 +95,21 @@ public interface GenerationalAlgorithm<T extends ParallelTask<?>, R> {
      * @return {@code true} if the stopping condition has not yet been reached
      */
     boolean stoppingConditionIsNotMet();
+
+    /**
+     * Returns whether the run has been asked to finish before its stopping criterion
+     * ({@code POST /api/v1/stop}). The loop in {@link #run()} exits as soon as this method
+     * returns {@code true}, whatever {@link #stoppingConditionIsNotMet()} says, so that a stop
+     * cannot leave {@code run()} submitting generations that nobody evaluates.
+     *
+     * <p>{@code false} by default, for implementations that cannot be stopped;
+     * {@link AbstractMaster#isStopRequested()} overrides it for every master.
+     *
+     * @return {@code true} once a stop has been requested
+     */
+    default boolean isStopRequested() {
+        return false;
+    }
 
     /**
      * Returns the algorithm's final result once the stopping condition is met.
@@ -100,25 +126,30 @@ public interface GenerationalAlgorithm<T extends ParallelTask<?>, R> {
      * <ol>
      *   <li>Create and submit the initial population as tasks.</li>
      *   <li>Block until all initial evaluations complete ({@link #waitForEvaluatedTasks()}).</li>
-     *   <li>Repeat until the stopping condition is met:
+     *   <li>Repeat until a stop is requested ({@link #isStopRequested()}), the thread is
+     *       interrupted or the stopping condition is met:
      *     <ol>
-     *       <li>Apply evolutionary operators and submit next-generation tasks
-     *           ({@link #evolution(List)}).</li>
-     *       <li>Block until the full generation is evaluated
-     *           ({@link #waitForEvaluatedTasks()}).</li>
+     *       <li>Call {@link #evolution(List)} with the population list; it submits the next
+     *           generation and waits for it itself.</li>
      *     </ol>
      *   </li>
      * </ol>
      *
      * <p>Note that {@code evolution()} receives the evaluated population and is expected to
-     * update it in place as well as submit the offspring tasks; the updated reference is
-     * then passed back into the next {@code evolution()} call.
+     * update it in place as well as submit and wait for the offspring tasks; the same list is
+     * passed on every call.
+     *
+     * <p>An interrupt of the thread running the loop also ends it, before the next generation:
+     * {@link #waitForEvaluatedTasks()} returns at once while the interrupt flag is set, so the
+     * loop would otherwise spin through generations that are never awaited. The flag is left set,
+     * so the caller can tell an interrupted run from a finished one through
+     * {@code Thread.currentThread().isInterrupted()}.
      */
     default void run() {
         List<T> initialTasks = createInitialTasks();
         submitTasks(initialTasks);
         List<T> population = waitForEvaluatedTasks();
-        while (stoppingConditionIsNotMet()) {
+        while (!isStopRequested() && !Thread.currentThread().isInterrupted() && stoppingConditionIsNotMet()) {
             evolution(population);
         }
     }

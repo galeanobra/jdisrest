@@ -19,7 +19,7 @@ import java.util.List;
  * <ul>
  *   <li>{@code segmentSizes} — only for {@code CompositeSolution} problems: size
  *       of each segment of the concatenated vector {@code [seg0 | seg1 | ...]},
- *       e.g. {@code [3249, 3249, 3249]}.</li>
+ *       e.g. {@code [4, 2]}.</li>
  *   <li>{@code encoding} — {@code "double"} when every variable is real,
  *       {@code "mixed"} for a composite whose segments differ. Absent means
  *       every variable is an integer.</li>

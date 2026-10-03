@@ -15,7 +15,6 @@ import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
 import es.unex.jdisrest.util.Log;
 import es.unex.jdisrest.util.Timings;
 
@@ -29,23 +28,27 @@ import java.util.stream.Collectors;
  *
  * <p>All three endpoints ({@code /next}, {@code /result}, {@code /error}) share
  * the same design principle: the reactive pipeline is created on the Netty
- * event-loop thread but the actual work is dispatched to
- * {@link Schedulers#boundedElastic()} (or to the injected virtual-thread
- * scheduler), so blocking calls never stall the event loop.
+ * event-loop thread but the actual work is dispatched to the injected
+ * virtual-thread scheduler ({@link MasterSpringApp#virtualThreadScheduler()}),
+ * so blocking calls never stall the event loop, and any number of workers can
+ * wait in a long-poll or on the master's locks at once without one request
+ * queueing behind another.
  *
  * <p>Task lifecycle:
  * <ol>
  *   <li>Worker calls {@code GET /next} — master moves a task from
  *       {@code pendingTaskQueue} to {@code inFlightTasks} and returns it.</li>
  *   <li>Worker evaluates the solution and calls {@code POST /{id}/result} —
- *       master validates the payload, writes objectives/constraints (and the
- *       optional repaired variables) directly into the solution object still
- *       held in {@code inFlightTasks}, then moves the task to
+ *       master validates the payload, takes the task out of
+ *       {@code inFlightTasks}, writes objectives/constraints (and the optional
+ *       repaired variables) into its solution, then moves the task to
  *       {@code completedTaskQueue}.</li>
  *   <li>If evaluation fails, worker calls {@code POST /{id}/error} — master
  *       requeues the task to {@code pendingTaskQueue} immediately, without
- *       waiting for the watchdog timeout. A result that fails validation (or
- *       cannot be decoded) follows the same path.</li>
+ *       waiting for the watchdog timeout, or discards it once it has failed
+ *       too many times. A result that fails validation (or cannot be decoded)
+ *       follows the same path. A failure reported by a worker that no longer
+ *       holds the task (another worker has it now) is ignored.</li>
  * </ol>
  *
  * <p>Variable encodings: the decision vector travels as a flat list of JSON
@@ -63,7 +66,7 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/v1/tasks")
 public class TaskController {
 
-    /** Reactor scheduler backed by Java 21 virtual threads; used for blocking calls. */
+    /** Reactor scheduler backed by virtual threads; runs every blocking call of the handlers. */
     private final Scheduler scheduler;
 
     /**
@@ -80,23 +83,38 @@ public class TaskController {
      * Long-poll endpoint: a worker requests the next task to evaluate.
      *
      * <p>The call blocks on {@link MasterFacade#claimNextTask} for up to
-     * {@code timeoutSeconds} (currently 30 s) waiting for a task to become
-     * available in {@code pendingTaskQueue}. It always runs on
-     * {@link Schedulers#boundedElastic()} — never on the Netty event-loop thread.
+     * {@link Timings#TASK_LONGPOLL_S} seconds waiting for a task to become available in
+     * {@code pendingTaskQueue} (a steady-state master creates one on demand instead, so
+     * it only waits once the run is over). It always runs on the virtual-thread
+     * scheduler — never on the Netty event-loop thread.
+     *
+     * <p>A worker holds one task at a time: if its previous task is still in flight
+     * when it asks again (the result or error never arrived), that task goes back to
+     * the queue, without counting as a failed evaluation. Each concurrent evaluation
+     * slot therefore needs its own {@code workerId}.
      *
      * <p>Response codes:
      * <ul>
      *   <li>{@code 200 OK} — task payload returned; worker should evaluate and call
      *       {@code POST /{id}/result}.</li>
-     *   <li>{@code 204 No Content} — no task arrived within the timeout; worker
-     *       should immediately retry the long-poll.</li>
+     *   <li>{@code 204 No Content} — no task arrived within the long-poll window, or the
+     *       master is not ready to hand out tasks yet (it is still building its initial
+     *       state); the worker should wait a few seconds and ask again (the bundled
+     *       workers wait 5 s).</li>
      *   <li>{@code 410 Gone} — the algorithm has finished; worker should shut
      *       down.</li>
+     *   <li>{@code 500 Internal Server Error} — the claimed task could not be serialized
+     *       (an unsupported solution type, or a variable that is {@code null}, {@code NaN}
+     *       or infinite); the task has been handled as a failed evaluation (requeued, or
+     *       discarded after too many failures), and the worker may ask again.</li>
+     *   <li>{@code 503 Service Unavailable} — the master shut down while the request waited in
+     *       the long-poll ({@code 410} if the run had finished by then). The server is closing,
+     *       so the worker usually sees a closed connection instead; nothing is logged.</li>
      * </ul>
      *
      * @param workerId opaque identifier for the requesting worker (e.g. {@code "worker-01"})
      * @return a {@link Mono} emitting a {@link ResponseEntity} containing a
-     *         {@link TaskPayload}, or an empty/410 response as described above
+     *         {@link TaskPayload}, or an empty response as described above
      */
     @GetMapping("/next")
     public Mono<ResponseEntity<TaskPayload>> getNextTask(@RequestParam("workerId") String workerId) {
@@ -106,47 +124,68 @@ public class TaskController {
                 return ResponseEntity.<TaskPayload>status(410).build();
             }
             // Block up to TASK_LONGPOLL_S seconds waiting for a task; returns null on timeout.
-            ParallelTask<Solution<?>> task = MasterFacade.claimNextTask(workerId, Timings.TASK_LONGPOLL_S);
+            ParallelTask<Solution<?>> task;
+            try {
+                task = MasterFacade.claimNextTask(workerId, Timings.TASK_LONGPOLL_S);
+            } catch (InterruptedException e) {
+                // shutdown() disposes the handler threads while workers wait in the long-poll: the
+                // server is closing, so answer quietly instead of logging a 500 per waiting worker.
+                Thread.currentThread().interrupt();
+                return ResponseEntity.<TaskPayload>status(MasterFacade.isFinished() ? 410 : 503).build();
+            }
             if (task == null) {
-                // No task within the timeout window; worker should retry.
+                // No task within the timeout window, or the master is not ready: retry later.
                 return ResponseEntity.<TaskPayload>noContent().build();
             }
             try {
                 return ResponseEntity.ok(toPayload(task.getIdentifier(), task.getContents()));
-            } catch (IllegalArgumentException e) {
-                // Unsupported solution type: the task is already in flight, so put it
-                // back instead of stranding it, and make the misconfiguration visible.
-                // SteadyStateEvolutionaryAlgorithm.run() rejects such problems up front;
-                // this only guards other masters.
+            } catch (RuntimeException e) {
+                // The task is already in flight, so hand it back (it counts as a failed
+                // evaluation) instead of stranding it, and make the problem visible. Any
+                // exception counts: an unsupported or corrupted solution may fail with a
+                // ClassCastException as well as with an IllegalArgumentException.
+                // SteadyStateEvolutionaryAlgorithm.run() rejects unsupported problems up
+                // front; this guards other masters and individual bad solutions.
                 Log.error("[task-" + task.getIdentifier() + "] Cannot serialize solution: " + e.getMessage());
-                MasterFacade.requeueInFlightTask(task.getIdentifier());
+                MasterFacade.failInFlightTask(task.getIdentifier(), workerId);
                 return ResponseEntity.<TaskPayload>internalServerError().build();
             }
-        }).subscribeOn(Schedulers.boundedElastic());
+        }).subscribeOn(scheduler);
     }
 
     /**
      * Endpoint for a worker to submit evaluation results (objectives and constraints).
      *
      * <p>The solution object lives on the master throughout the entire evaluation
-     * cycle. This method validates the payload (see {@link #rejectionReason}),
-     * writes the returned objectives, constraints and — when present — repaired
-     * variables directly into the {@link Solution} instance that is still stored
-     * in {@code inFlightTasks}, then calls {@link MasterFacade#submitResult} to
-     * move the task to {@code completedTaskQueue}, unblocking the algorithm thread
-     * that is waiting in {@code waitForComputedTask()} or {@code waitForEvaluatedTasks()}.
+     * cycle. This method validates the payload (see {@link #rejectionReason}) and
+     * hands it to {@link MasterFacade#submitResult(long, String, java.util.function.Consumer)},
+     * which takes the task out of {@code inFlightTasks}, writes the returned
+     * objectives, constraints and — when present — repaired variables into the
+     * {@link Solution} instance (see {@link #record}) and moves the task to
+     * {@code completedTaskQueue}, unblocking the algorithm thread that is waiting
+     * in {@code waitForComputedTask()} or {@code waitForEvaluatedTasks()}. Nothing is
+     * written into a solution whose task this request does not win, so two reports
+     * of the same task never write into it at the same time.
+     *
+     * <p>A result is accepted from any worker, also from one that no longer holds the
+     * task (a late result is still a valid evaluation); {@code workerId} may be
+     * missing.
      *
      * <p>Response codes:
      * <ul>
      *   <li>{@code 200 OK} — result accepted and recorded.</li>
      *   <li>{@code 404 Not Found} — {@code taskId} is no longer in
-     *       {@code inFlightTasks}; the watchdog already requeued it because the
-     *       worker took too long. The result is discarded.</li>
+     *       {@code inFlightTasks}, because the watchdog already requeued it (the
+     *       worker took too long), another report for it was accepted first, or
+     *       the run has been stopped ({@code POST /api/v1/stop}) and no more
+     *       results are needed. The result is discarded.</li>
      *   <li>{@code 422 Unprocessable Content} — the payload is well-formed JSON
      *       but cannot be applied: wrong number of objectives or constraints, a
      *       {@code null}, {@code NaN} or infinite value, or a decision vector that
-     *       does not fit the solution. The task is requeued as if the worker had
-     *       reported an evaluation error, and the body is a
+     *       does not fit the solution or lies outside its variables' bounds. The
+     *       task is handled as if the worker had reported an evaluation error
+     *       (requeued, or discarded after too many failures; ignored if another
+     *       worker holds the task now), and the body is a
      *       {@link TaskRejectionPayload} explaining the rejection.</li>
      * </ul>
      *
@@ -161,63 +200,55 @@ public class TaskController {
             @PathVariable("taskId") long taskId,
             @RequestBody TaskResultPayload result) {
         return Mono.<ResponseEntity<TaskRejectionPayload>>fromCallable(() -> {
-            // Look up the task; it may have been requeued by the watchdog if the
-            // worker was silent for more than Timings.WORKER_TIMEOUT_S.
+            // Validate everything before taking the task, so a rejected result leaves the
+            // master-held solution untouched and only its holder's report counts as a failure.
+            // The solution is only read here; its shape never changes.
             ParallelTask<Solution<?>> task = MasterFacade.inFlightTasks().get(taskId);
-            if (task == null) {
-                Log.warn("Result for unknown/expired taskId: " + taskId + " from " + result.workerId());
-                return ResponseEntity.<TaskRejectionPayload>notFound().build();
+            if (task != null) {
+                String reason = rejectionReason(result, task.getContents());
+                if (reason != null) {
+                    boolean counted = MasterFacade.failInFlightTask(taskId, result.workerId());
+                    Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId() + ": " + reason
+                        + (counted ? " — counted as a failed evaluation" : ""));
+                    return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, reason));
+                }
             }
-
-            Solution<?> solution = task.getContents();
-
-            // Validate everything before writing anything, so a rejected result
-            // leaves the master-held solution untouched.
-            String reason = rejectionReason(result, solution);
-            if (reason != null) {
-                Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId()
-                    + ": " + reason + " — requeueing");
-                MasterFacade.requeueInFlightTask(taskId);
-                return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, reason));
+            try {
+                // Takes the task out of flight, records the result, moves it to the completed
+                // queue. Returns false if the task was not in flight (the watchdog or another
+                // report took it first) or a stop has been requested (the result is dropped).
+                boolean accepted = MasterFacade.submitResult(taskId, result.workerId(),
+                    claimed -> record(claimed.getContents(), result));
+                return accepted
+                    ? ResponseEntity.<TaskRejectionPayload>ok().build()
+                    : ResponseEntity.<TaskRejectionPayload>notFound().build();
+            } catch (IllegalArgumentException e) {
+                // Only when the task entered flight after the check above (it is checked again
+                // by record): the master has already handled it as a failed evaluation.
+                Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId() + ": "
+                    + e.getMessage() + " — counted as a failed evaluation");
+                return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, e.getMessage()));
             }
-
-            // The worker may send back a modified decision vector (Lamarckian
-            // repair/local-search). Overwrite the variables first so objectives
-            // and constraints stay consistent with the genes.
-            if (result.variables() != null && !result.variables().isEmpty()) {
-                SolutionVariables.apply(solution, result.variables());
-            }
-
-            double[] objectives = solution.objectives();
-            for (int i = 0; i < objectives.length; i++) {
-                objectives[i] = result.objectives().get(i);
-            }
-
-            double[] constraints = solution.constraints();
-            for (int i = 0; i < constraints.length; i++) {
-                constraints[i] = result.constraints().get(i);
-            }
-
-            // Move the task from inFlightTasks → completedTaskQueue.
-            // Returns false if the watchdog already removed it since our null-check above.
-            boolean accepted = MasterFacade.submitResult(taskId, result.workerId());
-            return accepted
-                ? ResponseEntity.<TaskRejectionPayload>ok().build()
-                : ResponseEntity.<TaskRejectionPayload>notFound().build();
-        }).subscribeOn(Schedulers.boundedElastic());
+        }).subscribeOn(scheduler);
     }
 
     /**
      * Endpoint for a worker to report that evaluation of a task has failed.
      *
      * <p>On receiving this call, the master immediately requeues the task back into
-     * {@code pendingTaskQueue} via {@link MasterFacade#requeueInFlightTask}, so
-     * another available worker can retry it. This is faster than waiting for the
-     * {@link WatchdogScheduler} to detect a silent worker after its 45-second
-     * timeout.
+     * {@code pendingTaskQueue} via {@link MasterFacade#failInFlightTask(long, String)}, so
+     * another available worker can retry it, unless the task has now failed too
+     * many times and is discarded. This is faster than waiting for the
+     * {@link WatchdogScheduler} to detect a silent worker after its
+     * {@link Timings#WORKER_TIMEOUT_S}-second timeout. A report from a worker that no
+     * longer holds the task (another worker has it now) is ignored, so it cannot take
+     * the task away from that worker.
      *
-     * <p>Always returns {@code 200 OK} — even if the {@code taskId} has already
-     * been requeued, the outcome is the same and the error has been logged.
+     * <p>Returns {@code 200 OK} whatever happened to the task — even if the {@code taskId}
+     * has already been requeued, or the report was ignored, the error has been logged and
+     * there is nothing for the worker to do. Like every endpoint it answers {@code 400} with
+     * a {@link TaskRejectionPayload} when the body cannot be decoded (see
+     * {@link #onRejectedRequest}), and {@code 500} when no master is running.
      *
      * @param taskId the identifier of the failed task (path variable)
      * @param error  payload containing the reporting worker id and a human-readable
@@ -231,23 +262,29 @@ public class TaskController {
         return Mono.<ResponseEntity<Void>>fromCallable(() -> {
             Log.warn("[task-" + taskId + "] Evaluation error from " + error.workerId()
                 + ": " + error.errorMessage());
-            // Requeue immediately so the task is not lost until the next watchdog cycle.
-            MasterFacade.requeueInFlightTask(taskId);
+            // Requeue (or discard) at once so the task is not stranded until the next
+            // watchdog cycle.
+            MasterFacade.failInFlightTask(taskId, error.workerId());
             return ResponseEntity.<Void>ok().build();
-        }).subscribeOn(Schedulers.boundedElastic());
+        }).subscribeOn(scheduler);
     }
 
     /**
      * Handles requests Spring rejects before the handler method runs: a body that
      * cannot be decoded (e.g. a bare {@code NaN} or {@code Infinity} token emitted
      * by Python's {@code json.dumps}, which is not valid JSON — {@code 400}), a
-     * wrong {@code Content-Type} ({@code 415}) and similar client errors.
+     * wrong {@code Content-Type} ({@code 415}), a body larger than the server's
+     * buffer limit ({@code 413}, see {@code AbstractMaster.DEFAULT_MAX_REQUEST_SIZE})
+     * and similar client errors on a matched route.
      *
      * <p>Without this handler Spring would answer with the error status and the
      * task would stay in {@code inFlightTasks} forever: the worker is alive and
      * keeps sending heartbeats, so the watchdog never requeues it. When the
      * request targets {@code /{taskId}/result} or {@code /{taskId}/error}, the
-     * task is requeued as if the worker had reported an evaluation error. The
+     * task is handled as if the worker had reported an evaluation error (requeued,
+     * or discarded after too many failures). The reporting worker is unknown here
+     * (its id is in the body that could not be read), so the report is not checked
+     * against the task's holder. The
      * response keeps Spring's status code and carries a
      * {@link TaskRejectionPayload} explaining what was wrong.
      *
@@ -266,10 +303,10 @@ public class TaskController {
             return Mono.just(ResponseEntity.status(ex.getStatusCode()).body(new TaskRejectionPayload(-1, reason)));
         }
         return Mono.<ResponseEntity<TaskRejectionPayload>>fromCallable(() -> {
-            Log.warn("[task-" + taskId + "] " + reason + " — requeueing");
-            MasterFacade.requeueInFlightTask(taskId);
+            boolean counted = MasterFacade.failInFlightTask(taskId, null);
+            Log.warn("[task-" + taskId + "] " + reason + (counted ? " — counted as a failed evaluation" : ""));
             return ResponseEntity.status(ex.getStatusCode()).body(new TaskRejectionPayload(taskId, reason));
-        }).subscribeOn(Schedulers.boundedElastic());
+        }).subscribeOn(scheduler);
     }
 
     /**
@@ -300,13 +337,22 @@ public class TaskController {
      * one variable is real-encoded, so integer problems (flat or composite) keep
      * producing exactly the JSON emitted by earlier versions.
      *
+     * <p>Every variable must be finite: a JSON number cannot carry {@code NaN} or an
+     * infinity (the JSON encoder would write it as a string, which no worker can apply),
+     * so such a solution is rejected here instead of failing on every worker.
+     *
      * @param taskId   the task identifier
      * @param solution the solution to serialize
      * @return the payload to send to the worker
-     * @throws IllegalArgumentException if the solution type is unsupported
+     * @throws IllegalArgumentException if the solution type is unsupported, or a variable is
+     *                                  {@code null}, not a number, {@code NaN} or infinite
      */
     static TaskPayload toPayload(long taskId, Solution<?> solution) {
         List<Number> variables = SolutionVariables.flatten(solution);
+        String notFinite = SolutionVariables.checkFinite(variables);
+        if (notFinite != null) {
+            throw new IllegalArgumentException(notFinite + " — a JSON number cannot carry it");
+        }
         List<Integer> segSizes = segmentSizes(solution);
         String encoding = SolutionVariables.wireEncoding(solution);
         if (SolutionVariables.Encoding.INT.wireName().equals(encoding)) {
@@ -324,7 +370,8 @@ public class TaskController {
      * values and {@code constraints} exactly {@code solution.constraints().length}
      * ({@code null} counts as empty); every value must be non-null and finite;
      * {@code variables}, when present and non-empty, must be convertible to the
-     * solution's variables (see {@link SolutionVariables#convert}).
+     * solution's variables (see {@link SolutionVariables#convert}) and lie within their
+     * bounds (see {@link SolutionVariables#checkBounds}).
      *
      * @param result   the payload posted by the worker
      * @param solution the master-held solution the result targets
@@ -336,13 +383,43 @@ public class TaskController {
         reason = checkValues("constraints", result.constraints(), solution.constraints().length);
         if (reason != null) return reason;
         if (result.variables() != null && !result.variables().isEmpty()) {
+            List<Number> converted;
             try {
-                SolutionVariables.convert(solution, result.variables());
+                converted = SolutionVariables.convert(solution, result.variables());
             } catch (IllegalArgumentException e) {
                 return e.getMessage();
             }
+            return SolutionVariables.checkBounds(solution, converted);
         }
         return null;
+    }
+
+    /**
+     * Writes a result into the solution it targets: the repaired variables first, when
+     * present (Lamarckian repair or local search), so that objectives and constraints stay
+     * consistent with the genes, then the objectives and the constraints. The result is
+     * checked again first ({@link #rejectionReason}), so nothing is written if it is invalid.
+     *
+     * @param solution the master-held solution
+     * @param result   the payload posted by the worker
+     * @throws IllegalArgumentException with the reason, if the result cannot be applied
+     */
+    static void record(Solution<?> solution, TaskResultPayload result) {
+        String reason = rejectionReason(result, solution);
+        if (reason != null) {
+            throw new IllegalArgumentException(reason);
+        }
+        if (result.variables() != null && !result.variables().isEmpty()) {
+            SolutionVariables.apply(solution, result.variables());
+        }
+        double[] objectives = solution.objectives();
+        for (int i = 0; i < objectives.length; i++) {
+            objectives[i] = result.objectives().get(i);
+        }
+        double[] constraints = solution.constraints();
+        for (int i = 0; i < constraints.length; i++) {
+            constraints[i] = result.constraints().get(i);
+        }
     }
 
     /**
@@ -389,8 +466,8 @@ public class TaskController {
      * backwards-compatible with workers that were built before composite
      * encoding was introduced.
      *
-     * <p>Example: a {@link CompositeSolution} with three components of 3 249
-     * variables each produces {@code [3249, 3249, 3249]}.
+     * <p>Example: a {@link CompositeSolution} with an integer component of 4
+     * variables and a real one of 2 produces {@code [4, 2]}.
      *
      * @param solution the jMetal solution to inspect
      * @return a list whose {@code i}-th element is the number of variables in

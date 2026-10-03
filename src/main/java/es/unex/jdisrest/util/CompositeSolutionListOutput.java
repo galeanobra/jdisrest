@@ -20,7 +20,9 @@ import java.util.stream.Collectors;
  * the inner components' metadata), so this class flattens all segments in
  * declaration order into a single space-separated row plus the outer
  * composite's objectives/constraints. Flat solutions in the list are written
- * the same way.
+ * the same way when this class is used directly; {@link TraceWriter} only uses it
+ * for lists of composites, and writes lists of flat solutions with jMetal's
+ * {@code SolutionListOutput} (separator-joined variables, nothing else).
  *
  * <p>VAR row format: {@code "v0 v1 ... vN-1,[obj0  obj1 ...],[con0  con1 ...]"}.
  * <p>FUN row format: standard jMetal — separator-joined objective values.

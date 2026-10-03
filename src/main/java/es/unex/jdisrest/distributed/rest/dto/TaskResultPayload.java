@@ -16,9 +16,11 @@ import java.util.List;
  * {@code problem.numberOfObjectives()} finite values, {@code constraints}
  * exactly {@code problem.numberOfConstraints()} finite values (an empty list or
  * {@code null} when the problem has none), and every value of {@code variables},
- * when present, must be representable by the destination variable. A payload
- * that fails validation is answered with {@code 422} and the task is requeued
- * as if the worker had reported an evaluation error.
+ * when present, must be representable by the destination variable and lie within
+ * its bounds. A payload
+ * that fails validation is answered with {@code 422} and the task is handled
+ * as if the worker had reported an evaluation error: requeued, or discarded
+ * after the failure limit (unless another worker holds the task now).
  *
  * <p>The {@code evaluationTimeMs} field is optional and informational only:
  * the master does not use it for scheduling or selection decisions. It is a
@@ -34,7 +36,8 @@ import java.util.List;
  * type of each JSON element is irrelevant: the master converts every value to
  * the type of the destination variable ({@code int} or {@code double}).
  *
- * @param workerId         identifier of the worker that performed the evaluation
+ * @param workerId         identifier of the worker that performed the evaluation;
+ *                         a result without it is still accepted
  * @param objectives       evaluated objective values in the order defined by the
  *                         problem (length must equal {@code problem.numberOfObjectives()})
  * @param constraints      evaluated constraint values (jMetal convention: negative

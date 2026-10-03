@@ -10,10 +10,13 @@ package es.unex.jdisrest.distributed.rest.dto;
  *
  * <p>On receipt the master removes the task from the in-flight map and
  * re-queues it in the pending queue so that another worker can retry the
- * evaluation. The {@code errorMessage} is logged at WARNING level for
+ * evaluation, or discards it once it has failed too many times. A report from
+ * a worker that no longer holds the task (another worker has it now) is ignored.
+ * The {@code errorMessage} is logged at WARNING level for
  * post-hoc debugging.
  *
- * @param workerId     identifier of the worker that encountered the error
+ * @param workerId     identifier of the worker that encountered the error; used
+ *                     to check that it still holds the task
  * @param errorMessage human-readable description of what went wrong; used for
  *                     logging only — the master does not act on its content
   * @author Jesús Galeano Brajones (Universidad de Extremadura)

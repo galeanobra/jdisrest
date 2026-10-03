@@ -1,21 +1,54 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77 is the first setuptools that takes an SPDX expression as the license (PEP 639).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jdisrest"
-version = "1.1.0"
+version = "1.2.0"
 description = "Python client for the jdisrest distributed evolutionary optimization framework"
 readme = "README.md"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
+# A copy of the repository's LICENSE, so that the wheel and the sdist carry the text.
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
-authors = [{ name = "Jesús Galeano Brajones", email = "jgaleanobra@unex.es" }]
+# All authors by name only: setuptools writes name-only and name-and-email authors to different
+# metadata fields, which shows one author as "Author" and the other as "Author-email".
+authors = [
+    { name = "Jesús Galeano Brajones" },
+    { name = "Francisco Luna" },
+]
+maintainers = [
+    { name = "Jesús Galeano Brajones", email = "jgaleanobra@unex.es" },
+]
+keywords = [
+    "evolutionary computation",
+    "multi-objective optimization",
+    "distributed computing",
+    "jMetal",
+    "master-worker",
+    "REST",
+    "NSGA-II",
+    "MOEA/D",
+    "SMS-EMOA",
+    "PAES",
+    "metaheuristics",
+    "HPC",
+]
 dependencies = [
     "requests>=2.31",
 ]
 
+[project.urls]
+Homepage = "https://github.com/galeanobra/jdisrest"
+Source = "https://github.com/galeanobra/jdisrest"
+Documentation = "https://github.com/galeanobra/jdisrest/blob/master/docs/DEVELOPER_MANUAL.md"
+
+[project.scripts]
+jdisrest-worker = "jdisrest._cli:console_main"
+
 [project.optional-dependencies]
-dev = ["pytest", "responses"]
+dev = ["pytest", "responses", "numpy", "matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["."]

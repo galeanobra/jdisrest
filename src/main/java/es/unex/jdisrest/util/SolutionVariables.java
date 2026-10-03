@@ -18,20 +18,26 @@ import java.util.List;
  *
  * <p>Supported solution types: {@link IntegerSolution}, {@link DoubleSolution}
  * and {@link CompositeSolution} whose components are any mix of the two. A
- * solution that is none of these is accepted when its variables are
- * {@link Integer} or {@link Double} at runtime (e.g. an integer permutation);
- * anything else is rejected with an {@link IllegalArgumentException}.
+ * solution that is none of these is accepted when its variables are all
+ * {@link Integer} or all {@link Double} at runtime (e.g. an integer permutation);
+ * anything else (other types, a mix of the two, a {@code null} variable, a
+ * composite nested in a composite) is rejected with an
+ * {@link IllegalArgumentException}.
  *
  * <p>Writing values back never trusts the numeric type that arrived on the
  * wire: each value is converted to the type the <em>destination</em> variable
- * requires ({@link Number#intValue()} for integer encodings,
- * {@link Number#doubleValue()} for real encodings). A JSON {@code 5} bound by
+ * requires (an {@code int} for integer encodings, a {@code double} for real
+ * encodings). A JSON {@code 5} bound by
  * Jackson to an {@link Integer} therefore lands correctly in a
  * {@code DoubleSolution}, and a {@code 5.0} bound to a {@link Double} lands
  * correctly in an {@code IntegerSolution}. Values that cannot be represented by
  * the destination (non-finite doubles, non-integral values for an integer
- * variable, integer overflow, {@code null}) are rejected — never truncated or
- * ignored silently.
+ * variable — beyond {@link #INTEGRALITY_TOLERANCE} — integer overflow, {@code null})
+ * are rejected — never truncated or ignored silently. (A real-encoded destination
+ * takes {@link Number#doubleValue()}, so a {@code long} beyond 2<sup>53</sup>, which
+ * Jackson never produces for these vectors, would be rounded.) Variables are not
+ * checked against their bounds here; {@link #checkBounds} does that for callers that
+ * accept vectors from outside, such as Lamarckian results.
  *
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
@@ -73,7 +79,10 @@ public final class SolutionVariables {
      *
      * <p>Decided by class first ({@link IntegerSolution} → {@link Encoding#INT},
      * {@link DoubleSolution} → {@link Encoding#DOUBLE}); otherwise by the runtime
-     * type of the first variable ({@link Integer} or {@link Double}).
+     * type of the variables, which must be all {@link Integer} or all {@link Double}:
+     * a flat vector has a single encoding on the wire, so a solution mixing both (or
+     * holding anything else) cannot be described and is rejected up front, instead of
+     * being announced as integer and then failing on every value that is not.
      *
      * @param solution a non-composite solution
      * @return its encoding
@@ -90,8 +99,21 @@ public final class SolutionVariables {
         List<?> vars = solution.variables();
         if (!vars.isEmpty()) {
             Object first = vars.get(0);
-            if (first instanceof Integer) return Encoding.INT;
-            if (first instanceof Double) return Encoding.DOUBLE;
+            Encoding encoding = first instanceof Integer ? Encoding.INT
+                : first instanceof Double ? Encoding.DOUBLE : null;
+            if (encoding != null) {
+                Class<?> type = first.getClass();
+                for (int i = 1; i < vars.size(); i++) {
+                    Object v = vars.get(i);
+                    if (v == null || v.getClass() != type) {
+                        throw new IllegalArgumentException("Unsupported solution type " + solution.getClass().getName()
+                            + ": variables[0] is " + type.getSimpleName() + " but variables[" + i + "] is "
+                            + (v == null ? "null" : v.getClass().getSimpleName())
+                            + "; the variables of a flat solution must be all Integer or all Double");
+                    }
+                }
+                return encoding;
+            }
         }
         throw new IllegalArgumentException("Unsupported solution type " + solution.getClass().getName()
             + ": only IntegerSolution, DoubleSolution and CompositeSolution of those are supported");
@@ -162,22 +184,70 @@ public final class SolutionVariables {
      * <p>The result is always a fresh, mutable list: callers may store it (e.g.
      * as a {@code HashSet} key) without aliasing the solution's live list.
      *
+     * <p>Every element is checked against its segment's encoding, so a {@code null}
+     * variable, or one of another type smuggled in through raw types, is reported
+     * with its position instead of failing later with a {@link ClassCastException} or
+     * travelling to a worker as JSON {@code null}. Non-finite values are copied as they
+     * are (they are legitimate keys and trace values); {@link #checkFinite} tells
+     * whether the vector can travel as JSON numbers.
+     *
      * @param solution the solution to read
      * @return a new list with all scalar variables
-     * @throws IllegalArgumentException if the solution (or one component) is unsupported
+     * @throws IllegalArgumentException if the solution (or one component) is unsupported, or
+     *                                  a variable is {@code null} or not of its encoding's type
      */
     public static List<Number> flatten(Solution<?> solution) {
         List<Number> flat = new ArrayList<>(size(solution));
         if (solution instanceof CompositeSolution composite) {
             for (Solution<?> component : composite.variables()) {
-                encodingOf(component); // validates the component type
-                for (Object v : component.variables()) flat.add((Number) v);
+                addVariables(flat, component, encodingOf(component));
             }
             return flat;
         }
-        encodingOf(solution); // validates the type
-        for (Object v : solution.variables()) flat.add((Number) v);
+        addVariables(flat, solution, encodingOf(solution));
         return flat;
+    }
+
+    /**
+     * Appends the variables of a flat solution or segment to {@code flat}, checking that each
+     * is an {@link Integer} ({@link Encoding#INT}) or a {@link Double} ({@link Encoding#DOUBLE}).
+     *
+     * @param flat     the vector being built; its size gives the position of the next value
+     * @param solution the flat solution or segment to read
+     * @param encoding its encoding
+     * @throws IllegalArgumentException if a variable is {@code null} or of another type
+     */
+    private static void addVariables(List<Number> flat, Solution<?> solution, Encoding encoding) {
+        Class<?> expected = encoding == Encoding.INT ? Integer.class : Double.class;
+        for (Object v : solution.variables()) {
+            if (v == null) {
+                throw new IllegalArgumentException("variables[" + flat.size() + "] is null");
+            }
+            if (v.getClass() != expected) {
+                throw new IllegalArgumentException("variables[" + flat.size() + "] = " + v + " is a "
+                    + v.getClass().getSimpleName() + " but its segment is " + encoding.wireName() + "-encoded");
+            }
+            flat.add((Number) v);
+        }
+    }
+
+    /**
+     * Checks that every value of a flat vector is finite, as JSON numbers must be: a
+     * {@code NaN} or an infinity would be written as a JSON string (or rejected) by the
+     * encoder, and no worker could apply it.
+     *
+     * @param values a flat vector, e.g. from {@link #flatten}
+     * @return {@code null} if every value is finite (or not a floating-point number),
+     *         otherwise the reason, naming the first offending position
+     */
+    public static String checkFinite(List<? extends Number> values) {
+        for (int i = 0; i < values.size(); i++) {
+            Number v = values.get(i);
+            if ((v instanceof Double || v instanceof Float) && !Double.isFinite(v.doubleValue())) {
+                return "variables[" + i + "] is not finite: " + v;
+            }
+        }
+        return null;
     }
 
     // ── Vector → solution ─────────────────────────────────────────────────────
@@ -192,12 +262,15 @@ public final class SolutionVariables {
      * @param values      the flat vector, laid out as {@link #flatten(Solution)} produces it
      * @return a new list of the same size whose elements are {@link Integer} or
      *         {@link Double} as each destination variable requires
-     * @throws IllegalArgumentException if the vector is {@code null}, its length
-     *                                  differs from {@link #size(Solution)}, or any
+     * @throws IllegalArgumentException if the vector is {@code null}, the destination's type is
+     *                                  unsupported (checked first, so that a nested composite is
+     *                                  reported as such rather than as a length mismatch), its
+     *                                  length differs from {@link #size(Solution)}, or any
      *                                  value cannot be represented by its destination
      */
     public static List<Number> convert(Solution<?> destination, List<? extends Number> values) {
         if (values == null) throw new IllegalArgumentException("variables is null");
+        wireEncoding(destination); // validates the destination's (and every segment's) type
         int expected = size(destination);
         if (values.size() != expected) {
             throw new IllegalArgumentException("variables has " + values.size()
@@ -216,6 +289,66 @@ public final class SolutionVariables {
         Encoding enc = encodingOf(destination);
         for (; idx < expected; idx++) out.add(convertValue(values.get(idx), enc, idx));
         return out;
+    }
+
+    /**
+     * Checks a converted vector against the bounds of the variables it would overwrite: the
+     * variables of an {@link IntegerSolution} or a {@link DoubleSolution}, or of such segments of
+     * a {@link CompositeSolution}, must lie within {@code [lowerBound, upperBound]}. Solutions
+     * of other types declare no bounds and accept any value.
+     *
+     * <p>{@link #convert} does not check bounds, because a vector going <em>to</em> a worker is
+     * the master's own; use this method for vectors coming back from outside, such as the
+     * repaired variables of a Lamarckian result, which would otherwise put values no operator
+     * expects into the population, the archive and the final front.
+     *
+     * @param destination the solution whose variables would receive the values
+     * @param converted   the vector as returned by {@link #convert} for {@code destination}
+     * @return {@code null} if every value is within its bounds, otherwise the reason, naming the
+     *         first offending position, its value and its bounds
+     */
+    public static String checkBounds(Solution<?> destination, List<? extends Number> converted) {
+        if (destination instanceof CompositeSolution composite) {
+            int offset = 0;
+            for (Solution<?> component : composite.variables()) {
+                String reason = checkBounds(component, converted, offset);
+                if (reason != null) return reason;
+                offset += component.variables().size();
+            }
+            return null;
+        }
+        return checkBounds(destination, converted, 0);
+    }
+
+    /**
+     * {@link #checkBounds(Solution, List)} for one flat solution or segment.
+     *
+     * @param solution  the flat solution or segment
+     * @param converted the whole converted vector
+     * @param offset    position of the segment's first variable in {@code converted}
+     * @return {@code null} if within bounds, otherwise the reason
+     */
+    private static String checkBounds(Solution<?> solution, List<? extends Number> converted, int offset) {
+        int n = solution.variables().size();
+        for (int i = 0; i < n; i++) {
+            double value = converted.get(offset + i).doubleValue();
+            Number lower;
+            Number upper;
+            if (solution instanceof IntegerSolution integer) {
+                lower = integer.getBounds(i).getLowerBound();
+                upper = integer.getBounds(i).getUpperBound();
+            } else if (solution instanceof DoubleSolution real) {
+                lower = real.getBounds(i).getLowerBound();
+                upper = real.getBounds(i).getUpperBound();
+            } else {
+                return null;  // no bounds declared
+            }
+            if (value < lower.doubleValue() || value > upper.doubleValue()) {
+                return "variables[" + (offset + i) + "] = " + converted.get(offset + i)
+                    + " is outside the bounds [" + lower + ", " + upper + "] of its variable";
+            }
+        }
+        return null;
     }
 
     /**

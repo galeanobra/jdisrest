@@ -12,15 +12,19 @@ import org.uma.jmetal.util.comparator.dominanceComparator.impl.DominanceWithCons
 /**
  * Distributed steady-state NSGA-II (Non-dominated Sorting Genetic Algorithm II).
  *
- * <p>This class wires the standard NSGA-II selection criterion — binary tournament
- * selection with Pareto dominance and constraint comparison — into the generic
- * steady-state infrastructure provided by {@link SteadyStateEvolutionaryAlgorithm}.
+ * <p>This class wires an NSGA-II mating selection — binary tournaments decided by Pareto
+ * dominance with constraint comparison ({@link DominanceWithConstraintsComparator}, see
+ * {@link NaryTournamentSelection}) — into the generic steady-state infrastructure provided by
+ * {@link SteadyStateEvolutionaryAlgorithm}. Textbook NSGA-II (and jMetal's own NSGA-II)
+ * decides its tournaments by rank and crowding distance instead, so the selection pressure
+ * among mutually non-dominated parents differs.
  *
  * <p>NSGA-II environmental selection in {@code processComputedTask} (inherited):
  * <ol>
  *   <li>Add the new offspring to the current population (size becomes
- *       {@code populationSize + 1}).</li>
- *   <li>Apply fast non-dominated sorting to assign each solution a rank.</li>
+ *       {@code populationSize + 1}), unless the population already holds a solution with the
+ *       same variables.</li>
+ *   <li>Apply fast non-dominated sorting, constraint-aware, to assign each solution a rank.</li>
  *   <li>Fill the new population front by front; when the last fitting front is
  *       too large, sort it by crowding distance (descending) and take the most
  *       diverse solutions.</li>

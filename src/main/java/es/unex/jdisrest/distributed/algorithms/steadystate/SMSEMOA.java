@@ -2,6 +2,7 @@ package es.unex.jdisrest.distributed.algorithms.steadystate;
 
 import es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithm;
 import es.unex.jdisrest.operator.NaryTournamentSelection;
+import es.unex.jdisrest.util.Log;
 import org.uma.jmetal.component.catalogue.common.termination.Termination;
 import org.uma.jmetal.operator.crossover.CrossoverOperator;
 import org.uma.jmetal.operator.mutation.MutationOperator;
@@ -9,12 +10,14 @@ import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.solution.Solution;
 import org.uma.jmetal.util.comparator.dominanceComparator.impl.DominanceWithConstraintsComparator;
+import org.uma.jmetal.util.densityestimator.impl.CrowdingDistanceDensityEstimator;
 import org.uma.jmetal.util.legacy.qualityindicator.impl.hypervolume.Hypervolume;
 import org.uma.jmetal.util.legacy.qualityindicator.impl.hypervolume.impl.PISAHypervolume;
 import org.uma.jmetal.util.ranking.Ranking;
 import org.uma.jmetal.util.ranking.impl.FastNonDominatedSortRanking;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -28,31 +31,47 @@ import java.util.List;
  *
  * <p>Selection procedure in {@link #processComputedTask} (steady-state variant):
  * <ol>
+ *   <li>Discard the new offspring if the population already holds a solution with the same
+ *       variables, as the other steady-state algorithms do (it still counts as an evaluation
+ *       and enters the archive).</li>
  *   <li>Add the new offspring to the current population, forming a joint population of
  *       size {@code populationSize + 1}.</li>
- *   <li>Apply fast non-dominated sorting to identify all Pareto fronts.</li>
+ *   <li>Apply fast non-dominated sorting with the algorithm's dominance comparator, which
+ *       takes constraints into account ({@link DominanceWithConstraintsComparator}), to
+ *       identify all fronts.</li>
  *   <li>From the last (worst) front, compute each solution's hypervolume contribution
  *       relative to the full joint population.</li>
  *   <li>Remove the solution with the minimum hypervolume contribution from the last
  *       front, keeping the population size constant at {@code populationSize}.</li>
  * </ol>
  *
+ * <p>The hypervolume contributions are undefined when an objective has the same value in every
+ * member of the joint population: jMetal's PISA hypervolume normalizes by the range of each
+ * objective and throws. In that case, when the last front has more than one member, the member of
+ * the last front with the smallest crowding distance is removed instead, and a warning is logged
+ * once per run.
+ *
  * <p>All other algorithm infrastructure (Spring Boot, task queues, archive, warm start,
  * trace saving) is inherited from {@link SteadyStateEvolutionaryAlgorithm}.
+ *
+ * <p>Since jdisrest 1.2 the ranking is constraint-aware and duplicates are filtered. Earlier
+ * versions ranked with plain Pareto dominance (as jMetal's own SMS-EMOA does), so an infeasible
+ * solution could push feasible ones out of the population; they also admitted exact duplicates,
+ * and a constant objective ended the run with an exception.
  *
  * @param <S> the solution type (typically {@code IntegerSolution} or {@code CompositeSolution})
   * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public class SMSEMOA<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorithm<S> {
 
-    /** Ranking algorithm used to compute non-dominated fronts (fast non-dominated sort). */
-    private final Ranking<S> ranking;
-
     /**
      * Hypervolume indicator used to compute each solution's contribution to the last front.
      * Uses the PISA hypervolume implementation.
      */
     private final Hypervolume<S> hypervolume;
+
+    /** Whether the constant-objective fallback has been reported (once per run). Algorithm thread only. */
+    private boolean constantObjectiveReported;
 
     /**
      * Constructs a distributed steady-state SMS-EMOA master.
@@ -75,28 +94,31 @@ public class SMSEMOA<S extends Solution<?>> extends SteadyStateEvolutionaryAlgor
               new DominanceWithConstraintsComparator<>(),
               termination, tracesFolder);
 
-        this.ranking = new FastNonDominatedSortRanking<>();
         this.hypervolume = new PISAHypervolume<>();
     }
 
     /**
      * Integrates an evaluated offspring into the population using SMS-EMOA selection.
      *
-     * <p>If the population has not yet reached {@code populationSize}, the offspring is
-     * added directly. Otherwise, the joint population (current + offspring) is ranked
-     * by non-domination, and the solution with the minimum hypervolume contribution in
-     * the last (worst) front is discarded, maintaining exactly {@code populationSize}
-     * solutions.
+     * <p>A copy of the offspring enters the archive. If the population already holds a solution
+     * with the same variables, the offspring goes no further. If the population has not yet
+     * reached {@code populationSize}, the offspring is added directly. Otherwise
+     * the SMS-EMOA replacement removes one member of the joint population (current + offspring),
+     * maintaining exactly {@code populationSize} solutions.
      *
      * @param task the completed task whose solution has been evaluated by a worker
      */
     @Override
+    @SuppressWarnings("unchecked")
     public void processComputedTask(ParallelTask<S> task) {
         evaluations++;
         S sol = (S) task.getContents().copy();
-        archive.add(sol);
+        archive.add((S) sol.copy());  // never share an instance with the population
 
         synchronized (population) {
+            if (solutionInThePopulation(sol)) {
+                return;  // exact duplicate of a member: counted and archived, not inserted
+            }
             if (population.size() < populationSize) {
                 // Population not yet full — add directly without selection pressure.
                 population.add(sol);
@@ -105,29 +127,93 @@ public class SMSEMOA<S extends Solution<?>> extends SteadyStateEvolutionaryAlgor
                 List<S> jointPopulation = new ArrayList<>(population);
                 jointPopulation.add(sol);
 
-                // Step 1: rank all solutions by non-domination.
-                ranking.compute(jointPopulation);
-
-                // Step 2: identify the last (worst) front and compute hypervolume contributions.
-                List<S> lastSubFront = ranking.getSubFront(ranking.getNumberOfSubFronts() - 1);
-                lastSubFront = hypervolume.computeHypervolumeContribution(lastSubFront, jointPopulation);
-
-                // Step 3: rebuild population — keep all fronts except the last in full,
-                // then add all but the last (minimum-contribution) solution of the last front.
-                List<S> resultPopulation = new ArrayList<>();
-                for (int i = 0; i < ranking.getNumberOfSubFronts() - 1; i++) {
-                    resultPopulation.addAll(ranking.getSubFront(i));
+                int constant = constantObjective(jointPopulation);
+                if (constant >= 0 && !constantObjectiveReported) {
+                    constantObjectiveReported = true;
+                    Log.warn("SMS-EMOA: objective " + constant + " has the same value in the whole population"
+                            + " — removing the most crowded member of the last front instead of the smallest"
+                            + " hypervolume contribution while that lasts (reported once)");
                 }
-                // computeHypervolumeContribution sorts the last front so the solution with
-                // the smallest contribution is placed last — drop it.
-                for (int i = 0; i < lastSubFront.size() - 1; i++) {
-                    resultPopulation.add(lastSubFront.get(i));
-                }
+                List<S> resultPopulation = survivors(jointPopulation, dominanceComparator, hypervolume);
 
                 population.clear();
                 population.addAll(resultPopulation);
                 rebuildPopulationSignatures();
             }
         }
+    }
+
+    // ── Environmental selection ───────────────────────────────────────────────
+
+    /**
+     * The SMS-EMOA replacement: the joint population without its least valuable member.
+     *
+     * <p>The joint population is ranked with {@code dominanceComparator}. Every front but the last
+     * survives whole. From the last front the member with the smallest hypervolume contribution,
+     * computed against the whole joint population, is removed; when the last front has a single
+     * member, that member is removed. When the last front has several members and some objective
+     * is constant over the joint population ({@link #constantObjective}), so that the
+     * contributions are undefined, the member of the last front with the smallest crowding
+     * distance is removed instead (on a tie, the one ranked last).
+     *
+     * <p>Writes rank, hypervolume-contribution or crowding attributes into the members, so the
+     * caller must hold whatever lock guards them.
+     *
+     * @param jointPopulation     the population plus the new solution; not modified
+     * @param dominanceComparator the dominance used to rank
+     * @param hypervolume         the hypervolume used for the contributions
+     * @param <S>                 the solution type
+     * @return a new list with every member of {@code jointPopulation} but one
+     */
+    static <S extends Solution<?>> List<S> survivors(List<S> jointPopulation, Comparator<S> dominanceComparator,
+            Hypervolume<S> hypervolume) {
+        Ranking<S> ranking = new FastNonDominatedSortRanking<>(dominanceComparator);
+        ranking.compute(jointPopulation);
+        int lastFrontIndex = ranking.getNumberOfSubFronts() - 1;
+
+        List<S> lastFront = new ArrayList<>(ranking.getSubFront(lastFrontIndex));
+        if (lastFront.size() > 1 && constantObjective(jointPopulation) >= 0) {
+            CrowdingDistanceDensityEstimator<S> crowding = new CrowdingDistanceDensityEstimator<>();
+            crowding.compute(lastFront);
+            lastFront.sort(crowding.comparator());  // decreasing distance: the most crowded last
+        } else {
+            // Sorted by decreasing contribution, so the smallest is last; a single member stays as is.
+            lastFront = hypervolume.computeHypervolumeContribution(lastFront, jointPopulation);
+        }
+
+        List<S> resultPopulation = new ArrayList<>(jointPopulation.size() - 1);
+        for (int i = 0; i < lastFrontIndex; i++) {
+            resultPopulation.addAll(ranking.getSubFront(i));
+        }
+        resultPopulation.addAll(lastFront.subList(0, lastFront.size() - 1));
+        return resultPopulation;
+    }
+
+    /**
+     * The first objective whose value is the same in every solution, or {@code -1} if there is
+     * none (or the list is empty). Values are compared with {@code ==}, as the hypervolume
+     * compares the minimum and maximum of each objective.
+     *
+     * @param solutions the solutions to examine
+     * @return the index of a constant objective, or {@code -1}
+     */
+    static int constantObjective(List<? extends Solution<?>> solutions) {
+        if (solutions.isEmpty()) {
+            return -1;
+        }
+        double[] first = solutions.getFirst().objectives();
+        for (int i = 0; i < first.length; i++) {
+            boolean constant = true;
+            for (Solution<?> s : solutions) {
+                if (s.objectives()[i] != first[i]) {
+                    constant = false;
+                    break;
+                }
+            }
+            if (constant) {
+                return i;
+            }
+        }
+        return -1;
     }
 }

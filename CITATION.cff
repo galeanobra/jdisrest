@@ -2,6 +2,18 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it using the metadata below."
 title: "jdisrest: distributed REST-based master/worker framework for jMetal-encoded optimization problems"
 type: software
+abstract: >-
+  Distributed REST-based master/worker framework for jMetal-encoded
+  optimization problems. jdisrest runs evolutionary algorithms (NSGA-II,
+  MOEA/D, SMS-EMOA, PAES) whose objective-function evaluations are farmed
+  out to remote worker processes over plain HTTP. The master (Java, Spring
+  Boot WebFlux) owns the algorithm and the population; workers only need
+  four REST endpoints (heartbeat, next task, result and error report), so
+  they can be written in Java, Python, MATLAB, or anything else that can
+  make an HTTP request. This makes it straightforward to distribute
+  expensive evaluations, such as external simulators, trained models, or
+  legacy code, across a cluster (including SLURM-managed HPC nodes) without
+  coupling the algorithm implementation to the evaluation language.
 authors:
   - family-names: "Galeano Brajones"
     given-names: "Jesús"
@@ -24,3 +36,9 @@ keywords:
   - jMetal
   - master-worker
   - REST
+  - NSGA-II
+  - MOEA/D
+  - SMS-EMOA
+  - PAES
+  - metaheuristics
+  - HPC

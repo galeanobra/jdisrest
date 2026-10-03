@@ -6,7 +6,7 @@
 
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <licenses>
@@ -23,15 +23,23 @@
             <organization>GITACA – Universidad de Extremadura</organization>
             <organizationUrl>https://gitaca.unex.es/</organizationUrl>
         </developer>
+        <developer>
+            <name>Francisco Luna</name>
+            <url>https://orcid.org/0000-0002-0455-7223</url>
+            <organization>Universidad de Málaga</organization>
+        </developer>
     </developers>
 
     <name>jdisrest</name>
     <description>
         Distributed REST-based master/worker framework for jMetal-encoded
         optimization problems. Provides an embedded Spring Boot master that
-        exposes a task API consumed by remote workers, plus steady-state
-        and generational algorithm variants (NSGA-II, MOEA/D, SMS-EMOA).
+        exposes a task API consumed by remote workers; steady-state NSGA-II,
+        MOEA/D, SMS-EMOA and PAES; a base class for generational masters;
+        configuration files and a launcher for real-coded problems; and a
+        Java worker.
     </description>
+    <url>https://github.com/galeanobra/jdisrest</url>
 
     <properties>
         <maven.compiler.source>25</maven.compiler.source>
@@ -42,6 +50,20 @@
     </properties>
 
     <build>
+        <!-- Declaring resources replaces Maven's default, so src/main/resources is listed too. -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <!-- The license travels inside the jar, as META-INF/LICENSE. -->
+            <resource>
+                <directory>${project.basedir}</directory>
+                <includes>
+                    <include>LICENSE</include>
+                </includes>
+                <targetPath>META-INF</targetPath>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -81,13 +103,16 @@
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
-        <!-- Actuator endpoint /actuator/health (used by monitoring scripts). -->
+        <!-- Actuator: GET /actuator/health on the master's port, a liveness check for scripts. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Jackson for JSON payloads (transitively via webflux, listed explicitly). -->
+        <!-- Jackson 2 (com.fasterxml), used directly by AbstractMaster (.master-endpoint), the
+             status.json writer, RestWorker and PythonProcessEvaluator. WebFlux serializes the REST
+             payloads with Jackson 3 (tools.jackson), which it brings in itself; both read the
+             com.fasterxml.jackson.annotation annotations of the DTOs. -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>

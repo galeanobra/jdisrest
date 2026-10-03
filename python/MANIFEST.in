@@ -1,0 +1,4 @@
+# The trace tools are not part of the package, but the tests import them: ship them in the sdist
+# so that its tests run.
+graft tools
+global-exclude *.py[cod] __pycache__
