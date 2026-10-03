@@ -6,7 +6,7 @@
 
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.2.0</version>
+    <version>1.2.1</version>
     <packaging>jar</packaging>
 
     <licenses>
@@ -81,6 +81,32 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.5</version>
             </plugin>
+            <!-- Integration tests (*IT, which Surefire leaves out) run in mvn verify. Each class
+                 starts a real master, which registers itself in static singletons, so each gets a
+                 JVM of its own; they run only when jdisrest.it is true, so an IDE that runs every
+                 test in one JVM skips them. They run in target/it-workdir, so a file written to the
+                 current directory stays out of the source tree. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.5</version>
+                <configuration>
+                    <forkCount>1</forkCount>
+                    <reuseForks>false</reuseForks>
+                    <workingDirectory>${project.build.directory}/it-workdir</workingDirectory>
+                    <systemPropertyVariables>
+                        <jdisrest.it>true</jdisrest.it>
+                    </systemPropertyVariables>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 
@@ -135,7 +161,7 @@
             <version>${jmetal.version}</version>
         </dependency>
 
-        <!-- Unit tests (version managed by spring-boot-dependencies). -->
+        <!-- Unit and integration tests (version managed by spring-boot-dependencies). -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

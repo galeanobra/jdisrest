@@ -7,6 +7,8 @@ import org.uma.jmetal.solution.integersolution.IntegerSolution;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -16,8 +18,9 @@ import static es.unex.jdisrest.distributed.AbstractMasterTest.stderrOf;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * How the masters hand out tasks before they are ready and when a worker claims again: tested on
- * masters built without their REST server (constructing a real one starts Spring).
+ * How the masters hand out tasks before they are ready, once they need no more results and when
+ * a worker claims again: tested on masters built without their REST server (constructing a real
+ * one starts Spring).
  */
 class SteadyStateMasterTest {
 
@@ -29,9 +32,14 @@ class SteadyStateMasterTest {
 
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
-    /** A steady-state master whose readiness the test sets and whose new tasks it counts. */
+    /**
+     * A steady-state master whose readiness, stopping condition and end of run the test sets, and
+     * whose new tasks it counts.
+     */
     static final class TestSteadyStateMaster extends SteadyStateMaster<ParallelTask<IntegerSolution>, Void> {
         volatile boolean ready = true;
+        volatile boolean running = true;
+        volatile boolean ended = false;
         final AtomicInteger created = new AtomicInteger();
         final AtomicInteger stoppingConditionChecks = new AtomicInteger();
         private final AtomicLong ids = new AtomicLong(100);
@@ -41,11 +49,12 @@ class SteadyStateMasterTest {
         }
 
         @Override public boolean isReady() { return ready; }
+        @Override boolean runEnded() { return ended; }
 
         @Override
         public boolean stoppingConditionIsNotMet() {
             stoppingConditionChecks.incrementAndGet();
-            return true;
+            return running;
         }
 
         @Override
@@ -123,6 +132,78 @@ class SteadyStateMasterTest {
         assertNull(claimed);
         assertTrue(Duration.between(start, Instant.now()).compareTo(AT_ONCE) < 0, "no long-poll while not ready");
         assertEquals(2, master.getPendingTaskQueue().size());
+    }
+
+    // ── No more results needed ────────────────────────────────────────────────
+
+    @Test
+    void steadyStateMasterStillHandsOutAQueuedTaskWhileOnlyTheStoppingConditionIsMet() throws InterruptedException {
+        // isFinished() can be true on a REST thread before the algorithm thread has noticed it (a
+        // criterion installed with setTermination): the loop may be waiting for one more result,
+        // and the queued task's can be that one.
+        TestSteadyStateMaster master = new TestSteadyStateMaster();
+        master.submitTask(task(1));
+        master.running = false;
+
+        assertTrue(master.isFinished());
+        ParallelTask<IntegerSolution> claimed = master.claimNextTask("w1", LONG_POLL_S);
+
+        assertNotNull(claimed, "handed out until the algorithm has left its loop");
+        assertEquals(1L, claimed.getIdentifier());
+        assertEquals(0, master.created.get(), "but no new task is created for it");
+        assertTrue(master.inFlightTasks.containsKey(1L));
+    }
+
+    @Test
+    void steadyStateMasterHandsOutNothingOnceTheRunHasEnded() throws InterruptedException {
+        // A request that passed the controller's check just before the end: the spare child of
+        // the last task created is still queued, and its result would be refused.
+        TestSteadyStateMaster master = new TestSteadyStateMaster();
+        master.submitTask(task(1));
+        master.ended = true;
+
+        Instant start = Instant.now();
+        ParallelTask<IntegerSolution> claimed = master.claimNextTask("w1", LONG_POLL_S);
+
+        assertNull(claimed, "the worker gets 204, then 410 on its next request");
+        assertTrue(Duration.between(start, Instant.now()).compareTo(AT_ONCE) < 0, "no long-poll after the end");
+        assertEquals(1, master.getPendingTaskQueue().size(), "the queued task is not even taken");
+        assertEquals(0, master.created.get());
+        assertTrue(master.inFlightTasks.isEmpty());
+    }
+
+    @Test
+    void taskThatArrivesDuringTheLongPollAfterTheEndIsNotHandedOut() throws Exception {
+        TestSteadyStateMaster master = new TestSteadyStateMaster();
+        master.running = false;  // met as REST threads see it: nothing is created, the claim waits
+        FutureTask<ParallelTask<IntegerSolution>> claim =
+            new FutureTask<>(() -> master.claimNextTask("w1", LONG_POLL_S));
+        Thread thread = new Thread(claim, "long-poll-under-test");
+        thread.setDaemon(true);
+        thread.start();
+        Instant deadline = Instant.now().plus(AT_ONCE);
+        while (thread.getState() != Thread.State.TIMED_WAITING) {
+            assertTrue(Instant.now().isBefore(deadline), "the claim never started its long-poll");
+            Thread.sleep(1);
+        }
+
+        master.ended = true;
+        master.submitTask(task(1));  // say, requeued just before the end
+
+        assertNull(claim.get(AT_ONCE.toSeconds(), TimeUnit.SECONDS), "a task whose result would be refused");
+        assertTrue(master.inFlightTasks.isEmpty());
+        assertNull(master.getWorkerRegistry().get("w1"), "the worker was never given anything");
+    }
+
+    @Test
+    void generationalMasterHandsOutNothingAfterAStop() throws InterruptedException {
+        TestGenerationalMaster master = new TestGenerationalMaster();
+        master.submitTasks(List.of(task(1), task(2)));
+        stderrOf(master::requestStop);
+
+        assertNull(master.claimNextTask("w1", LONG_POLL_S));
+        assertEquals(2, master.getPendingTaskQueue().size(), "at once, without taking a task to drop");
+        assertTrue(master.inFlightTasks.isEmpty());
     }
 
     // ── Claiming again ────────────────────────────────────────────────────────

@@ -203,10 +203,13 @@ through (a network error, or an answer such as `500` or `502`), are reported the
 best-effort, so that the master requeues the task at once instead of keeping it in flight; the
 master counts such a report as a failed evaluation of the task if it still has the task in
 flight. The master answers `404` to a result it no longer expects (the task was requeued, or
-the run was stopped) and `400`, `413`, `415` or `422` to one it cannot apply, which already
+the run is over) and `400`, `413`, `415` or `422` to one it cannot apply, which already
 counts as a failed evaluation: for a `422`, unless another worker holds the task by then; a
 `400`, `413` or `415` counts whoever holds it, because the master cannot read the `workerId` of
-a body it has not decoded. The worker logs the answer and carries on.
+a body it has not decoded. Once the run has been stopped or has ended, nothing counts: a result
+the master cannot apply gets `404` as well, and a report through `/error` or answered with
+`400`, `413` or `415` only takes the task out of flight. The worker logs the answer and carries
+on.
 
 The master is taken as gone after 5 failed requests in a row (`Worker.MAX_CONSECUTIVE_ERRORS`):
 network errors and answers the protocol does not expect, such as the `502` of a proxy in front

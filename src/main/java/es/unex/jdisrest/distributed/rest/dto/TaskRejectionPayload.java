@@ -15,8 +15,10 @@ package es.unex.jdisrest.distributed.rest.dto;
  * Media Type} when it is not sent as {@code application/json}. In every case the
  * master has already handled the task exactly as if the worker had called
  * {@code POST /api/v1/tasks/{taskId}/error} (requeued, or discarded once it has
- * failed too many times): the worker should log {@code reason} and move on to
- * the next task.
+ * failed too many times; once a stop has been requested or the algorithm has
+ * ended its run, taken out of flight without counting anything, and an invalid
+ * result gets {@code 404} instead of {@code 422}): the worker should log
+ * {@code reason} and move on to the next task.
  *
  * @param taskId the task whose result was rejected; {@code -1} if it could not
  *               be determined from the request path

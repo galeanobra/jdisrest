@@ -51,6 +51,13 @@ import java.util.stream.Collectors;
  *       holds the task (another worker has it now) is ignored.</li>
  * </ol>
  *
+ * <p>Once the master needs no more results (a stop has been requested, or the
+ * algorithm has ended its run; see {@link MasterFacade#needsNoMoreResults()}),
+ * {@code GET /next} hands out nothing, a decoded result gets {@code 404}
+ * whether it passes validation or not (a body Spring rejects keeps its
+ * {@code 400}, {@code 413} or {@code 415}), and a failure report counts
+ * nothing: the task only leaves {@code inFlightTasks}.
+ *
  * <p>Variable encodings: the decision vector travels as a flat list of JSON
  * numbers whatever the jMetal solution type ({@code IntegerSolution},
  * {@code DoubleSolution} or a {@code CompositeSolution} mixing both). The
@@ -100,7 +107,8 @@ public class TaskController {
      *   <li>{@code 204 No Content} — no task arrived within the long-poll window, or the
      *       master is not ready to hand out tasks yet (it is still building its initial
      *       state); the worker should wait a few seconds and ask again (the bundled
-     *       workers wait 5 s).</li>
+     *       workers wait 5 s). A request that was already being served when the run was
+     *       stopped or ended gets it too, and the next one {@code 410}.</li>
      *   <li>{@code 410 Gone} — the algorithm has finished; worker should shut
      *       down.</li>
      *   <li>{@code 500 Internal Server Error} — the claimed task could not be serialized
@@ -174,11 +182,16 @@ public class TaskController {
      * <p>Response codes:
      * <ul>
      *   <li>{@code 200 OK} — result accepted and recorded.</li>
-     *   <li>{@code 404 Not Found} — {@code taskId} is no longer in
-     *       {@code inFlightTasks}, because the watchdog already requeued it (the
-     *       worker took too long), another report for it was accepted first, or
-     *       the run has been stopped ({@code POST /api/v1/stop}) and no more
-     *       results are needed. The result is discarded.</li>
+     *   <li>{@code 404 Not Found} — the master no longer expects the result:
+     *       {@code taskId} is no longer in {@code inFlightTasks} (the watchdog
+     *       already requeued it because the worker took too long, or another report
+     *       for it was accepted first), or no more results are needed (the run was
+     *       stopped with {@code POST /api/v1/stop} or, for
+     *       {@code SteadyStateEvolutionaryAlgorithm} and its subclasses, has ended on
+     *       its stopping criterion). The result is discarded and not counted. Once no
+     *       more results are needed this holds for an invalid result too: it does not
+     *       count as a failed evaluation, and the worker gets this answer instead of
+     *       {@code 422}.</li>
      *   <li>{@code 422 Unprocessable Content} — the payload is well-formed JSON
      *       but cannot be applied: wrong number of objectives or constraints, a
      *       {@code null}, {@code NaN} or infinite value, or a decision vector that
@@ -210,13 +223,15 @@ public class TaskController {
                     boolean counted = MasterFacade.failInFlightTask(taskId, result.workerId());
                     Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId() + ": " + reason
                         + (counted ? " — counted as a failed evaluation" : ""));
-                    return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, reason));
+                    // Read after the report, which counts nothing once no more results are needed.
+                    return invalidResultAnswer(taskId, reason, counted, MasterFacade.needsNoMoreResults());
                 }
             }
             try {
                 // Takes the task out of flight, records the result, moves it to the completed
-                // queue. Returns false if the task was not in flight (the watchdog or another
-                // report took it first) or a stop has been requested (the result is dropped).
+                // queue. Returns false, dropping the result, if the task was not in flight (the
+                // watchdog or another report took it first), a stop has been requested or a
+                // SteadyStateEvolutionaryAlgorithm has ended its run.
                 boolean accepted = MasterFacade.submitResult(taskId, result.workerId(),
                     claimed -> record(claimed.getContents(), result));
                 return accepted
@@ -224,7 +239,8 @@ public class TaskController {
                     : ResponseEntity.<TaskRejectionPayload>notFound().build();
             } catch (IllegalArgumentException e) {
                 // Only when the task entered flight after the check above (it is checked again
-                // by record): the master has already handled it as a failed evaluation.
+                // by record): the master has already handled it as a failed evaluation, which
+                // counts nothing if a stop or the end of the run landed during the recording.
                 Log.warn("[task-" + taskId + "] Invalid result from " + result.workerId() + ": "
                     + e.getMessage() + " — counted as a failed evaluation");
                 return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, e.getMessage()));
@@ -242,12 +258,14 @@ public class TaskController {
      * {@link WatchdogScheduler} to detect a silent worker after its
      * {@link Timings#WORKER_TIMEOUT_S}-second timeout. A report from a worker that no
      * longer holds the task (another worker has it now) is ignored, so it cannot take
-     * the task away from that worker.
+     * the task away from that worker. Once the master needs no more results (a stop, or
+     * the end of the run) the report counts nothing: the task leaves
+     * {@code inFlightTasks} and is neither requeued nor discarded.
      *
      * <p>Returns {@code 200 OK} whatever happened to the task — even if the {@code taskId}
-     * has already been requeued, or the report was ignored, the error has been logged and
-     * there is nothing for the worker to do. Like every endpoint it answers {@code 400} with
-     * a {@link TaskRejectionPayload} when the body cannot be decoded (see
+     * has already been requeued, or the report was ignored or counted nothing, the error has
+     * been logged and there is nothing for the worker to do. Like every endpoint it answers
+     * {@code 400} with a {@link TaskRejectionPayload} when the body cannot be decoded (see
      * {@link #onRejectedRequest}), and {@code 500} when no master is running.
      *
      * @param taskId the identifier of the failed task (path variable)
@@ -282,10 +300,11 @@ public class TaskController {
      * keeps sending heartbeats, so the watchdog never requeues it. When the
      * request targets {@code /{taskId}/result} or {@code /{taskId}/error}, the
      * task is handled as if the worker had reported an evaluation error (requeued,
-     * or discarded after too many failures). The reporting worker is unknown here
-     * (its id is in the body that could not be read), so the report is not checked
-     * against the task's holder. The
-     * response keeps Spring's status code and carries a
+     * or discarded after too many failures; once the master needs no more results,
+     * taken out of {@code inFlightTasks} without counting anything). The reporting
+     * worker is unknown here (its id is in the body that could not be read), so the
+     * report is not checked against the task's holder. The response keeps Spring's
+     * status code, also once no more results are needed, and carries a
      * {@link TaskRejectionPayload} explaining what was wrong.
      *
      * @param ex       the failure raised by Spring while resolving the request
@@ -392,6 +411,30 @@ public class TaskController {
             return SolutionVariables.checkBounds(solution, converted);
         }
         return null;
+    }
+
+    /**
+     * Answers a result that failed validation, once its report has gone to
+     * {@link MasterFacade#failInFlightTask(long, String)}: {@code 422} with the reason while more
+     * results are needed (whether the report counted as a failed evaluation or was ignored
+     * because another worker holds the task), or if the report counted just before no more were
+     * needed; the bodiless {@code 404} of a late result once the master needs no more results and
+     * the report did not count (whatever the reason), since the master no longer expects this
+     * result at all.
+     *
+     * @param taskId             the task the result is for
+     * @param reason             why the result cannot be applied
+     * @param counted            whether the report counted, as
+     *                           {@link MasterFacade#failInFlightTask(long, String)} returned
+     * @param needsNoMoreResults whether the master needs no more results, read after the report
+     * @return {@code 422} with a {@link TaskRejectionPayload}, or {@code 404}
+     */
+    static ResponseEntity<TaskRejectionPayload> invalidResultAnswer(
+            long taskId, String reason, boolean counted, boolean needsNoMoreResults) {
+        if (!counted && needsNoMoreResults) {
+            return ResponseEntity.<TaskRejectionPayload>notFound().build();
+        }
+        return ResponseEntity.status(422).body(new TaskRejectionPayload(taskId, reason));
     }
 
     /**

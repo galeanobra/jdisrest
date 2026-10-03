@@ -35,6 +35,7 @@ language capable of making HTTP requests).
    - [Startup and shutdown](#startup-and-shutdown)
    - [`status.json` file](#statusjson-file)
 9. [Changes in 1.2](#9-changes-in-12)
+10. [Changes in 1.2.1](#10-changes-in-121)
 
 ---
 
@@ -132,7 +133,8 @@ GET http://<master>:<port>/api/v1/tasks/next?workerId=<unique-id>
 Possible responses:
   200 OK   → a task is available
   204 No Content → no task right now: the master is not ready yet (below), or no task
-                   arrived within the long-poll; ask again a few seconds later
+                   arrived within the long-poll; ask again a few seconds later (also a
+                   request being served when the run is stopped or ends: the next one gets 410)
   410 Gone → algorithm finished (or stopped with POST /api/v1/stop), the worker must stop
   500 Internal Server Error → the master could not build the payload of the task it took
                               for this worker (an unsupported solution type, or a variable
@@ -207,9 +209,13 @@ Possible responses:
   404 Not Found              → the master no longer expects this result: the task was requeued (the
                                watchdog found the worker silent, or the worker asked for a new task
                                first, section 2.2), another report for it was handled first, or the
-                               run was stopped (POST /api/v1/stop)
-  422 Unprocessable Content  → the result is invalid (see below); the task has been requeued (or discarded)
-  400 Bad Request            → the body is not valid JSON (e.g. a bare NaN); the task has been requeued (or discarded)
+                               run was stopped (POST /api/v1/stop) or, with the bundled algorithms,
+                               has ended on its stopping criterion (section 8); the result is not
+                               counted, valid or not (below)
+  422 Unprocessable Content  → the result is invalid (see below); the task has been requeued (or discarded);
+                               after a stop or the end of the run, 404 instead (below)
+  400 Bad Request            → the body is not valid JSON (e.g. a bare NaN); the task has been requeued (or discarded),
+                               except after a stop or the end of the run (below)
   413 Content Too Large      → the body is larger than the server's limit (16 MiB by default, section 5); same
   415 Unsupported Media Type → the Content-Type is not application/json; same
 ```
@@ -224,6 +230,8 @@ The master validates the whole body before writing anything into the solution. I
 
 A rejected result is treated exactly like `POST /error`: it counts as a failed evaluation, the task goes back to the pending queue and the same solution will be evaluated again by whichever worker claims it. As with `POST /error` (section 2.4), a `422` sent by a worker that no longer holds the task (another worker has it now) is answered but changes nothing. The other requests Spring rejects before the handler runs, such as a body that is not JSON (`400`), a wrong `Content-Type` (`415`) or a body above the size limit (`413`), count as a failed evaluation whoever sent them, because the master cannot read the `workerId` of a body it has not decoded.
 
+**After a stop or the end of the run.** Once a stop has been requested or, with the bundled algorithms, the algorithm has ended its run, the master needs no more results (`AbstractMaster.needsNoMoreResults()`), and no failure counts: the task of a rejected result leaves flight (unless another worker holds it, as above) without being requeued or discarded, as that of a result refused with `404`. A result that fails validation then gets `404` like any late result, not `422`; a `400`, `413` or `415` keeps its status, and counts nothing either.
+
 **Failure limit.** After `AbstractMaster.DEFAULT_MAX_TASK_FAILURES` (3) failed evaluations, or the number set with `setMaxTaskFailures(int)` on the algorithm, the master discards the task instead of requeueing it: the task is never dispatched again, it is counted in `discardedTasks` of `GET /api/v1/status` (section 8), and the master logs it at ERROR level with its decision vector (the first 50 values of a longer one):
 
 ```
@@ -235,11 +243,11 @@ A failed evaluation is a `POST /error`, a `422`, `400`, `413` or `415` answer to
 
 An evaluator that produces `NaN` for some inputs must still map it to a finite penalty itself — the master has no way to choose one, and otherwise each such solution costs `DEFAULT_MAX_TASK_FAILURES` wasted evaluations and is lost to the search. Note that Python's `json.dumps` emits `NaN` as a bare token (invalid JSON, answered with `400`) and MATLAB's `jsonencode` turns `NaN` into `null` (answered with `422`); the bundled Python client validates finiteness before sending and reports the problem through `/error` instead. Its command-line worker (section 4.2) can apply the penalty: `--non-finite-penalty X`, or `FunctionEvaluator(function, non_finite_penalty=X)` from Python, gives `X` to every objective of a result whose objectives are not all finite, and logs a warning. It is opt-in and has no default, because no value is safe for every problem: choose one worse than any valid objective.
 
-> The 404 is not a critical error: the task was requeued, or the run was stopped. The worker should log a warning and continue. The 400, 413, 415 and 422 are not network errors either: log the reason and move on to the next task. Both bundled workers treat a `2xx`, `404`, `400`, `413`, `415` or `422` answer to `/result` or `/error` as the answer of a live master, and count anything else (a `5xx`, another `4xx`, a network error) towards giving the master up as lost (section 4).
+> The 404 is not a critical error: the task was requeued, or the run is over. The worker should log a warning and continue. The 400, 413, 415 and 422 are not network errors either: log the reason and move on to the next task. Both bundled workers treat a `2xx`, `404`, `400`, `413`, `415` or `422` answer to `/result` or `/error` as the answer of a live master, and count anything else (a `5xx`, another `4xx`, a network error) towards giving the master up as lost (section 4).
 
 ### 2.4 `POST /api/v1/tasks/{taskId}/error`
 
-Reports an evaluation failure (the worker hit an exception while evaluating). Makes the master requeue the task immediately instead of waiting for the watchdog, or discard it once it has reached the failure limit (section 2.3).
+Reports an evaluation failure (the worker hit an exception while evaluating). Makes the master requeue the task immediately instead of waiting for the watchdog, or discard it once it has reached the failure limit (section 2.3). After a stop or, with the bundled algorithms, once the algorithm has ended its run, the report counts nothing: the task leaves flight, and is neither requeued nor discarded (section 2.3).
 
 ```
 POST http://<master>:<port>/api/v1/tasks/42/error
@@ -247,7 +255,8 @@ Content-Type: application/json
 
 { "workerId": "worker-py-01", "errorMessage": "ZeroDivisionError: ..." }
 
-Response: 200 OK  (no body), also when the task is no longer in flight or the report is ignored
+Response: 200 OK  (no body), also when the task is no longer in flight, or the report is
+                  ignored or counts nothing
 ```
 
 Only the worker that holds the task can fail it. A report from a worker that no longer holds it (the watchdog took the task away, or the worker asked for another one, and another worker has it now) is logged as `[task-42] Failure report from w-07 ignored — the task is now held by w-12` and changes nothing, so it cannot take the task away from its new holder or count against its evaluation. A report without `workerId`, or for a task that no registered worker holds, counts.
@@ -554,10 +563,11 @@ function submit_result(masterUrl, workerId, taskId, objectives, elapsedMs)
     resp = req.send(uri, HTTPOptions('ResponseTimeout', 15));
     code = double(resp.StatusCode);
     if code == 404
-        % Requeued, or the run was stopped: the result is not needed.
+        % Requeued, or the run is over: the result is not needed.
         fprintf('[%s] task %d no longer expected by the master\n', workerId, taskId);
     elseif any(code == [400 413 415 422])
-        % The master could not apply the result and has requeued (or discarded) the task.
+        % The master could not apply the result; it has requeued (or discarded) the
+        % task, unless the run has been stopped or has ended.
         fprintf('[%s] task %d rejected: %s\n', workerId, taskId, resp.Body.Data.reason);
     elseif code ~= 200
         error('Unexpected HTTP status %d from POST /result', code);
@@ -588,7 +598,7 @@ Or as a non-interactive script:
 matlab -nodisplay -nosplash -r "sphere_worker('http://10.0.0.1:55000','worker-matlab-01'); exit"
 ```
 
-`double(task.variables)` works for every encoding: `jsondecode` already delivers integers and reals as doubles. Two things to watch: `jsonencode` turns `NaN` into `null`, which the master rejects with `422` (map non-finite objectives to a finite penalty before `submit_result`), and a `422`, `400`, `413` or `415` response means the task was requeued, or discarded after the failure limit: `submit_result` above logs the reason and returns, so the loop continues with the next task instead of counting it as a connection error. The error count starts again after a `204` or an answered result, not when a task arrives, as in the bundled workers (section 4.1). The worker id must be unique among the workers of the run (section 2.1); the default above is a random one.
+`double(task.variables)` works for every encoding: `jsondecode` already delivers integers and reals as doubles. Two things to watch: `jsonencode` turns `NaN` into `null`, which the master rejects with `422` (map non-finite objectives to a finite penalty before `submit_result`), and a `422`, `400`, `413` or `415` response means the task was requeued, or discarded after the failure limit (neither after a stop or the end of the run, section 2.3): `submit_result` above logs the reason and returns, so the loop continues with the next task instead of counting it as a connection error. The error count starts again after a `204` or an answered result, not when a task arrives, as in the bundled workers (section 4.1). The worker id must be unique among the workers of the run (section 2.1); the default above is a random one.
 
 ---
 
@@ -858,7 +868,7 @@ The class path needs jdisrest, its dependencies and the problem's class. A run g
 4. The traces folder, if the file names one, receives the configuration and `configuration.log` (see below).
 5. An `AlgorithmReconfiguration` is registered, so `GET /api/v1/config` returns the configuration in use and `POST /api/v1/config` changes it (section 8).
 6. The algorithm runs until its budget is spent or `POST /api/v1/stop`, and its result is written to `VAR.csv` and `FUN.csv` (comma-separated) in the working directory; a run stopped before its first result writes them empty. The master logs `ZDT1 finished after <evaluations> evaluations: <n> solutions written to VAR.csv and FUN.csv`.
-7. The master is shut down (`shutdown()`, section 5), also when a step after the second fails: `.master-endpoint` is deleted, the REST server closes and `status.json` gets a final snapshot that reports the run as finished. Then the JVM exits. Workers that asked for a task before the close got `410` and stopped; those still evaluating find the master gone and stop after their failed heartbeats or requests, typically 10 to 25 s later (section 8, `POST /api/v1/stop`). A Python worker started from the endpoint file then finds the file deleted and exits with 0, not 3 (section 4.2).
+7. The master is shut down (`shutdown()`, section 5), also when a step after the second fails: `.master-endpoint` is deleted, the REST server closes and `status.json` gets a final snapshot that reports the run as finished. Then the JVM exits. Workers that asked for a task before the close got `410` and stopped (a result they posted after the run had ended got `404` first, and was not counted); those still evaluating find the master gone and stop after their failed heartbeats or requests, typically 10 to 25 s later (section 8, `POST /api/v1/stop`). A Python worker started from the endpoint file then finds the file deleted and exits with 0, not 3 (section 4.2).
 
 `--check` reads the file for the problem exactly as a run does (every value, the operators, which are built once, and the MOEA/D lattice size against the problem's objectives), prints `Configuration OK for <class name>: <summary>` on the standard output and exits without starting Spring, so a script can gate the submission of a job on its exit status. The exit status is 0 when a run ends (also after `POST /api/v1/stop`) or a check passes, and 1 otherwise. A usage error prints `Invalid arguments: <reason>` and the usage text (for instance `port must be an integer in [1, 65535], got '0'`); an invalid file prints `Invalid configuration: <reason>`, such as `mutation.beta must be in (1, 2), got '2'`; both go to the standard error without a stack trace. A failure while the run starts or goes on is logged as `<class name> failed: <exception>` with its stack trace, and still ends the JVM with status 1; a port already in use, for instance, gives `ZDT1 failed: java.lang.IllegalStateException: Could not start the REST server on port 8080 — Address already in use` (with the operating system's wording of the cause).
 
@@ -1102,7 +1112,7 @@ initProgress()                          (from now on isReady() is true)
 TaskController.getNextTask():           [virtual thread]
   → 410 if finished or stopped
 claimNextTask(workerId)
-  → null (204) until isReady()
+  → null (204) until isReady(), and once a stop is requested or the loop has ended
   ← pendingTaskQueue.poll()
   → if empty and still running: createNewTask()
     (two children: one returned, the spare queued)
@@ -1124,12 +1134,14 @@ claimNextTask(workerId)
 TaskController.submitResult():          [virtual thread]
   ← inFlightTasks.get(taskId)
   → validates the payload; if invalid: 422 and failInFlightTask(taskId, workerId):
-      requeued, or discarded after the failure limit (ignored if another worker holds it)
+      requeued, or discarded after the failure limit (ignored if another worker holds it);
+      404 and nothing counted once a stop is requested or the loop has ended
   → MasterFacade.submitResult(taskId, workerId, recorder)
      → inFlightTasks.remove(taskId)     (404 if no longer in flight)
      → currentTaskId = -1 for every worker that pointed at the task
+     → if a stop is requested or the loop has ended: 404, nothing recorded
      → recorder: writes variables (optional), objectives and constraints into the solution
-     → completedTaskQueue.add(task)     (404 instead once a stop is requested)
+     → completedTaskQueue.add(task)
 
 run() loop                              [algorithm thread]
   ← waitForComputedTask()               (completedTaskQueue; null after a stop)
@@ -1140,7 +1152,7 @@ run() loop                              [algorithm thread]
 
 Task creation is demand-driven: in a steady-state master the REST thread that serves `GET /tasks/next` creates the task when the queue is empty, and `processComputedTask` never creates one. `inFlightTasks.remove(taskId)` is the single point that decides what happens to a task in flight: whichever of a result, a failure, the watchdog or a new claim of the same worker removes it first owns it, and the others find nothing to do. A result is written into the solution only after it has won that removal.
 
-A `POST /error`, a rejected result and a task that cannot be serialized all go through `AbstractMaster.failInFlightTask(taskId, workerId)`, which ignores a report from a worker that no longer holds the task (section 2.4) and otherwise calls `failInFlightTask(taskId)`: that one requeues the task or, at the failure limit, discards it (section 2.3). The deprecated `requeueInFlightTask(taskId)` of earlier versions delegates to it and counts as a failure too. The framework calls only `failInFlightTask`, so a subclass written for 1.1 that overrode `requeueInFlightTask` must move that code to `failInFlightTask(long)` or `onTaskDiscarded`. Likewise the REST layer calls the three-argument `submitResult(taskId, workerId, recorder)`, so an override of the two-argument `submitResult(taskId, workerId)` written for 1.1 no longer sees the workers' results and must override the three-argument one. Whenever a task leaves flight, every worker's `currentTaskId` that points at it returns to `-1`. The watchdog moves the tasks of silent workers back to the queue without counting a failure (section 7.4). A `GenerationalMaster` queues a whole generation at once (`submitTasks`), and its `claimNextTask` only polls the queue.
+A `POST /error`, a rejected result and a task that cannot be serialized all go through `AbstractMaster.failInFlightTask(taskId, workerId)`, which ignores a report from a worker that no longer holds the task (section 2.4) and otherwise calls `failInFlightTask(taskId)`: that one requeues the task or, at the failure limit, discards it (section 2.3). Once the master needs no more results (`needsNoMoreResults()`: a stop has been requested, or `runEnded()`, which `SteadyStateEvolutionaryAlgorithm` reports once its loop has ended), it only takes the task out of flight and forgets its failures, and `failInFlightTask(taskId, workerId)` returns `false`; the same predicate makes `submitResult` refuse results, `claimNextTask` hand out nothing and the watchdog drop the tasks of silent workers. It is not `isFinished()`, which REST threads may see `true` while the loop still waits for the result that lets it notice its stopping criterion (a criterion installed with `setTermination`, section 7.5): refusing that result could hang the run. The deprecated `requeueInFlightTask(taskId)` of earlier versions delegates to `failInFlightTask(taskId)` and counts as a failure too (nothing after a stop or the end). The framework calls only `failInFlightTask`, so a subclass written for 1.1 that overrode `requeueInFlightTask` must move that code to `failInFlightTask(long)` or `onTaskDiscarded`. Likewise the REST layer calls the three-argument `submitResult(taskId, workerId, recorder)`, so an override of the two-argument `submitResult(taskId, workerId)` written for 1.1 no longer sees the workers' results and must override the three-argument one. Whenever a task leaves flight, every worker's `currentTaskId` that points at it returns to `-1`. The watchdog moves the tasks of silent workers back to the queue without counting a failure (section 7.4). A `GenerationalMaster` queues a whole generation at once (`submitTasks`), and its `claimNextTask` only polls the queue.
 
 ### 7.3 Server-side long-polling
 
@@ -1165,7 +1177,7 @@ return Mono.fromCallable(() -> {
            .subscribeOn(scheduler);                           // the virtual-thread scheduler
 ```
 
-`SteadyStateMaster.claimNextTask()` first takes a queued task or creates one (section 7.5), so a steady-state worker practically never waits; the long-poll, `pendingTaskQueue.poll(timeout, SECONDS)` for up to 30 s, is only a fallback for when no task can be created. `GenerationalMaster.claimNextTask()` always long-polls, because only `submitTasks()` fills its queue. If no task arrives in that time, the method returns `null` → the controller responds `204`. Both return `null` at once, without a long-poll, while the master is not ready.
+`SteadyStateMaster.claimNextTask()` first takes a queued task or creates one (section 7.5), so a steady-state worker practically never waits; the long-poll, `pendingTaskQueue.poll(timeout, SECONDS)` for up to 30 s, is only a fallback for when no task can be created. `GenerationalMaster.claimNextTask()` always long-polls, because only `submitTasks()` fills its queue. If no task arrives in that time, the method returns `null` → the controller responds `204`. Both return `null` at once, without a long-poll, while the master is not ready (`204`, ask again). Once it needs no more results (a stop or, for `SteadyStateEvolutionaryAlgorithm`, the end of the run) they return `null` at once and drop a task obtained meanwhile: the worker gets `204`, then `410` on its next request.
 
 ### 7.4 Watchdog
 
@@ -1178,14 +1190,14 @@ public void checkDeadWorkers() {
 }
 ```
 
-`requeueOrphanTasks()` looks for workers whose `lastSeen` (their last heartbeat, task request or accepted result) exceeds the threshold, moves their tasks from `inFlightTasks` back to `pendingTaskQueue`, and removes the worker from the registry. Each removal is one atomic step, so a worker whose heartbeat or request lands at that moment is either kept or registered afresh, never removed together with a task it has just been given. When it removes workers, the master logs `Watchdog: N worker(s) removed. Active workers: ... | Pending tasks: ... | In-flight tasks: ...`. If the original worker delivers the task before another worker has claimed it, it receives a `404` and should log a warning without retrying; once another worker holds the task (same id), the late result is accepted and the second worker's result gets the `404`. A `POST /error` (or a result rejected with `422`) that the original worker sends after another worker has claimed the task is ignored (section 2.4), so it cannot count against the new dispatch; a result rejected with `400`, `413` or `415` counts whoever sent it (section 2.3). These requeues do not count towards the failure limit of section 2.3, because a worker can die for reasons unrelated to its task (a preempted SLURM job, an evicted HTCondor job). A task whose evaluation itself kills the worker is therefore retried without limit, one watchdog timeout each time.
+`requeueOrphanTasks()` looks for workers whose `lastSeen` (their last heartbeat, task request or accepted result) exceeds the threshold, moves their tasks from `inFlightTasks` back to `pendingTaskQueue`, and removes the worker from the registry. After a stop or the end of the run it drops those tasks instead, since nobody would hand them out, and logs `Dropping task 42 from dead worker w-07 — the run needs no more results`. Each removal is one atomic step, so a worker whose heartbeat or request lands at that moment is either kept or registered afresh, never removed together with a task it has just been given. When it removes workers, the master logs `Watchdog: N worker(s) removed. Active workers: ... | Pending tasks: ... | In-flight tasks: ...`. If the original worker delivers the task before another worker has claimed it, it receives a `404` and should log a warning without retrying; once another worker holds the task (same id), the late result is accepted and the second worker's result gets the `404`. A `POST /error` (or a result rejected with `422`) that the original worker sends after another worker has claimed the task is ignored (section 2.4), so it cannot count against the new dispatch; a result rejected with `400`, `413` or `415` counts whoever sent it (section 2.3). These requeues do not count towards the failure limit of section 2.3, because a worker can die for reasons unrelated to its task (a preempted SLURM job, an evicted HTCondor job). A task whose evaluation itself kills the worker is therefore retried without limit, one watchdog timeout each time.
 
 ### 7.5 Steady-state synchronization
 
 `SteadyStateMaster.claimNextTask()` uses double-checking with `synchronized` to prevent two concurrent requests from generating duplicate tasks:
 
 ```java
-if (isStopRequested() || !isReady()) return null;    // 410 on the next request, or 204 until ready
+if (needsNoMoreResults() || !isReady()) return null; // 410 on the next request, or 204 until ready
 T task = pendingTaskQueue.poll();
 if (task == null && stoppingConditionIsNotMet()) {
     synchronized (taskCreationLock) {
@@ -1198,8 +1210,8 @@ if (task == null && stoppingConditionIsNotMet()) {
 if (task == null) {
     task = pendingTaskQueue.poll(timeoutSeconds, TimeUnit.SECONDS);   // long-poll fallback
 }
-if (task != null && isStopRequested()) {
-    task = null;                                     // a stop arrived while the worker waited
+if (task != null && needsNoMoreResults()) {
+    task = null;                                     // a stop or the end arrived meanwhile
 }
 if (task != null) {
     recordDispatch(workerId, task);                  // in flight; the worker's previous task is requeued
@@ -1221,7 +1233,7 @@ Inside `SteadyStateEvolutionaryAlgorithm`, `population` and `populationSignature
 5. If the algorithm keeps state about tasks in flight (for example MOEA/D's map from task to subproblem), override `onTaskDiscarded(task)` to release it: a task discarded after the failure limit never reaches `processComputedTask`. It runs on the REST thread that handled the failure, concurrently with the algorithm thread, so it must be thread-safe and fast; it need not call `super`, because the framework's own accounting does not depend on it. `MOEAD` is the in-tree example.
 6. The stop and the start-up window need no code. `stoppingConditionIsNotMet()` already includes the stop, the end of `run()` and readiness (section 7.5); an override should combine its own condition with `super.stoppingConditionIsNotMet()`. A subclass that overrides `waitForComputedTask()` must return `null` once `isStopRequested()` is `true`, because no result arrives after a stop and a plain `take()` would hang `run()`; the default `run()` loop ends on a `null`. An override of `run()` must call `super.run()` or end its loop on a stop as well.
 7. `setVariation`, `setTermination` and `getEvaluations` let a `ConfigurationHandler` change the operators and the budget of the running algorithm. Settings of your own need a method that checks every argument before it changes anything, under the population lock, as `PAES.reconfigure` and `MOEAD.reconfigure` do.
-8. Keep the rules of the algorithm in a class without Spring (package-private unless users need it), as `PAESState`, `MOEADWeights`, `MOEADAggregation`, `TaskFailureTracker` and `StopRequest` do: the constructor of every master starts the REST server, so the master itself cannot be built in a unit test. Check the constructor arguments before calling `super(...)`, which starts the server, so that a wrong argument fails at once instead of leaving a live server behind (Java 25 allows statements before `super`): the program has no reference to the half-built master, so nothing can shut that server down.
+8. Keep the rules of the algorithm in a class without Spring (package-private unless users need it), as `PAESState`, `MOEADWeights`, `MOEADAggregation`, `TaskFailureTracker` and `StopRequest` do: the constructor of every master starts the REST server, so the master itself cannot be built in a unit test. Check the constructor arguments before calling `super(...)`, which starts the server, so that a wrong argument fails at once instead of leaving a live server behind (Java 25 allows statements before `super`): the program has no reference to the half-built master, so nothing can shut that server down. In this repository an integration test can build one: `EndOfRunScenario` starts a master on port `0` (a free port) and plays its workers over HTTP. Its subclasses end in `IT`, which `mvn verify` runs (not `mvn test`), each class in a JVM of its own, because a master registers itself in static singletons; they run only when the system property `jdisrest.it` is `true`, which Failsafe sets (set it yourself to run one from an IDE).
 9. The traces need no code either: `updateProgress()` calls the public `saveTrace()` after every processed result, and `run()` calls it once more when the loop ends, for the final snapshot (section 7.7). An override of `saveTrace()` is called that last time too. Override `populationTraceSnapshot()` instead to change what `VAR_<n>.csv` / `FUN_<n>.csv` hold (PAES writes its archive there).
 
 ```java
@@ -1310,7 +1322,7 @@ Lightweight snapshot with global progress. Meant for monitoring scripts and exte
 }
 ```
 
-`evaluations` counts the results the master has accepted; `finished` is `true` once the stopping criterion is met or a stop has been requested. Before the master is ready (section 7.5) the run is reported as running and not finished. `progress` is `evaluations / maxEvaluations`, clamped to [0, 1], and `estimatedSecondsRemaining` extrapolates it, `elapsedSeconds / progress × (1 − progress)`: it is never negative, `0` once the accepted results have reached the budget while the run has not finished yet, and `-1` until `progress` passes 1 %, once the run has finished, or before any time has elapsed. `elapsedSeconds` counts from `MasterFacade.init`, and is `0` before it. `discardedTasks` counts the tasks discarded after reaching the failure limit (section 2.3): any value above zero means some solutions could not be evaluated, and the master log names them (`[task-42] Failed evaluation 3 of 3 — discarded; its variables were [...]`). A `discardedTasks` that keeps growing while `evaluations` stays still means that every evaluation fails, for instance because the workers evaluate another problem. Fields added in later versions go last; Java clients that bind this JSON to a class with the ten fields of jdisrest 1.1 must ignore unknown properties (Jackson 2 fails on them by default); in the other direction, `StatusSnapshot` reads the JSON of a 1.1 master, which has no `discardedTasks`, as `0`.
+`evaluations` counts the results the master has accepted, those still queued for the algorithm included; `finished` is `true` once the stopping criterion is met or a stop has been requested. Before the master is ready (section 7.5) the run is reported as running and not finished. Once a stop has been requested or, with the bundled algorithms (`SteadyStateEvolutionaryAlgorithm` and its subclasses), the algorithm has ended its run, the master needs no more results: a result that arrives is refused with `404` and not counted, and `evaluations` counts only the results the algorithm used. The results accepted while it was still processing earlier ones and still queued at that point, which it never processes, are left out (they still show as `queuedResults` in `GET /api/v1/workers/status`). There are usually none or a few, but possibly many when the workers together deliver results faster than the algorithm processes them (cheap evaluations, many workers), so `evaluations` can drop at that point. A run that ends on its budget therefore reports `maxEvaluations`: the results the algorithm used, which `getEvaluations()` returns and `ConfiguredMaster` logs. `progress` is `evaluations / maxEvaluations`, clamped to [0, 1], and `estimatedSecondsRemaining` extrapolates it, `elapsedSeconds / progress × (1 − progress)`: it is never negative, `0` once the accepted results have reached the budget while the run has not finished yet, and `-1` until `progress` passes 1 %, once the run has finished, or before any time has elapsed. `elapsedSeconds` counts from `MasterFacade.init`, and is `0` before it. `discardedTasks` counts the tasks discarded after reaching the failure limit (section 2.3): any value above zero means some solutions could not be evaluated, and the master log names them (`[task-42] Failed evaluation 3 of 3 — discarded; its variables were [...]`). A `discardedTasks` that keeps growing while `evaluations` stays still means that every evaluation fails, for instance because the workers evaluate another problem. Fields added in later versions go last; Java clients that bind this JSON to a class with the ten fields of jdisrest 1.1 must ignore unknown properties (Jackson 2 fails on them by default); in the other direction, `StatusSnapshot` reads the JSON of a 1.1 master, which has no `discardedTasks`, as `0`.
 
 ### `GET /api/v1/workers/status`
 
@@ -1331,7 +1343,7 @@ Per-worker details — useful for debugging workers that get stuck:
 }
 ```
 
-The keys always come in this order, and the workers are sorted by id; the registry includes workers that may now be considered dead, until the watchdog removes them. `currentTaskId = -1` indicates an idle worker (waiting for a task or between evaluations): it returns to `-1` as soon as the worker's task leaves flight (its result is accepted, or it fails). `lastSeen` is the worker's last heartbeat, task request or accepted result, and `address` is `unknown` for a worker that asked for a task before its first heartbeat. Before a master exists every count is `0` and `workers` is empty.
+The keys always come in this order, and the workers are sorted by id; the registry includes workers that may now be considered dead, until the watchdog removes them. `totalEvaluations` is the `evaluations` of `GET /api/v1/status`, and `queuedResults` the results waiting for the algorithm thread: after a stop or the end of the run the algorithm never processes them, and `totalEvaluations` leaves them out. `currentTaskId = -1` indicates an idle worker (waiting for a task or between evaluations): it returns to `-1` as soon as the worker's task leaves flight (its result is accepted, or it fails). `lastSeen` is the worker's last heartbeat, task request or accepted result, and `address` is `unknown` for a worker that asked for a task before its first heartbeat. Before a master exists every count is `0` and `workers` is empty.
 
 ### `GET` and `POST /api/v1/config`
 
@@ -1390,7 +1402,7 @@ curl -X POST http://10.0.0.1:8080/api/v1/stop
 ```
 
 - No more tasks are handed out: workers get `410 Gone` on their next request and shut down. A request already being served when the stop lands may still receive one task. A worker still evaluating when the master has shut down (`ConfiguredMaster` shuts it down and exits as soon as it has written the result, at a stop as at a normal end) finds no master instead: it stops after 3 failed heartbeats 5 s apart, typically 10 to 25 s after the shutdown, or after 5 failed requests 10 s apart. The command-line Python worker started from the endpoint file then exits with 0, because the shutdown deleted the file (section 4.2).
-- The results of the evaluations still in flight are refused with `404`, which both bundled workers log and move past, and are not counted in `evaluations`. Results accepted before the stop that the algorithm had not processed yet are counted, then dropped.
+- The results of the evaluations still in flight are refused with `404`, which both bundled workers log and move past, and are not counted in `evaluations`. Results accepted before the stop that the algorithm had not processed yet are dropped, and `evaluations` leaves them out from then on. A failure report counts nothing: the task is neither requeued nor discarded, and a result that fails validation gets `404` rather than `422` (section 2.3).
 - `run()` returns with the current result, exactly as at a normal end: a steady-state master stops waiting within 200 ms, a generational one within about a second, with the part of the generation it has. The caller writes the result: `ConfiguredMaster` writes `VAR.csv` and `FUN.csv` and exits with status 0; a program of your own does it as after a normal finish, for instance with `TraceWriter.write(algo.getResult(), "VAR.csv", "FUN.csv", ",")`. A stop before the first result leaves the result archive empty, and `getResult()` then returns an empty list. The steady-state algorithms write a final trace snapshot when `run()` returns (section 7.7), so the traces folder ends with the state the result comes from.
 
 The response is `202 Accepted` with the `/api/v1/status` snapshot, already with `"finished": true`, or `503 Service Unavailable` if no master is running. Repeated requests are harmless; the master logs the first one:
@@ -1399,7 +1411,7 @@ The response is `202 Accepted` with the `/api/v1/status` snapshot, already with 
 Stop requested — finishing with the current result and discarding the 3 evaluations in flight
 ```
 
-The stop does not end the process: the REST server and the `status.json` writer keep running until the program calls `shutdown()` (section 5) or exits. After a stop, `pendingTasks` can stay above zero, since tasks still queued (or requeued by a late `/error` or the watchdog) are never handed out, and `POST /api/v1/config` answers `409`.
+The stop does not end the process: the REST server and the `status.json` writer keep running until the program calls `shutdown()` (section 5) or exits. After a stop, `pendingTasks` can stay above zero, since tasks still queued are never handed out (after a stop nothing is requeued, neither by a late `/error` nor by the watchdog), and `POST /api/v1/config` answers `409`.
 
 The endpoint calls `AbstractMaster.requestStop()`. `isFinished()` includes the request, so the workers are sent away whatever the algorithm's stopping condition says; `SteadyStateEvolutionaryAlgorithm`, the base of the bundled algorithms, includes it in `stoppingConditionIsNotMet()`, and the default `run()` loops of both `SteadyStateAlgorithm` and `GenerationalAlgorithm` end on it. Custom algorithms need no code of their own unless they override the waits (section 7.6).
 
@@ -1419,7 +1431,7 @@ The REST server starts in the algorithm's constructor, and every endpoint answer
 
 If `MasterFacade.init(maxEvals, statusFileIntervalSec)` is called with an interval > 0, the master writes the same payload as `/api/v1/status` to `status.json` under `-Djdisrest.dataPath` (the folder is created if needed), atomically, so a reader never sees a partial file. Useful when the worker nodes have access to a shared filesystem but not to the compute node's network (the typical case on HPC clusters with login nodes). `ConfiguredMaster` writes it every 30 s. To follow the Pareto front of a run rather than its counters, `python/tools/watch_front.py` reads the traces folder (see [`python/README.md`](../python/README.md)).
 
-The first write happens at once, inside `init`, and reports the run as running even though `run()` has not started yet (see [Startup and shutdown](#startup-and-shutdown)). A snapshot that cannot be built (for instance a stopping criterion that throws) and a file that cannot be written are each logged once, as `Could not build the status for status.json (further failures will be silent): ...` and `Could not write status.json (further failures will be silent): ...`, so a `dataPath` that cannot be written goes unreported after that warning: check that `status.json` appears. `shutdown()` writes a last snapshot, with `"finished": true`, and stops the writer, so the file ends with the final state of the run.
+The first write happens at once, inside `init`, and reports the run as running even though `run()` has not started yet (see [Startup and shutdown](#startup-and-shutdown)). A snapshot that cannot be built (for instance a stopping criterion that throws) and a file that cannot be written are each logged once, as `Could not build the status for status.json (further failures will be silent): ...` and `Could not write status.json (further failures will be silent): ...`, so a `dataPath` that cannot be written goes unreported after that warning: check that `status.json` appears. `shutdown()` writes a last snapshot, with `"finished": true`, and stops the writer, so the file ends with the final state of the run; the snapshot is taken after the REST server has closed and, with the bundled algorithms or after a stop, its `evaluations` are those the algorithm used (see `GET /api/v1/status`).
 
 ---
 
@@ -1478,3 +1490,19 @@ What behaves differently from jdisrest 1.1. The task payload of an integer probl
 **Configuration** (section 5)
 
 - New: configuration files for NSGA-II, PAES and MOEA/D (`es.unex.jdisrest.config`), the `ConfiguredMaster` launcher with `--check`, changes during a run through `POST /api/v1/config`, and the record of the configuration in the traces folder; the warm-start file `iVAR.csv` is copied into the traces folder.
+
+---
+
+## 10. Changes in 1.2.1
+
+What behaves differently from jdisrest 1.2.0.
+
+**Protocol and master**
+
+The changes at the end of a run apply to the bundled algorithms (they extend `SteadyStateEvolutionaryAlgorithm`); a master of your own that does not extend it gets them only after a stop.
+
+- A result that arrives after a steady-state run has ended on its stopping criterion gets `404` and is not counted, as after `POST /api/v1/stop`. 1.2.0 accepted and counted it although nobody processed it, so `evaluations` in `GET /api/v1/status` and `status.json` could end above `maxEvaluations` by up to one more result per worker still evaluating at the end (sections 2.3 and 8).
+- After a stop or the end of the run, `evaluations` in `GET /api/v1/status` and `status.json`, and `totalEvaluations` in `GET /api/v1/workers/status`, count only the results the algorithm used. 1.2.0 also counted the results still queued at that point, which the algorithm never processes, so with cheap evaluations and many workers a run could end far above `maxEvaluations`; now one that ends on its budget reports `maxEvaluations`, and `evaluations` (and `progress`) can decrease when the run is stopped or ends, by the results left out. Those still show as `queuedResults`, including one the algorithm was taking at the very moment of a stop, which 1.2.0 took out of the queue (section 8).
+- After a stop or the end of the run, a failure report counts nothing: after a `POST /error`, or a `400`, `413` or `415` answer to a result, the task leaves flight without being requeued or discarded, and a result that fails validation gets `404` instead of `422`. 1.2.0 counted them as failed evaluations, requeueing the task into a queue nobody served, or discarding it with an ERROR line, a call to `onTaskDiscarded` and one more `discardedTasks`. The watchdog no longer requeues the task of a silent worker then either (sections 2.3, 2.4 and 7.4).
+- A steady-state master hands out no task once the algorithm has ended its run, as after a stop: 1.2.0 could still give a worker that asked at that moment one of the tasks left in the queue, whose result was then accepted and counted although nobody processed it (a wasted evaluation). That worker now gets `204`, and `410` on its next request. A generational master returns at once after a stop, without taking a queued task or waiting for the long-poll (sections 7.3 and 7.5).
+- New `AbstractMaster.needsNoMoreResults()`, `true` once a stop has been requested or the algorithm has ended its run, which decides all of the above (section 7.2).

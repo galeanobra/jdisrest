@@ -53,7 +53,10 @@ public class StatusController {
      *       completed all evaluations or met its stopping criterion, or a stop has been
      *       requested ({@code POST /api/v1/stop}, see {@link StopController}).</li>
      *   <li><strong>{@code evaluations}</strong> — cumulative number of evaluations
-     *       successfully completed and recorded by the master since startup.</li>
+     *       successfully completed and recorded by the master since startup. Once a stop
+     *       has been requested or the algorithm has ended its run, only those the
+     *       algorithm used: the results still queued, which it will never process, are
+     *       left out.</li>
      *   <li><strong>{@code maxEvaluations}</strong> — the total number of evaluations
      *       configured for this run (set via {@link MasterFacade#init}).</li>
      *   <li><strong>{@code progress}</strong> — {@code evaluations / maxEvaluations},

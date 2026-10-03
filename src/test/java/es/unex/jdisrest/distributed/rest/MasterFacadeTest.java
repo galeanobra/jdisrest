@@ -10,9 +10,10 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * The arithmetic of the progress snapshot and the body of {@code GET /api/v1/workers/status},
- * with and without a master. Unit tests never construct a master (its constructor starts
- * Spring), so the facade has none here.
+ * The arithmetic of the progress snapshot, the evaluations both status endpoints report, and
+ * the body of {@code GET /api/v1/workers/status}, with and without a master. Unit tests never
+ * construct a master (its constructor starts Spring), so the facade has none here; the
+ * integration tests ({@code EndOfRunScenario}) read both endpoints from a real one.
  */
 class MasterFacadeTest {
 
@@ -63,12 +64,26 @@ class MasterFacadeTest {
         assertEquals(new StatusSnapshot(true, false, 0, -1, 0.0, 0, -1, 0, 0, 0, 0), status);
     }
 
+    // ── Evaluations ───────────────────────────────────────────────────────────
+
+    @Test
+    void evaluationsLeaveOutTheQueuedResultsOnceNoMoreResultsAreNeeded() {
+        assertEquals(41, MasterFacade.evaluations(41, false, 1),
+            "while the run goes on, the queued result will still be processed");
+        assertEquals(40, MasterFacade.evaluations(41, true, 1),
+            "after a stop or the end of the run it never will: the algorithm used 40");
+        assertEquals(40, MasterFacade.evaluations(40, true, 0));
+        assertEquals(0, MasterFacade.evaluations(2, true, 3),
+            "never negative, although a result is queued just before it is counted");
+    }
+
     // ── Without a master ──────────────────────────────────────────────────────
 
     @Test
     void withoutAMasterNothingIsReadyOrFinished() {
         assertFalse(MasterFacade.isReady(), "no master means no task can be handed out");
         assertFalse(MasterFacade.isFinished(), "and nothing has finished either");
+        assertFalse(MasterFacade.needsNoMoreResults(), "and no run has been stopped or has ended");
     }
 
     @Test

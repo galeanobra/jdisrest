@@ -11,11 +11,11 @@ import es.unex.jdisrest.util.Timings;
  * every {@link Timings#HEARTBEAT_INTERVAL_S} seconds from a dedicated background thread,
  * independently of how long the current evaluation takes. If a worker has not been heard from
  * (heartbeat, task claim or result) for {@link Timings#WORKER_TIMEOUT_S} seconds, the watchdog
- * considers it dead, re-queues any in-flight task it held, and removes it from the registry so
- * new requests from the same worker ID are treated as fresh connections. A dead worker is
- * therefore noticed between {@link Timings#WORKER_TIMEOUT_S} and
- * {@link Timings#WORKER_TIMEOUT_S} + {@link Timings#WATCHDOG_INTERVAL_S} seconds after it was
- * last heard from.
+ * considers it dead, re-queues any in-flight task it held (drops it instead once the master needs
+ * no more results), and removes it from the registry so new requests from the same worker ID are
+ * treated as fresh connections. A dead worker is therefore noticed between
+ * {@link Timings#WORKER_TIMEOUT_S} and {@link Timings#WORKER_TIMEOUT_S} +
+ * {@link Timings#WATCHDOG_INTERVAL_S} seconds after it was last heard from.
  *
  * <p>This component is required for liveness: without it, a single worker crash would leave
  * its task permanently in-flight and cause {@code GenerationalMaster#waitForEvaluatedTasks()} or the
@@ -40,9 +40,10 @@ public class WatchdogScheduler {
      * <p>Runs every {@link Timings#WATCHDOG_INTERVAL_MS} ms (after the previous execution
      * completes) and calls {@link MasterFacade#requeueOrphanTasks}, which re-enqueues the
      * in-flight tasks whose owner has not been heard from within
-     * {@link Timings#WORKER_TIMEOUT_S}, removes the corresponding entries from the worker
-     * registry, and, if any worker was removed, logs how many together with the queue depths so
-     * operators can monitor recovery.
+     * {@link Timings#WORKER_TIMEOUT_S} (drops them instead once the master needs no more
+     * results), removes the corresponding entries from the worker registry, and, if any worker
+     * was removed, logs how many together with the queue depths so operators can monitor
+     * recovery.
      */
     @Scheduled(fixedDelayString = "#{T(es.unex.jdisrest.util.Timings).WATCHDOG_INTERVAL_MS}")
     public void checkDeadWorkers() {

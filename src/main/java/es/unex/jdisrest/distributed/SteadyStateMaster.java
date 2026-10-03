@@ -131,12 +131,17 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      *       worker's previous task if it is still in flight).</li>
      * </ol>
      *
-     * <p>Once a stop has been requested ({@link #requestStop()}) it hands out nothing: it
-     * returns {@code null} at once, and a task obtained during the long-poll is dropped
-     * instead of being put in flight. {@code TaskController} checks {@link #isFinished()}
-     * before calling this method, so the worker gets {@code 410 Gone} on its next request.
-     * A stop that lands between the last check and the dispatch still lets that one task
-     * out; its result is then refused by
+     * <p>Once the master needs no more results ({@link #needsNoMoreResults()}: a stop has been
+     * requested, or the algorithm has ended its run) it hands out nothing, since the result
+     * would be refused: it returns {@code null} at once, and drops a task obtained in the
+     * meantime (from the queue, such as the spare child {@link #createNewTask()} left there, or
+     * during the long-poll) instead of putting it in flight. It does not check
+     * {@link #isFinished()}, which REST threads may see {@code true} while the loop still waits
+     * for the result that lets it notice its stopping criterion. {@code TaskController} checks
+     * {@link #isFinished()} before calling this method, so the worker gets {@code 410 Gone} on
+     * its next request; one whose request passed that check just before the end gets
+     * {@code 204 No Content} first. A stop or an end that lands between the last check here and
+     * the dispatch still lets that one task out; its result is then refused by
      * {@link #submitResult(long, String, java.util.function.Consumer)}.
      *
      * <p>Until the algorithm is ready ({@link #isReady()}) it also returns {@code null} at once,
@@ -147,12 +152,13 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * @param timeoutSeconds maximum time in seconds to wait for a task if none is
      *                       immediately available (long-poll window)
      * @return the next task for the worker to evaluate, or {@code null} if no task
-     *         became available within {@code timeoutSeconds} or the algorithm is not ready
-     *         yet (the HTTP layer returns {@code 204 No Content} in that case)
+     *         became available within {@code timeoutSeconds}, the algorithm is not ready
+     *         yet or the master needs no more results (the HTTP layer returns
+     *         {@code 204 No Content} in that case)
      * @throws InterruptedException if the thread is interrupted while waiting
      */
     public T claimNextTask(String workerId, int timeoutSeconds) throws InterruptedException {
-        if (isStopRequested() || !isReady()) {
+        if (needsNoMoreResults() || !isReady()) {
             return null;  // 410 Gone, or 204 until the algorithm can serve
         }
         T task = pendingTaskQueue.poll();
@@ -171,8 +177,8 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
         if (task == null) {
             task = pendingTaskQueue.poll(timeoutSeconds, TimeUnit.SECONDS);
         }
-        if (task != null && isStopRequested()) {
-            task = null;  // a stop arrived while the worker was waiting: hand nothing out
+        if (task != null && needsNoMoreResults()) {
+            task = null;  // a stop or the end arrived meanwhile: hand nothing out
         }
 
         if (task != null) {
@@ -201,8 +207,8 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * {@link #completedTaskQueue}.
      *
      * <p>Returns {@code null} once a stop has been requested ({@link #requestStop()}),
-     * which it notices within 200 ms, discarding any result that arrives from then on (even
-     * one already waiting in the queue). It also returns {@code null}, restoring the
+     * which it notices within 200 ms, leaving unprocessed in the queue any result still there
+     * (even one it was taking at that moment). It also returns {@code null}, restoring the
      * interrupt flag, if the thread is interrupted while waiting. Either way the default
      * {@link SteadyStateAlgorithm#run()} loop ends.
      *

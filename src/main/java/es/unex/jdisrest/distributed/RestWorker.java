@@ -75,7 +75,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * a status other than {@code 2xx}. The answers the protocol defines are not failures:
  * {@code 204} and {@code 410} on {@code GET /next}, and {@code 404} (the master no longer
  * expects the result) and the rejections {@code 400}, {@code 413}, {@code 415} and {@code 422}
- * (the master has already counted the task as failed) on {@code POST /result} and
+ * (the master has already handled the failure: it requeued or discarded the task or, once the
+ * run has been stopped or has ended, only took it out of flight) on {@code POST /result} and
  * {@code POST /error}. The count is reset only when an exchange completes as the protocol
  * defines — a {@code 204}, or a task whose outcome the master acknowledged — not merely because
  * a task was handed out, so a master that serves tasks but fails every result stops the worker
@@ -117,7 +118,8 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
 
     /**
      * Answers to {@code POST /result} and {@code POST /error} meaning "the master refused this
-     * request and has already handled the task as a failed evaluation, or, for a {@code 422},
+     * request and has already handled the failure (requeued or discarded the task, or, once the
+     * run has been stopped or has ended, only taken it out of flight), or, for a {@code 422},
      * ignored the report because another worker holds the task now" (a {@code 400}, {@code 413}
      * or {@code 415} counts whoever holds the task, since the master cannot read the
      * {@code workerId} of a body it has not decoded; see {@code TaskRejectionPayload}): an
@@ -644,16 +646,16 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
         if (status / 100 == 2) return Outcome.ACCEPTED;
         if (status == 404) {
             // The master no longer expects this result (the watchdog already requeued it,
-            // or the run was stopped and the master drops late results).
+            // or the run is over and the master drops late results).
             Log.warn("Master no longer holds task " + taskId
-                    + " (requeued by the watchdog, or the run was stopped)");
+                    + " (requeued by the watchdog, or the run is over)");
             return Outcome.DROPPED;
         }
         if (REJECTION_STATUSES.contains(status)) {
             // The master could not apply the result (e.g. a vector outside the bounds, or a body
             // over its size limit) and has requeued the task (or discarded it after the failure
-            // limit). This is an evaluation problem, not a dead master: log the reason and carry
-            // on with the next task.
+            // limit; neither once the run has been stopped or has ended). This is an evaluation
+            // problem, not a dead master: log the reason and carry on with the next task.
             Log.warn("Master rejected result for taskId " + taskId + " (" + status + "): " + response.body());
             return Outcome.FAILED;
         }
@@ -675,7 +677,7 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
             if (status != 404 && !REJECTION_STATUSES.contains(status)) {
                 throw new IOException("Unexpected status " + status + " from POST /tasks/" + taskId + "/error");
             }
-            // 404: the master no longer holds the task; a rejection: it has counted the failure.
+            // 404: the master no longer holds the task; a rejection: it has handled the failure.
             Log.warn("Master answered " + status + " to the error report for task " + taskId + ": " + response.body());
         }
         return Outcome.FAILED;

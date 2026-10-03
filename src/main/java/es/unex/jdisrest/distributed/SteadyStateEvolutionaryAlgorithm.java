@@ -95,9 +95,9 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * {@link #updateProgress()}. A {@link ConcurrentHashMap}, because REST threads read it while
      * the algorithm thread writes it; like any such map it rejects {@code null} values.
      */
-    protected final Map<String, Object> attributes;
+    protected final Map<String, Object> attributes = new ConcurrentHashMap<>();
     /** Notified with {@link #attributes} after every progress update; see {@link #observable()}. */
-    protected final Observable<Map<String, Object>> observable;
+    protected final Observable<Map<String, Object>> observable = new DefaultObservable<>("Observable");
     /**
      * Crossover applied to the parents of every new task. Replaceable during the run through
      * {@link #setVariation}; read it inside {@code synchronized (population)}. {@code null} only
@@ -124,7 +124,9 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * Set when the algorithm thread finds {@link #termination} met, and when {@link #run()}
      * returns or throws. From then on {@link #stoppingConditionIsNotMet()} is {@code false}
      * whatever {@link #termination} says, so a later {@link #setTermination} cannot reopen the
-     * run and a failed run stops handing out tasks nobody would collect.
+     * run and a failed run stops handing out tasks nobody would collect. {@link #runEnded()}
+     * returns it, so the master also takes nothing more from the workers
+     * ({@link #needsNoMoreResults()}).
      */
     private volatile boolean runFinished;
     /**
@@ -163,21 +165,43 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
 
         super(host, port, problem);  // boots Spring Boot here
         this.problem = problem;
+        this.populationSize = populationSize;
+        this.selection = selection;
+        initState(crossover, mutation, dominanceComparator, termination);
+
+        if (tracesFolder != null) this.tracesFolder = new File(tracesFolder);
+    }
+
+    /**
+     * Creates an algorithm without a REST server and without a traces folder, for the tests of
+     * this package (see {@link SteadyStateMaster#SteadyStateMaster(Problem)}).
+     */
+    SteadyStateEvolutionaryAlgorithm(Problem<S> problem, int populationSize,
+            CrossoverOperator<S> crossover, MutationOperator<S> mutation,
+            SelectionOperator<List<S>, List<S>> selection, Comparator<S> dominanceComparator,
+            Termination termination) {
+
+        super(problem);
+        this.problem = problem;
+        this.populationSize = populationSize;
+        this.selection = selection;
+        initState(crossover, mutation, dominanceComparator, termination);
+    }
+
+    /**
+     * Sets up the state both constructors share; the final fields are assigned by each
+     * constructor, as Java requires.
+     */
+    private void initState(CrossoverOperator<S> crossover, MutationOperator<S> mutation,
+            Comparator<S> dominanceComparator, Termination termination) {
         this.crossover = crossover;
         this.mutation = mutation;
-        this.populationSize = populationSize;
         this.termination = termination;
-        this.selection = selection;
         this.dominanceComparator = dominanceComparator;
         // All accesses to `population` are wrapped in synchronized(population), so the
         // synchronizedList wrapper would only add a redundant second layer of locking.
         this.population = new ArrayList<>();
-
-        attributes  = new ConcurrentHashMap<>();
-        observable  = new DefaultObservable<>("Observable");
-        archive     = new BestSolutionsArchive<>(new NonDominatedSolutionListArchive<>(), populationSize);
-
-        if (tracesFolder != null) this.tracesFolder = new File(tracesFolder);
+        archive = new BestSolutionsArchive<>(new NonDominatedSolutionListArchive<>(), populationSize);
     }
 
     // ── waitForWorkers() and acceptConnection() REMOVED ──────────────────────
@@ -546,6 +570,20 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
     @Override
     public boolean isReady() {
         return ready || runFinished;
+    }
+
+    /**
+     * {@code true} once the algorithm has left its loop for good: its thread has found the
+     * termination met, or {@link #run()} has returned or thrown, with or without a stop. No
+     * result is processed after that, so the master needs no more results
+     * ({@link #needsNoMoreResults()}), as after a stop: it hands out no task, refuses the
+     * results still in flight ({@code 404}, not counted in the {@code evaluations} of
+     * {@code GET /api/v1/status}), counts no failure report, and leaves the results still
+     * queued out of those {@code evaluations}.
+     */
+    @Override
+    boolean runEnded() {
+        return runFinished;
     }
 
     /**
