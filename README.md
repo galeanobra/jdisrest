@@ -331,23 +331,30 @@ versioned DOI; the concept DOI below always resolves to the latest one:
 Papers and theses that have used jdisrest (or the codebase it was
 extracted from) for their experiments:
 
+- A. Calzadilla, F. Luna, G. Álvarez-Botero, N. Duque-Madrid,
+  J. Galeano-Brajones, T. Lopetegi, M. A. G. Laso, I. Arregui. "Compact
+  Waveguide Low-Pass Filter With Smooth Profile Designed by Genetic
+  Algorithm Optimization." *IEEE Microwave and Wireless Technology
+  Letters*, early access, 2026.
+  DOI: [10.1109/LMWT.2026.3721955](https://doi.org/10.1109/LMWT.2026.3721955)
+
 - J. Calle-Cancho, J. Galeano-Brajones, D. Cortés-Polo, J. Carmona-Murillo,
   F. Luna-Valero. "Optimizing load-balanced resource allocation in
   next-generation mobile networks: A parallelized multi-objective
   approach." *Ad Hoc Networks*, 177, 103912, 2025.
   DOI: [10.1016/j.adhoc.2025.103912](https://doi.org/10.1016/j.adhoc.2025.103912)
 
-- J. Galeano-Brajones, C. Pupiales, D. Laselva, J. Carmona-Murillo, F. Luna.
-  "Applying Evolutionary Algorithms for Cell Switch-Off to Reduce Network
-  Energy Consumption." *2024 IEEE 99th Vehicular Technology Conference
-  (VTC2024-Spring)*, pp. 1–7, 2024.
-  DOI: [10.1109/VTC2024-Spring62846.2024.10683144](https://doi.org/10.1109/VTC2024-Spring62846.2024.10683144)
-
 - J. Galeano-Brajones, M. I. Chidean, F. Luna, J. Calle-Cancho,
   J. Carmona-Murillo. "Network traffic classification through high-order
   L-moments and multi-objective optimization." *Computer Communications*,
   242, 108290, 2025.
   DOI: [10.1016/j.comcom.2025.108290](https://doi.org/10.1016/j.comcom.2025.108290)
+
+- J. Galeano-Brajones, C. Pupiales, D. Laselva, J. Carmona-Murillo, F. Luna.
+  "Applying Evolutionary Algorithms for Cell Switch-Off to Reduce Network
+  Energy Consumption." *2024 IEEE 99th Vehicular Technology Conference
+  (VTC2024-Spring)*, pp. 1–7, 2024.
+  DOI: [10.1109/VTC2024-Spring62846.2024.10683144](https://doi.org/10.1109/VTC2024-Spring62846.2024.10683144)
 
 - J. Galeano-Brajones. *Advanced Optimization Techniques for Energy
   Efficiency Improvement in Ultra-Dense 5G/6G Networks.* PhD thesis,
