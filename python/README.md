@@ -18,10 +18,12 @@ pip install -e /path/to/jdisrest/python
 from jdisrest import Worker, EvalResult
 
 def evaluate(variables):
-    return EvalResult(objectives=[-sum(v ** 2 for v in variables)])
+    return EvalResult(objectives=[sum(v ** 2 for v in variables)])
 
 Worker("http://master:8080").run(evaluate)
 ```
+
+Every objective is minimized; negate one to maximize it.
 
 ## Command-line worker
 
@@ -56,8 +58,8 @@ python -m jdisrest --evaluator sphere:evaluate --code-dir path/to/code \
 ```
 
 The worker evaluates tasks until the run finishes (the master answers `410 Gone`), the master
-is gone (5 network errors in a row, or 3 failed heartbeats) or the worker is interrupted, then
-exits.
+is gone (5 failed requests or 3 failed heartbeats in a row, see [Failures](#failures)) or the
+worker is interrupted, then exits.
 
 | Option | Meaning (default) |
 |---|---|
@@ -66,7 +68,7 @@ exits.
 | `--master URL` | URL of the master, for instance `http://10.0.0.1:8080`. It must be an `http://` or `https://` URL. Excludes `--endpoint`. |
 | `--endpoint FILE` | Endpoint file written by the master (`.master-endpoint`), waited for if it does not exist yet. The file is accepted as soon as it exists, so a file left by an earlier run makes the worker connect to a master that is gone: delete it before starting the master. |
 | `--timeout SECONDS` | How long to wait for the endpoint file, checked every 5 seconds (300). |
-| `--worker-id ID` | Name of the worker in the master's logs and in `GET /api/v1/workers/status` (a random `worker-py-xxxxxxxx`). |
+| `--worker-id ID` | Name of the worker in the master's logs and in `GET /api/v1/workers/status` (a random `worker-py-xxxxxxxx`). It must be unique among the workers of a run: the master tracks one task in flight per id, and workers that share one keep taking each other's tasks back. |
 | `--variables N` | Number of variables every task must have. A task with another number is reported to the master as a failed evaluation without calling the function (not checked). |
 | `--objectives N` | Number of objectives the function must return. A result with another number is reported to the master as a failed evaluation (not checked here; the master then rejects a result with a wrong count with `422`, which also counts as a failed evaluation). |
 | `--non-finite-penalty X` | Opt-in. Replaces every objective of a result that has a NaN or infinite objective with the finite value `X`, and logs a warning (none). |
@@ -98,16 +100,31 @@ the master about the task it was evaluating: the master's watchdog, which checks
 seconds, requeues that task once the worker has sent no heartbeat for 45 seconds, and such a
 requeue does not count as a failed evaluation.
 
-**Exit status.** 0 once the worker stops (the run finished or was stopped, the master is gone,
-or the worker was interrupted); 1 if the evaluator cannot be loaded or the endpoint file does not
-appear within `--timeout` seconds; 2 for invalid options.
+**Exit status.** 0 once the worker stops because the run finished or was stopped, or because
+the worker was interrupted; 3 when it gave the master up as lost (so a batch script can tell the
+two apart); 1 if the evaluator cannot be loaded or the endpoint file does not appear within
+`--timeout` seconds; 2 for invalid options. A worker that is still evaluating when the master
+shuts down at the end of a run only finds the master gone; it stops after its failed heartbeats
+or requests (typically 10 to 25 seconds later) and, since the master deletes its endpoint file
+when it shuts down while one that dies leaves it behind, exits with 0 if the endpoint file it was
+started from is gone or names another master by then, and with 3 otherwise. A worker given
+`--master URL` cannot tell, and exits with 3 in that case too.
 
 ## API
 
 The package exports:
 
-- `Worker(master_url, worker_id=None)`: connects to a master; `run(evaluate)` evaluates its tasks
-  until the run finishes, with `evaluate` an `Evaluator` or a function.
+- `Worker(master_url, worker_id=None)`: connects to a master (`worker_id`, by default a random
+  `worker-py-xxxxxxxx`, must be unique among the workers of a run); `run(evaluate)` evaluates
+  its tasks until the run finishes, the master is gone or the worker is interrupted, and returns
+  which: `"finished"` (the master answered `410 Gone`: the run finished or was stopped; or, for
+  a worker created from an endpoint file, the master stopped answering and the file is gone or
+  names another master, because the master shut down), `"master-lost"` or `"interrupted"` (also
+  `Worker.FINISHED`, `Worker.MASTER_LOST` and `Worker.INTERRUPTED`). `evaluate` is an
+  `Evaluator`, any other object with an `evaluate(variables)` method, or a function; it may
+  return any of the results the command-line worker's function may return (see above).
+  Anything else passed as `evaluate` raises `TypeError` before the worker connects. A worker can
+  run again once `run` has returned.
   `Worker.from_endpoint(path=".master-endpoint")` reads the URL from the endpoint file, and
   `Worker.wait_for_endpoint(path=".master-endpoint", timeout=300)` waits for the file first
   (`TimeoutError` if it does not appear). Both also take `worker_id`.
@@ -115,7 +132,9 @@ The package exports:
   `evaluate(variables) -> EvalResult`.
 - `EvalResult(objectives, constraints=None, variables=None)`: the result of one evaluation.
   Every objective is minimized; constraints follow jMetal (`>= 0` satisfied, `< 0` violated);
-  `variables`, when given, replaces the decision vector on the master (Lamarckian search).
+  `variables`, when given, replaces the decision vector on the master (Lamarckian search). The
+  master rejects a vector with a value outside the bounds of its variable (`422`, a failed
+  evaluation): the bounds are inclusive and checked without tolerance, so clip exactly to them.
 - `Variables`: the type of the decision vector a task carries (a list of ints, floats or both).
 - `load_function(code_dir, module, attribute)`: imports `module`, from the folder `code_dir`
   (or from `sys.path` if it is None), and returns its `attribute`, as `--evaluator` and
@@ -127,7 +146,7 @@ The package exports:
   the pieces of the command-line worker, for a worker command line of your own. The first adds
   `--master`, `--endpoint`, `--timeout` and `--worker-id` to an `argparse` parser; the second
   sets up the log format above (it does nothing if logging is already configured); the third
-  connects as those options say and runs the worker.
+  connects as those options say, runs the worker and returns what `Worker.run` returned.
 
 For instance, `load_function` and `FunctionEvaluator` run the sphere above from a script:
 
@@ -167,14 +186,45 @@ if __name__ == "__main__":
 `run_worker` does not install the SIGTERM handling of `python -m jdisrest`; a command line that
 runs under a batch scheduler installs its own.
 
+### Failures
+
+An evaluation that raises, or whose result has no objective or a value that is not a finite
+number, is reported to the master (`POST /api/v1/tasks/{id}/error`) with the type and message
+of the exception, such as `ZeroDivisionError: division by zero`; the traceback of an exception
+raised by the evaluator goes to the log with the error. The master requeues the task, or
+discards it after its failure limit. From the second failed evaluation in a row, the worker
+waits before asking for the next task: 1 second, twice as long after each further failure, at
+most 60 seconds (`Worker.EVAL_ERROR_DELAY` and `Worker.MAX_EVAL_ERROR_DELAY`), so that a worker
+whose evaluator always fails no longer spins through the tasks: once the wait has reached its
+cap, it takes at most one task a minute.
+
+A task whose variables are not a list of finite numbers, and a result that does not get
+through (a network error, or an answer such as `500` or `502`), are reported the same way,
+best-effort, so that the master requeues the task at once instead of keeping it in flight; the
+master counts such a report as a failed evaluation of the task if it still has the task in
+flight. The master answers `404` to a result it no longer expects (the task was requeued, or
+the run was stopped) and `400`, `413`, `415` or `422` to one it cannot apply, which already
+counts as a failed evaluation: for a `422`, unless another worker holds the task by then; a
+`400`, `413` or `415` counts whoever holds it, because the master cannot read the `workerId` of
+a body it has not decoded. The worker logs the answer and carries on.
+
+The master is taken as gone after 5 failed requests in a row (`Worker.MAX_CONSECUTIVE_ERRORS`):
+network errors and answers the protocol does not expect, such as the `502` of a proxy in front
+of a master that is gone, or a task without an integer `taskId`. A task received does not clear
+the count until its result or error report gets an answer. Heartbeats go every 15 seconds on
+their own connection; one that fails (a network error or an answer other than 2xx) is logged as
+a warning and retried after 5 seconds, and 3 failures in a row (`Worker.MAX_HEARTBEAT_FAILURES`)
+also stop the worker.
+
 ## Tools
 
 `tools/` holds two standalone scripts for the traces a run writes, which are not part of the
 installed package. When the master has a traces folder, it writes there every `populationSize`
-evaluations (`archiveSize` for PAES; `setTraceCadence` spaces the snapshots out) the archive of
-non-dominated solutions to `aFUN_<evaluations>.csv` (objectives) and `aVAR_<evaluations>.csv`
-(variables), and the population (for PAES, its archive) to `FUN_<evaluations>.csv` and
-`VAR_<evaluations>.csv`. The local NSGA-II writes the same files.
+evaluations (`archiveSize` for PAES; `setTraceCadence` spaces the snapshots out), and once more
+when the run ends, the archive of non-dominated solutions to `aFUN_<evaluations>.csv`
+(objectives) and `aVAR_<evaluations>.csv` (variables), and the population (for PAES, its
+archive) to `FUN_<evaluations>.csv` and `VAR_<evaluations>.csv`. The local NSGA-II writes the
+same files.
 
 ### `watch_front.py`
 
@@ -255,7 +305,7 @@ python tools/plot_front_evolution.py path/to/run --step 1000 --labels cost time 
 | Option | Meaning (default) |
 |---|---|
 | `run` | The traces folder, or a folder with a `traces` subfolder. |
-| `--step N` | Evaluations between the fronts drawn: the `aFUN_<n>.csv` with `n` a multiple of `N` (1000). |
+| `--step N` | Evaluations between the fronts drawn: the `aFUN_<n>.csv` with `n` a multiple of `N` (1000). The final snapshot of a run is drawn only if its `n` is a multiple of `N` too. |
 | `--labels NAME ...` | Names of the objectives (`f1`, `f2`, ...). |
 | `--exclude-above X` | Leave out the solutions with an objective of `X` or more, such as those an evaluator penalizes with a large constant, so that they do not flatten the plot. |
 | `--output-dir DIR` | Folder for the figures (the parent of the traces folder). |

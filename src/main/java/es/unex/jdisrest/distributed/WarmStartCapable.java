@@ -12,9 +12,8 @@ import java.util.List;
  * solutions via {@code Problem.createSolution()}, and copies that file into the
  * traces folder. The callers are
  * {@link SteadyStateEvolutionaryAlgorithm#createInitialSolutions(int)} — used by
- * every distributed algorithm that keeps the inherited
- * {@link SteadyStateEvolutionaryAlgorithm#createInitialTasks() createInitialTasks()}
- * — and the local {@link es.unex.jdisrest.local.algorithms.NSGAII NSGA-II}.
+ * every bundled distributed algorithm (NSGA-II, SMS-EMOA, MOEA/D and PAES) —
+ * and the local {@link es.unex.jdisrest.local.algorithms.NSGAII NSGA-II}.
  * The method takes no path: implementations must read
  * {@link WarmStart#FILE}, the file whose presence enabled the warm start and the
  * one copied into the traces.
@@ -25,7 +24,7 @@ import java.util.List;
  *
  * @param <S> the solution type produced by the problem (e.g.
  *            {@code IntegerSolution} or {@code CompositeSolution})
- * @author Jes&uacute;s Galeano Brajones (Universidad de Extremadura)
+ * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
 public interface WarmStartCapable<S> {
 
@@ -42,8 +41,8 @@ public interface WarmStartCapable<S> {
      * malformed file) should log the error and return a population padded
      * entirely with random solutions rather than throwing. A list of another
      * size, or {@code null}, is tolerated with a warning (see
-     * {@link WarmStart#load}): the list is used as it is, and {@code null}
-     * makes the run start from random solutions.
+     * {@link WarmStart#load}): the algorithm decides what a short or long list
+     * means, and {@code null} makes the run start from random solutions.
      *
      * @param populationSize number of solutions requested by the algorithm
      * @return a list of {@code populationSize} solutions (see above for what

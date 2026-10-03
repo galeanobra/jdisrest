@@ -83,13 +83,16 @@
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
-        <!-- Actuator endpoint /actuator/health (used by monitoring scripts). -->
+        <!-- Actuator: GET /actuator/health on the master's port, a liveness check for scripts. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Jackson for JSON payloads (transitively via webflux, listed explicitly). -->
+        <!-- Jackson 2 (com.fasterxml), used directly by AbstractMaster (.master-endpoint), the
+             status.json writer, RestWorker and PythonProcessEvaluator. WebFlux serializes the REST
+             payloads with Jackson 3 (tools.jackson), which it brings in itself; both read the
+             com.fasterxml.jackson.annotation annotations of the DTOs. -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>

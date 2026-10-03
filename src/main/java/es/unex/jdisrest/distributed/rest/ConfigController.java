@@ -107,13 +107,31 @@ public class ConfigController {
             // Applying writes the change to the traces, so it runs off the event loop. Only the
             // body can fail here: respond() turns every failure of the handler into a response.
             return readBody(body, MAX_BODY_BYTES)
-                    .flatMap(text -> Mono.fromCallable(() -> respond(handler, MasterFacade::isFinished, text))
+                    .flatMap(text -> Mono.fromCallable(
+                                    () -> respond(handler, ConfigController::finishedOnceReady, text))
                             .subscribeOn(Schedulers.boundedElastic()))
                     .onErrorResume(DataBufferLimitException.class, e -> Mono.just(error(HttpStatus.CONTENT_TOO_LARGE,
                             "the configuration must not be longer than " + MAX_BODY_BYTES + " bytes")))
                     .onErrorResume(IllegalArgumentException.class,
                             e -> Mono.just(error(HttpStatus.UNPROCESSABLE_CONTENT, e.getMessage())));
         });
+    }
+
+    /**
+     * Whether the run has finished, for {@link #respond}: {@link MasterFacade#isFinished()}. While
+     * the master is still building its initial state ({@link MasterFacade#isReady()} is
+     * {@code false}) the run has not started and a change cannot be applied safely, so this
+     * method throws and {@link #respond} answers {@code 503}. (Without a master the handler
+     * alone decides, as before.)
+     *
+     * @return whether the run has finished
+     * @throws IllegalStateException if the master is not ready yet
+     */
+    private static boolean finishedOnceReady() {
+        if (MasterFacade.hasMaster() && !MasterFacade.isReady()) {
+            throw new IllegalStateException("the master is not ready yet");
+        }
+        return MasterFacade.isFinished();
     }
 
     // ── Body ──────────────────────────────────────────────────────────────────
@@ -172,7 +190,8 @@ public class ConfigController {
         try {
             over = finished.getAsBoolean();
         } catch (RuntimeException e) {
-            // Before the run starts, jMetal's terminations cannot be evaluated yet (no EVALUATIONS).
+            // Before the run starts (finishedOnceReady) or a stopping condition that cannot be
+            // evaluated yet: whether the run has finished cannot be told.
             return error(HttpStatus.SERVICE_UNAVAILABLE, "the master is not ready yet");
         }
         if (over) {

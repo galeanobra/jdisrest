@@ -13,6 +13,8 @@ import org.uma.jmetal.util.SolutionListUtils;
 import org.uma.jmetal.util.archive.Archive;
 import org.uma.jmetal.util.archive.impl.BestSolutionsArchive;
 import org.uma.jmetal.util.archive.impl.NonDominatedSolutionListArchive;
+import org.uma.jmetal.util.observable.Observable;
+import org.uma.jmetal.util.observable.ObservableEntity;
 import org.uma.jmetal.util.observable.impl.DefaultObservable;
 import org.uma.jmetal.util.pseudorandom.JMetalRandom;
 import es.unex.jdisrest.util.Log;
@@ -21,7 +23,9 @@ import es.unex.jdisrest.util.TraceWriter;
 
 import java.io.File;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -52,12 +56,25 @@ import java.util.stream.IntStream;
  *       and {@link #mutation} under the same lock. {@link #setVariation} takes it too, so no task
  *       mixes an old and a new operator. Subclasses that override {@code createNewTask()} must
  *       read the operators inside that lock as well.</li>
+ *   <li>{@link #attributes} is a concurrent map: the algorithm thread writes it, REST threads
+ *       read it whenever they evaluate the stopping condition.</li>
+ *   <li>The external {@link #archive} holds copies of its own, never the population members:
+ *       its distance-based subset selection writes density attributes into its members on the
+ *       algorithm thread without the population lock, while REST threads copy population
+ *       members, attributes included, under that lock.</li>
  * </ul>
+ *
+ * <h2>Startup</h2>
+ * <p>The REST server starts in the constructor, long before {@link #run()} has built the initial
+ * tasks and filled {@link #attributes}, which the termination reads. Until then
+ * {@link #isReady()} is {@code false} and {@link #stoppingConditionIsNotMet()} answers
+ * {@code true} on REST threads without consulting the termination (see both).
  *
  * @param <S> the solution type (e.g., {@code IntegerSolution} or {@code CompositeSolution})
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
-public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends SteadyStateMaster<ParallelTask<S>, List<S>> {
+public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends SteadyStateMaster<ParallelTask<S>, List<S>>
+        implements ObservableEntity<Map<String, Object>> {
 
     protected final Problem<S> problem;
     /**
@@ -72,8 +89,15 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      */
     protected volatile Termination termination;
     protected final int populationSize;
+    /**
+     * The progress the termination and the observers see ({@code EVALUATIONS}, {@code POPULATION},
+     * {@code COMPUTING_TIME}), filled by {@link #initProgress()} and refreshed by
+     * {@link #updateProgress()}. A {@link ConcurrentHashMap}, because REST threads read it while
+     * the algorithm thread writes it; like any such map it rejects {@code null} values.
+     */
     protected final Map<String, Object> attributes;
-    protected final org.uma.jmetal.util.observable.Observable<Map<String, Object>> observable;
+    /** Notified with {@link #attributes} after every progress update; see {@link #observable()}. */
+    protected final Observable<Map<String, Object>> observable;
     /**
      * Crossover applied to the parents of every new task. Replaceable during the run through
      * {@link #setVariation}; read it inside {@code synchronized (population)}. {@code null} only
@@ -104,6 +128,18 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      */
     private volatile boolean runFinished;
     /**
+     * Set once {@link #attributes} holds what the termination reads: at the end of
+     * {@link #initProgress()}, or at the algorithm thread's first successful check of the
+     * stopping condition (for subclasses whose {@code initProgress()} does not call this one).
+     * See {@link #isReady()}.
+     */
+    private volatile boolean ready;
+    /**
+     * Evaluation count of the last trace snapshot written, so that the final snapshot of
+     * {@link #run()} does not write the same files twice. Algorithm thread only.
+     */
+    private int lastTracedEvaluations = -1;
+    /**
      * Taken by {@link #setTermination} and by the algorithm thread's check of {@link #termination},
      * so that the loop never ends on a criterion that is being replaced.
      */
@@ -111,7 +147,11 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
     /** The thread running {@link #run()}, whose checks of the stopping condition end the loop. */
     private volatile Thread algorithmThread;
 
-    /** Set how often traces are written; clamped to a minimum of 1. */
+    /**
+     * Sets how often traces are written: every {@code populationSize * cadence} evaluations,
+     * clamped to a cadence of at least 1. The final state of the run is traced in any case (see
+     * {@link #saveTrace()}).
+     */
     public void setTraceCadence(int cadence) {
         this.traceCadence = Math.max(1, cadence);
     }
@@ -133,7 +173,7 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
         // synchronizedList wrapper would only add a redundant second layer of locking.
         this.population = new ArrayList<>();
 
-        attributes  = new HashMap<>();
+        attributes  = new ConcurrentHashMap<>();
         observable  = new DefaultObservable<>("Observable");
         archive     = new BestSolutionsArchive<>(new NonDominatedSolutionListArchive<>(), populationSize);
 
@@ -153,9 +193,10 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      *
      * <p>The key is a defensive copy of the flat decision vector produced by
      * {@link SolutionVariables#flatten}: for {@code CompositeSolution} the component
-     * variables are concatenated (jMetal's inner solutions use identity equality, so
-     * {@code variables()} itself is not usable as a key), and for flat solutions the
-     * copy avoids storing a reference to the live variable list inside the set.
+     * variables are concatenated. {@code variables()} itself would compare correctly (jMetal
+     * solutions are equal when their variables are), but it is the live list of the solution
+     * (for a {@code CompositeSolution}, a list of its live component solutions), so a later
+     * change of the solution would silently change a key already stored in the set.
      *
      * <p>Equality is exact, element by element. With integer encodings this catches
      * every duplicate. With real encodings two independently generated vectors are
@@ -173,15 +214,26 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
         population.forEach(s -> populationSignatures.add(solutionKey(s)));
     }
 
+    /**
+     * Fills {@link #attributes} for the first time and notifies the observers. From then on the
+     * termination can be evaluated, so the master reports itself ready ({@link #isReady()}).
+     * An override should call this method; one that does not still makes the master ready at the
+     * algorithm thread's first check of the stopping condition.
+     */
     @Override
     public void initProgress() {
         attributes.put("EVALUATIONS", evaluations);
         attributes.put("POPULATION", population);
         attributes.put("COMPUTING_TIME", System.currentTimeMillis() - initTime);
+        ready = true;
         observable.setChanged();
         observable.notifyObservers(attributes);
     }
 
+    /**
+     * Refreshes {@link #attributes} after a processed result, notifies the observers and writes
+     * the trace snapshot when one is due ({@link #saveTrace()}).
+     */
     @Override
     public void updateProgress() {
         attributes.put("EVALUATIONS", evaluations);
@@ -220,9 +272,10 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * <p>This is the extension point for algorithms that do not start from
      * {@link #populationSize} solutions: a subclass whose {@link #createInitialTasks()} calls
      * {@code createInitialSolutions(1)}, for instance, starts a single-solution strategy with the
-     * same warm-start support. A subclass that overrides {@code createInitialTasks()}
-     * <em>without</em> calling this method (MOEA/D does) bypasses it, and gets neither the warm
-     * start nor the copy of the file.
+     * same warm-start support, and MOEA/D calls {@code createInitialSolutions(populationSize)} to
+     * map solution {@code i} to subproblem {@code i}. A subclass that overrides
+     * {@code createInitialTasks()} <em>without</em> calling this method bypasses it, and gets
+     * neither the warm start nor the copy of the file.
      *
      * @param count number of solutions requested
      * @return the solutions, not yet evaluated
@@ -240,11 +293,18 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
 
     // ── Steady-state step ─────────────────────────────────────────────────────
 
+    /**
+     * Counts the result, adds a copy of it to the external {@link #archive} and, unless the
+     * population already holds a solution with the same variables, inserts it: appended while the
+     * population is not full, otherwise through ranking and crowding over the population plus the
+     * new solution with {@link #dominanceComparator}, which drops one member.
+     */
     @Override
+    @SuppressWarnings("unchecked")
     public void processComputedTask(ParallelTask<S> task) {
         evaluations++;
         S sol = (S) task.getContents().copy();
-        archive.add(sol);
+        archive.add((S) sol.copy());  // never share an instance with the population (see the class doc)
 
         synchronized (population) {
             if (!solutionInThePopulation(sol)) {
@@ -266,26 +326,39 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
 
     private static final int MAX_DUPLICATE_RETRIES = 1000;
 
+    /**
+     * Creates two offspring and returns a task for one of them, queueing the other as a spare in
+     * {@link #pendingTaskQueue}. Runs on a REST thread, under the population lock.
+     *
+     * <p>The two parents returned by {@link #selection} are mated with {@link #crossover}; copies of
+     * the first two children are mutated, so the operators never touch population members. A
+     * crossover that returns a single child mates a second pair of parents, selected
+     * independently, for the second offspring (see {@link #secondChild}); one that returns none
+     * fails with an {@link IllegalStateException}. When either offspring duplicates a
+     * population member the pair is created again, up to 1000 attempts;
+     * if the last attempt still produced a duplicate, a warning is logged and it is used anyway.
+     * While the population holds two members or fewer the task holds a random solution instead.
+     */
     @Override
+    @SuppressWarnings("unchecked")
     public ParallelTask<S> createNewTask() {
         synchronized (population) {
             if (population.size() > 2) {
-                List<S> parents;
                 S sol0, sol1;
-                int retries = 0;
+                boolean duplicate;
+                int attempts = 0;
                 do {
-                    parents = selection.execute(population);
-                    List<S> offspring = crossover.execute(parents);
-                    sol0 = (S) offspring.get(0).copy();
-                    sol1 = (S) offspring.get(1).copy();
+                    List<S> offspring = crossover.execute(selection.execute(population));
+                    sol0 = (S) child(offspring, 0).copy();
+                    sol1 = (S) secondChild(offspring, () -> crossover.execute(selection.execute(population))).copy();
                     mutation.execute(sol0);
                     mutation.execute(sol1);
-                    if (++retries >= MAX_DUPLICATE_RETRIES) {
-                        Log.warn("Could not generate non-duplicate solution after "
-                                + MAX_DUPLICATE_RETRIES + " retries, using last generated solution");
-                        break;
-                    }
-                } while (solutionInThePopulation(sol0) || solutionInThePopulation(sol1));
+                    duplicate = solutionInThePopulation(sol0) || solutionInThePopulation(sol1);
+                } while (duplicate && ++attempts < MAX_DUPLICATE_RETRIES);
+                if (duplicate) {
+                    Log.warn("Could not generate non-duplicate solution after "
+                            + MAX_DUPLICATE_RETRIES + " retries, using last generated solution");
+                }
 
                 if (JMetalRandom.getInstance().nextInt(0, 1) == 0) {
                     pendingTaskQueue.add(ParallelTask.create(createTaskIdentifier(), sol1));
@@ -302,6 +375,45 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
 
     protected boolean solutionInThePopulation(S sol0) {
         return populationSignatures.contains(solutionKey(sol0));
+    }
+
+    /**
+     * Child {@code index} of a crossover's offspring, or its last child when there are fewer.
+     * (jMetal's {@code DifferentialEvolutionCrossover} is not a one-child crossover usable here:
+     * it needs three parents and a current solution, which this class never supplies.) The caller
+     * copies the child before mutating it.
+     *
+     * @param offspring what the crossover returned
+     * @param index     the child wanted, from 0
+     * @param <T>       the solution type
+     * @return the child, not copied
+     * @throws IllegalStateException if the crossover returned no child at all
+     */
+    protected static <T> T child(List<T> offspring, int index) {
+        if (offspring == null || offspring.isEmpty()) {
+            throw new IllegalStateException("the crossover returned no offspring — it must return at least one child");
+        }
+        return offspring.get(Math.min(index, offspring.size() - 1));
+    }
+
+    /**
+     * The second offspring of a task: the second child of a crossover's offspring or, when the
+     * crossover returned a single child, the child of a second mating of independently selected
+     * parents. Giving the single child to both offspring would make them copies that only the
+     * mutation may tell apart, and the duplicate filter compares each with the population, not
+     * with its sibling, so with a mutation probability of 1/n about one task pair in eight would
+     * evaluate the same vector twice. A crossover with two or more children is not called again,
+     * so its random stream is unchanged. The caller copies the child before mutating it.
+     *
+     * @param offspring what the crossover returned
+     * @param mateAgain selects new parents and mates them, for a crossover with a single child
+     * @param <T>       the solution type
+     * @return the child, not copied
+     * @throws IllegalStateException if a crossover returned no child at all
+     */
+    protected static <T> T secondChild(List<T> offspring, Supplier<List<T>> mateAgain) {
+        child(offspring, 0);  // fails for no child at all
+        return offspring.size() > 1 ? offspring.get(1) : child(mateAgain.get(), 0);
     }
 
     // ── Changes during the run ────────────────────────────────────────────────
@@ -327,10 +439,10 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * waiting in {@link #pendingTaskQueue}.
      *
      * <p>The operators must fit the running algorithm's {@code createNewTask()}. This class mates
-     * the two parents returned by the selection and keeps the first two children, so a crossover
-     * that needs another number of parents or yields fewer than two children makes every later
-     * task creation fail. Nothing beyond {@code null} is checked here, because subclasses may use
-     * the operators differently.
+     * the two parents returned by the selection and keeps the first two children (a single child
+     * makes it mate a second pair), so a crossover that needs another number of parents or yields no
+     * child makes every later task creation fail. Nothing beyond {@code null} is checked here,
+     * because subclasses may use the operators differently.
      *
      * @param crossover the new crossover, or {@code null} only in subclasses whose
      *                  {@code createNewTask()} does not use one
@@ -396,6 +508,11 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * the loop and a new criterion cannot cross. Subclasses that override this method should
      * combine their condition with {@code super.stoppingConditionIsNotMet()} to keep these
      * guarantees.
+     *
+     * <p>Before the master is ready ({@link #isReady()}) a REST thread gets {@code true} without
+     * consulting the termination: until {@link #initProgress()} has filled {@link #attributes},
+     * jMetal's terminations throw on the missing keys (and during the constructor the termination
+     * is not even assigned), and a run that has not started is not finished.
      */
     @Override
     public boolean stoppingConditionIsNotMet() {
@@ -403,15 +520,32 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
             return false;
         }
         if (Thread.currentThread() != algorithmThread) {
-            return !termination.isMet(attributes);
+            return !ready || !termination.isMet(attributes);
         }
         synchronized (terminationLock) {
             if (termination.isMet(attributes)) {
                 runFinished = true;
                 return false;
             }
+            ready = true;
             return true;
         }
+    }
+
+    /**
+     * {@code true} once the run has filled {@link #attributes} ({@link #initProgress()}), so that
+     * the termination can be evaluated, and from then on; also {@code true} once {@link #run()}
+     * has finished, even if it failed before that point, so that the master can report itself
+     * finished. {@code false} from the moment the REST server starts in the constructor until
+     * then: the REST layer hands out no task and does not report the run finished in that window
+     * (see {@link AbstractMaster#isReady()}). The initial tasks are queued just before
+     * {@code initProgress()}, so workers get them as soon as the master is ready.
+     *
+     * @return whether the master can serve workers
+     */
+    @Override
+    public boolean isReady() {
+        return ready || runFinished;
     }
 
     /**
@@ -421,6 +555,13 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
      * <p>However the loop ends — termination met, stop requested, interrupted, or an exception —
      * the run is marked finished on the way out, so {@link #isFinished()} is {@code true} from
      * then on and workers are told to stop instead of being handed tasks nobody will collect.
+     *
+     * <p>When the loop ends normally (termination met, stop requested or interrupted),
+     * {@link #saveTrace()} is called once more and writes a final snapshot, unless one was just
+     * written at the same evaluation count or no result was processed: the run's last state is
+     * traced even when the budget is not a multiple of the trace period or a stop ended the run
+     * early. A run that throws writes no final snapshot, and a final snapshot that cannot be
+     * written is logged as an error without failing the run, whose result is complete.
      */
     @Override
     public void run() {
@@ -432,16 +573,50 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
             SolutionVariables.wireEncoding(problem.createSolution());
             initTime = System.currentTimeMillis();
             super.run();
+            runFinished = true;
+            try {
+                saveTrace();  // the final snapshot (see above)
+            } catch (RuntimeException e) {
+                Log.error("Could not write the final trace snapshot (" + e + ") — the result is not affected");
+            }
         } finally {
             runFinished = true;
         }
     }
 
+    // ── Observers ─────────────────────────────────────────────────────────────
+
+    /**
+     * The observable notified with {@link #attributes} by {@link #initProgress()} and after every
+     * processed result by {@link #updateProgress()}, so that jMetal observers (an
+     * {@code EvaluationObserver}, a chart, a custom progress log) can follow the run. Register
+     * them before {@link #run()}.
+     *
+     * <p>Observers are called on the algorithm thread, which is the only thread that modifies the
+     * population and the attributes, so they may read both (the {@code POPULATION} attribute is
+     * the live population list); they must not modify either, and a slow observer slows down the
+     * processing of results.
+     *
+     * @return the observable of this algorithm
+     */
+    @Override
+    public Observable<Map<String, Object>> observable() {
+        return observable;
+    }
+
     // ── Result and traces ─────────────────────────────────────────────────────
 
+    /**
+     * Returns the feasible solutions of the external archive, at most {@link #populationSize} of
+     * them (the archive returns a distance-based subset of that size). The list is empty when no
+     * feasible solution was found, and also when no result was processed at all (for instance a
+     * run stopped before its first result).
+     *
+     * @return the feasible non-dominated solutions found, possibly none
+     */
     @Override
     public List<S> getResult() {
-        List<S> feasible = archive.solutions().stream()
+        List<S> feasible = archiveSolutions().stream()
             .filter(ConstraintHandling::isFeasible)
             .collect(Collectors.toList());
         if (feasible.isEmpty()) {
@@ -452,24 +627,44 @@ public class SteadyStateEvolutionaryAlgorithm<S extends Solution<?>> extends Ste
     }
 
     /**
+     * The members of the external archive, reduced to {@link #populationSize} by the archive
+     * itself; empty for an empty archive, on which jMetal's {@code BestSolutionsArchive} would
+     * throw.
+     */
+    private List<S> archiveSolutions() {
+        return archive.size() == 0 ? List.of() : archive.solutions();
+    }
+
+    /**
      * Writes a trace snapshot every {@code populationSize * traceCadence} evaluations when a
      * traces folder is set: the archive to {@code aVAR_<n>.csv} / {@code aFUN_<n>.csv} and
      * {@link #populationTraceSnapshot()} to {@code VAR_<n>.csv} / {@code FUN_<n>.csv}, where
      * {@code n} is {@link #getEvaluations()}. Called by {@link #updateProgress()} on the
-     * algorithm thread.
+     * algorithm thread, and once more by {@link #run()} when the loop ends: that last call writes
+     * the final snapshot whatever the count, unless the snapshot of that count already exists or
+     * no result was processed. A snapshot is never written twice for the same count.
+     *
+     * <p>The archive files hold the distance-based subset of at most {@code populationSize}
+     * members that the archive returns, not every non-dominated solution it keeps; like the
+     * population files, they include infeasible solutions (feasibility filtering is reserved for
+     * {@link #getResult()}).
      */
     public void saveTrace() {
-        if (evaluations % (populationSize * traceCadence) == 0 && tracesFolder != null) {
+        if (tracesFolder == null || evaluations == 0 || evaluations == lastTracedEvaluations) {
+            return;
+        }
+        // In long: populationSize * traceCadence overflows int for large cadences.
+        boolean due = evaluations % ((long) populationSize * traceCadence) == 0;
+        if (due || runFinished) {
             if (!tracesFolder.exists() && !tracesFolder.mkdirs()) {
                 Log.error("Error creating traces folder " + tracesFolder + " — skipping snapshot");
                 return;
             }
             Log.info("Population trace saved after " + evaluations + " evaluations in " + tracesFolder + " folder");
+            lastTracedEvaluations = evaluations;
 
             String prefix = tracesFolder + "/";
-            // Traces dump the full archive and population (feasible or not).
-            // Feasibility filtering is reserved for the final result (see getResult()).
-            List<S> archiveSnapshot = new ArrayList<>(archive.solutions());
+            List<S> archiveSnapshot = new ArrayList<>(archiveSolutions());
             List<S> populationSnapshot = populationTraceSnapshot();
             TraceWriter.write(archiveSnapshot,
                     prefix + "aVAR_" + evaluations + ".csv",

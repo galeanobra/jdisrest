@@ -23,7 +23,27 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.stream.IntStream;
 
 /**
- * Distributed steady‑state MOEA/D with configurable aggregation and limited replacement.
+ * Distributed steady-state MOEA/D with configurable aggregation and limited replacement.
+ *
+ * <h2>Population and subproblems</h2>
+ * <p>Once the population is full, member {@code k} is the current solution of subproblem
+ * {@code k}, the one replacement compares against weight vector {@code k}. Every task records the
+ * subproblem it was created for: initial task {@code i} is subproblem {@code i}, and offspring
+ * belong to the subproblem whose neighbourhood (or, with probability {@code 1 - delta}, the whole
+ * population) supplied their parents. While the population fills, the solution of subproblem
+ * {@code k} takes slot {@code k} when it is free and otherwise the nearest free one, and the
+ * population is put in slot order when the last slot is taken; in the meantime, workers that ask
+ * for work before any result has arrived get random solutions. A solution whose variables equal
+ * those of a member is not admitted, and the duplicate filter stays exact even when one offspring
+ * replaces several neighbours.
+ *
+ * <h2>Initial population and result</h2>
+ * <p>The initial solutions come from
+ * {@link SteadyStateEvolutionaryAlgorithm#createInitialSolutions(int)}, so a warm start is used
+ * when there is one (solution {@code i} for subproblem {@code i}); an initial solution that
+ * duplicates an earlier one is replaced by a random one. {@link #getResult()} returns the feasible
+ * solutions of the archive, as the other algorithms do. Every random draw (subproblem, mating
+ * scope, parents) comes from {@link JMetalRandom}, so its seed covers MOEA/D too.
  *
  * <h2>Weight vectors</h2>
  * <p>The weight vectors, one per subproblem, come from {@link MOEADWeights}:
@@ -46,6 +66,15 @@ import java.util.stream.IntStream;
  * population size that is not a lattice size) fails at once instead of leaving a live server
  * behind.
  *
+ * <h2>Changes from jdisrest 1.1</h2>
+ * <p>Besides the weights and the Tchebycheff weighting above: the warm start is honoured (1.1
+ * ignored it), {@code getResult()} filters infeasible solutions out (1.1 returned the archive as
+ * it was), the random draws come from {@code JMetalRandom} instead of an unseeded
+ * {@code java.util.Random} (the stochastic stream of a run changes), solutions fill the slot of
+ * their subproblem (1.1 appended them in arrival order, so slot and weight vector did not match
+ * until replacements settled them), and a worker asking for work before the first result gets a
+ * random solution instead of an error.
+ *
  * @param <S> the solution type
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
  */
@@ -62,8 +91,21 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
     protected final MOEADAggregation aggregation; // ideal and nadir points, aggregation function
     protected double[][] lambda;       // weight vectors
     protected int[][] neighbor;       // neighborhood indices
+    /**
+     * No longer used: every draw comes from {@link JMetalRandom}, so that its seed covers MOEA/D.
+     * Kept so that subclasses that read it still compile.
+     *
+     * @deprecated draw from {@code JMetalRandom.getInstance()} instead
+     */
+    @Deprecated
     protected Random random = new Random();
     protected ConcurrentMap<Long, Integer> taskSubproblemMap = new ConcurrentHashMap<>();
+    /**
+     * While the population fills, the solution taken for each subproblem, {@code null} while the
+     * slot is free; the population is put in this order when the last slot is taken. Guarded by
+     * the population lock.
+     */
+    private final List<S> fillingSlots;
 
     /**
      * Constructs a MOEA/D master with {@link MOEADWeights.Method#SPREAD} weight vectors and
@@ -137,6 +179,7 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
         this.maxReplaced = maxReplacedSolutions;
         this.weightMethod = weightMethod;
         this.aggregation = new MOEADAggregation(problem.numberOfObjectives(), aggFun, normalizeObjectives);
+        this.fillingSlots = new ArrayList<>(Collections.nCopies(populationSize, null));
 
         this.neighbor = new int[populationSize][T];
 
@@ -170,7 +213,8 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
     }
 
     /**
-     * Neighborhood.
+     * Assigns {@link #neighbor}: for each subproblem, the {@link #T} subproblems whose weight
+     * vectors are nearest to its own (Euclidean distance), nearest first, itself included.
      */
     protected void initNeighborhood() {
         double[][] dist = new double[populationSize][populationSize];
@@ -191,56 +235,129 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
         }
     }
 
+    /**
+     * One task per initial solution of
+     * {@link SteadyStateEvolutionaryAlgorithm#createInitialSolutions(int)
+     * createInitialSolutions(populationSize)} (the warm start when there is one, random solutions
+     * otherwise), task {@code i} for subproblem {@code i}. A solution whose variables equal those
+     * of an earlier one is replaced by a random solution, up to 1000
+     * times; a duplicate that survives is kept with a warning, and is discarded when its result
+     * arrives. A warm start with more solutions than subproblems assigns solution {@code i} to
+     * subproblem {@code i % populationSize}; one with fewer leaves the remaining slots to the
+     * offspring created later.
+     */
     @Override
     public List<ParallelTask<S>> createInitialTasks() {
-        List<ParallelTask<S>> list = new ArrayList<>();
+        List<S> initial = createInitialSolutions(populationSize);
+        List<ParallelTask<S>> list = new ArrayList<>(initial.size());
         // Track already-created initial solutions locally; populationSignatures is empty at this
         // point (solutions are not yet evaluated), so we cannot use solutionInThePopulation().
         Set<List<?>> seen = new HashSet<>();
-        for (int i = 0; i < populationSize; i++) {
-            S s;
-            int retries = 0;
-            do {
+        int keptDuplicates = 0;
+        for (int i = 0; i < initial.size(); i++) {
+            S s = initial.get(i);
+            boolean duplicate = !seen.add(solutionKey(s));
+            for (int attempt = 0; duplicate && attempt < MAX_DUPLICATE_RETRIES; attempt++) {
                 s = problem.createSolution();
-            } while (!seen.add(solutionKey(s)) && ++retries < MAX_DUPLICATE_RETRIES);
+                duplicate = !seen.add(solutionKey(s));
+            }
+            if (duplicate) {
+                keptDuplicates++;
+            }
 
             long id = createTaskIdentifier();
-            taskSubproblemMap.put(id, i);
+            taskSubproblemMap.put(id, i % populationSize);
             list.add(ParallelTask.create(id, s));
+        }
+        if (keptDuplicates > 0) {
+            Log.warn("MOEAD: " + keptDuplicates + " initial solution(s) still duplicate another one after "
+                    + MAX_DUPLICATE_RETRIES + " random replacements — they are discarded when evaluated");
         }
         return list;
     }
 
+    /**
+     * Counts the result, adds a copy of it to the archive, updates the ideal and nadir points and,
+     * unless the population already holds a solution with the same variables, inserts it: while
+     * the population fills, into the slot of its subproblem (or the nearest free one); afterwards,
+     * into each of the nearest neighbours of its subproblem (at most {@link #maxReplaced}) whose
+     * aggregated value it improves. The duplicate filter is rebuilt after replacements, because
+     * one offspring may take several slots and the solutions it evicts may still fill others.
+     */
     @Override
+    @SuppressWarnings("unchecked")
     public void processComputedTask(ParallelTask<S> task) {
         evaluations++;
         Integer subProb = taskSubproblemMap.remove(task.getIdentifier());
         if (subProb == null) return; // unknown id
 
         S offspring = (S) task.getContents().copy();
-        archive.add(offspring);
+        archive.add((S) offspring.copy());  // never share an instance with the population
 
         synchronized (population) {
             aggregation.update(offspring); // ideal and nadir points
             if (!solutionInThePopulation(offspring)) {
                 if (population.size() < populationSize) {
-                    population.add(offspring); // filling phase
-                    populationSignatures.add(solutionKey(offspring));
+                    fill(offspring, subProb);
                 } else {
                     int replaced = 0;
                     for (int k : neighbor[subProb]) {
                         if (replaced >= maxReplaced) break;
                         S current = population.get(k);
                         if (aggregationFitness(offspring, lambda[k]) < aggregationFitness(current, lambda[k])) {
-                            populationSignatures.remove(solutionKey(current));
                             population.set(k, offspring);
-                            populationSignatures.add(solutionKey(offspring));
                             replaced++;
                         }
+                    }
+                    if (replaced > 0) {
+                        // A set of keys cannot count how many slots hold each solution: rebuild it.
+                        rebuildPopulationSignatures();
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Filling phase: puts {@code solution} in the slot of subproblem {@code subproblem} (or the
+     * nearest free one) and, once every slot is taken, reorders the population so that member
+     * {@code k} is the solution of subproblem {@code k}. Call under the population lock.
+     */
+    private void fill(S solution, int subproblem) {
+        int slot = fillingSlot(fillingSlots, subproblem, neighbor[subproblem]);
+        if (slot < 0) {
+            throw new IllegalStateException("MOEAD: no free slot while the population holds "
+                    + population.size() + " of " + populationSize + " solutions");
+        }
+        fillingSlots.set(slot, solution);
+        population.add(solution);
+        populationSignatures.add(solutionKey(solution));
+        if (population.size() == populationSize) {
+            population.clear();
+            population.addAll(fillingSlots);  // from now on, member k is the solution of subproblem k
+        }
+    }
+
+    /**
+     * The slot a solution created for {@code subproblem} takes while the population fills:
+     * {@code subproblem} itself when free, otherwise the first free one among its
+     * {@code neighbours} (nearest first), otherwise the lowest free slot.
+     *
+     * @param slots      the solution of each subproblem so far, {@code null} for a free slot
+     * @param subproblem the subproblem the solution was created for
+     * @param neighbours the neighbourhood of {@code subproblem}, nearest first
+     * @return the slot, or {@code -1} if every slot is taken
+     */
+    static int fillingSlot(List<?> slots, int subproblem, int[] neighbours) {
+        if (slots.get(subproblem) == null) {
+            return subproblem;
+        }
+        for (int k : neighbours) {
+            if (slots.get(k) == null) {
+                return k;
+            }
+        }
+        return slots.indexOf(null);
     }
 
     /**
@@ -254,47 +371,51 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
 
     private static final int MAX_DUPLICATE_RETRIES = 1000;
 
+    /**
+     * Creates two offspring for a random subproblem and returns a task for one of them, queueing
+     * the other as a spare. With probability {@link #delta}, once the population is full, both
+     * parents come from the subproblem's neighbourhood; otherwise from the whole population.
+     * Copies of the first two children are mutated (a crossover with a single child mates a
+     * second pair of parents, drawn the same way, for the second one; see
+     * {@link SteadyStateEvolutionaryAlgorithm#secondChild}); a pair with a duplicate of a member is
+     * created again, up to 1000 attempts, after which a warning is logged if the last attempt
+     * still produced one. While the population is empty (more workers than initial tasks, or
+     * every initial result still on its way) the task holds a random solution instead.
+     */
     @Override
+    @SuppressWarnings("unchecked")
     public ParallelTask<S> createNewTask() {
         // Synchronize on population for two reasons:
         // 1. processComputedTask() modifies population under this lock; compound operations
         //    (size check → get) must be atomic to avoid IndexOutOfBoundsException.
         // 2. Consistent with SteadyStateEvolutionaryAlgorithm.createNewTask() which also synchronizes.
+        JMetalRandom rnd = JMetalRandom.getInstance();
         final int subP;
         final S child0;
         final S child1;
         synchronized (population) {
-            subP = random.nextInt(populationSize);
-            S c0 = null, c1 = null;
-            int retries = 0;
+            subP = rnd.nextInt(0, populationSize - 1);
+            if (population.isEmpty()) {
+                // No parent yet: a random solution, as the base class does before it can mate.
+                long id = createTaskIdentifier();
+                taskSubproblemMap.put(id, subP);
+                return ParallelTask.create(id, problem.createSolution());
+            }
+            S c0, c1;
+            boolean duplicate;
+            int attempts = 0;
             do {
-                List<S> parents = new ArrayList<>(2);
-                // Use neighborhood mating only when population is fully initialized; neighbor
-                // indices span [0, populationSize-1] so population.size() must be >= populationSize
-                // to guarantee all indices are valid (>= T was insufficient during filling phase).
-                if (random.nextDouble() < delta && population.size() >= populationSize) {
-                    int[] neigh = neighbor[subP];
-                    while (parents.size() < 2) {
-                        parents.add(population.get(neigh[JMetalRandom.getInstance().nextInt(0, T - 1)]));
-                    }
-                } else {
-                    while (parents.size() < 2) {
-                        parents.add(population.get(random.nextInt(Math.max(1, population.size()))));
-                    }
-                }
-
-                List<S> children = crossover.execute(parents);
-                while (children.size() < 2) children.add((S) children.get(0).copy());
-                c0 = (S) children.get(0).copy();
-                c1 = (S) children.get(1).copy();
+                List<S> children = mate(subP, rnd);
+                c0 = (S) child(children, 0).copy();
+                c1 = (S) secondChild(children, () -> mate(subP, rnd)).copy();
                 mutation.execute(c0);
                 mutation.execute(c1);
-                if (++retries >= MAX_DUPLICATE_RETRIES) {
-                    Log.warn("MOEAD: Could not generate non-duplicate solution after "
-                            + MAX_DUPLICATE_RETRIES + " retries, using last generated solution");
-                    break;
-                }
-            } while (solutionInThePopulation(c0) || solutionInThePopulation(c1));
+                duplicate = solutionInThePopulation(c0) || solutionInThePopulation(c1);
+            } while (duplicate && ++attempts < MAX_DUPLICATE_RETRIES);
+            if (duplicate) {
+                Log.warn("MOEAD: Could not generate non-duplicate solution after "
+                        + MAX_DUPLICATE_RETRIES + " retries, using last generated solution");
+            }
             child0 = c0;
             child1 = c1;
         }
@@ -310,6 +431,29 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
             pendingTaskQueue.add(ParallelTask.create(id0, child0));
             return ParallelTask.create(id1, child1);
         }
+    }
+
+    /**
+     * Draws two parents for subproblem {@code subP} and mates them: with probability
+     * {@link #delta}, once the population is full, from the subproblem's neighbourhood; otherwise
+     * from the whole population. Called under the population lock, with a non-empty population.
+     */
+    private List<S> mate(int subP, JMetalRandom rnd) {
+        List<S> parents = new ArrayList<>(2);
+        // Use neighborhood mating only when population is fully initialized; neighbor
+        // indices span [0, populationSize-1] so population.size() must be >= populationSize
+        // to guarantee all indices are valid (>= T was insufficient during filling phase).
+        if (rnd.nextDouble() < delta && population.size() >= populationSize) {
+            int[] neigh = neighbor[subP];
+            while (parents.size() < 2) {
+                parents.add(population.get(neigh[rnd.nextInt(0, T - 1)]));
+            }
+        } else {
+            while (parents.size() < 2) {
+                parents.add(population.get(rnd.nextInt(0, population.size() - 1)));
+            }
+        }
+        return crossover.execute(parents);
     }
 
     /** The aggregated value of {@code s} for the weight vector {@code w} (see {@link MOEADAggregation}). */
@@ -355,11 +499,6 @@ public class MOEAD<S extends Solution<?>> extends SteadyStateEvolutionaryAlgorit
             this.maxReplaced = maxReplacedSolutions;
             aggregation.configure(aggregationFunction, normalizeObjectives);
         }
-    }
-
-    @Override
-    public List<S> getResult() {
-        return new ArrayList<>(archive.solutions());
     }
 
     /* ---------------- public config --------------- */

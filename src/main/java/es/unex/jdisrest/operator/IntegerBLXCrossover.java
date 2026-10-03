@@ -22,14 +22,30 @@ import org.uma.jmetal.util.pseudorandom.RandomGenerator;
  * is drawn from {@code [min - range*α, max + range*α]} where
  * {@code range = max - min}.
  *
- * <p>This is a direct adaptation of the double-coded BLX-α. The only
- * difference is that the sampled real value is truncated to {@code int} after
- * being repaired to the variable bounds.
+ * <p>This is a direct adaptation of jMetal's double-coded {@code BLXAlphaCrossover}, with two
+ * differences:
+ * <ul>
+ *   <li>The sampled real value is repaired to the variable bounds and then rounded to the
+ *       nearest {@code int}. Rounding is symmetric, so the children are centred on the blend
+ *       interval and, with {@code α = 0}, both parent values can be produced. Before 1.2.0 the
+ *       value was truncated toward zero, which pulled the children about half a unit toward 0
+ *       on average and, with {@code α = 0}, never produced the larger parent value of a
+ *       non-negative pair (and almost never the smaller one of a negative pair).</li>
+ *   <li>A variable whose lower and upper bounds are equal has a single feasible value, so both
+ *       children take it without consuming random numbers, whatever the repair. jMetal's
+ *       default repair ({@link RepairDoubleSolutionWithBoundValue}) requires
+ *       {@code lowerBound < upperBound} and would throw on such a variable every time the
+ *       crossover fires; inside a jdisrest master that fails the worker's task request.</li>
+ * </ul>
  *
  * <p>When {@code α = 0} the offspring are restricted to the interval between
  * the parents (no exploration beyond parents). The conventional default is
  * {@code α = 0.5}, which allows moderate exploration; values above 0.5 increase
  * exploration at the cost of diversity loss near the Pareto front.
+ *
+ * <p>All random numbers come from the injected generator, by default {@link JMetalRandom}: one
+ * draw decides whether the crossover is applied and, if it is, two per variable whose bounds
+ * differ. The children are always new copies, never the parents themselves.
  *
  * @author Antonio J. Nebro (original double version)
  * @see RepairDoubleSolution
@@ -142,20 +158,26 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
     // -------------------------------------------------------------------------
 
     /**
-     * Sets the crossover probability.
+     * Sets the crossover probability, with the constructor's check.
      *
      * @param crossoverProbability new probability value in [0,1]
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidProbabilityValueException
+     *         if the value is not in [0, 1]; the probability is then left unchanged
      */
     public void crossoverProbability(double crossoverProbability) {
+        Check.probabilityIsValid(crossoverProbability);
         this.crossoverProbability = crossoverProbability;
     }
 
     /**
-     * Sets the α exploration parameter.
+     * Sets the α exploration parameter, with the constructor's check.
      *
      * @param alpha new alpha value (must be ≥ 0)
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidConditionException
+     *         if {@code alpha} is negative or NaN; α is then left unchanged
      */
     public void alpha(double alpha) {
+        Check.that(alpha >= 0, "Alpha is negative: " + alpha);
         this.alpha = alpha;
     }
 
@@ -168,8 +190,10 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
      *
      * @param solutions list of exactly two parent {@link IntegerSolution}s
      * @return list of two offspring solutions
-     * @throws org.uma.jmetal.util.errorchecking.JMetalException if {@code solutions} is null or
-     *         does not contain exactly two elements
+     * @throws org.uma.jmetal.util.errorchecking.exception.NullParameterException
+     *         if {@code solutions} is null
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidConditionException
+     *         if it does not contain exactly two elements
      */
     @Override
     public List<IntegerSolution> execute(List<IntegerSolution> solutions) {
@@ -192,8 +216,9 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
      *       {@code maxRange = max + range*α}.</li>
      *   <li>Sample two independent uniform values from {@code [minRange, maxRange]}.</li>
      *   <li>Repair each sampled value to the declared variable bounds
-     *       (via {@link #solutionRepair}) and cast to {@code int}.</li>
+     *       (via {@link #solutionRepair}) and round it to the nearest {@code int}.</li>
      * </ol>
+     * A variable whose bounds are equal skips these steps: both children take the bound value.
      * If the random draw is greater than {@code probability} the offspring are
      * returned as copies of the parents (no crossover applied).
      *
@@ -223,6 +248,15 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
                 Bounds<Integer> bounds = parent1.getBounds(i);
                 upperBound = bounds.getUpperBound();
                 lowerBound = bounds.getLowerBound();
+
+                // A fixed variable has a single feasible value. jMetal's bound repair would throw
+                // on it (it requires lowerBound < upperBound), so it is set directly.
+                if (lowerBound == upperBound) {
+                    offspring.get(0).variables().set(i, bounds.getLowerBound());
+                    offspring.get(1).variables().set(i, bounds.getLowerBound());
+                    continue;
+                }
+
                 valueX1 = parent1.variables().get(i);
                 valueX2 = parent2.variables().get(i);
 
@@ -256,14 +290,15 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
                 random = randomGenerator.getRandomValue();
                 valueY2 = minRange + random * (maxRange - minRange);
 
-                // Clip to declared variable bounds before truncating to int.
+                // Clip to declared variable bounds before rounding to int.
                 // solutionRepair clamps the value to [lowerBound, upperBound].
                 valueY1 = solutionRepair.repairSolutionVariableValue(valueY1, lowerBound, upperBound);
                 valueY2 = solutionRepair.repairSolutionVariableValue(valueY2, lowerBound, upperBound);
 
-                // Truncate real value to integer (floor towards zero).
-                offspring.get(0).variables().set(i, (int) valueY1);
-                offspring.get(1).variables().set(i, (int) valueY2);
+                // Round to the nearest integer. Rounding is symmetric, unlike the truncation
+                // toward zero of an (int) cast, which biased every child toward 0.
+                offspring.get(0).variables().set(i, (int) Math.round(valueY1));
+                offspring.get(1).variables().set(i, (int) Math.round(valueY2));
             }
         }
 
@@ -275,6 +310,7 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
      *
      * @return 2
      */
+    @Override
     public int numberOfRequiredParents() {
         return 2;
     }
@@ -284,6 +320,7 @@ public class IntegerBLXCrossover implements CrossoverOperator<IntegerSolution> {
      *
      * @return 2
      */
+    @Override
     public int numberOfGeneratedChildren() {
         return 2;
     }

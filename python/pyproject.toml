@@ -18,7 +18,7 @@ dependencies = [
 jdisrest-worker = "jdisrest._cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest", "responses"]
+dev = ["pytest", "responses", "numpy"]
 
 [tool.setuptools.packages.find]
 where = ["."]

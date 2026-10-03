@@ -21,7 +21,8 @@ import reactor.core.publisher.Mono;
  *       {@code run()} writes it, as at a normal finish.</li>
  * </ul>
  * Use it to end a long run cleanly instead of killing the process, which would lose the
- * final result. The REST server keeps answering until the process exits.
+ * final result. The REST server keeps answering until the program shuts the master down
+ * ({@link es.unex.jdisrest.distributed.AbstractMaster#shutdown()}) or exits.
  *
  * <p>Response codes:
  * <ul>

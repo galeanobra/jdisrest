@@ -5,7 +5,6 @@ import org.uma.jmetal.problem.Problem;
 import es.unex.jdisrest.util.Log;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,8 +30,9 @@ import java.util.function.IntSupplier;
  *
  * <h2>Singleton pattern</h2>
  * Spring Boot beans ({@code TaskController}, {@code WorkerController},
- * {@code WatchdogScheduler}) are initialized by the Spring IoC container before
- * application code constructs the master object. {@link #INSTANCE} provides a static
+ * {@code WatchdogScheduler}) are initialized by the Spring IoC container while the
+ * {@link AbstractMaster} constructor starts the REST server, before this constructor registers
+ * the master. {@link #INSTANCE} provides a static
  * bridge that allows controllers to reach the active master via {@link #getInstance()}.
  * Only one {@code GenerationalMaster} should exist per JVM; a second construction overwrites
  * {@code INSTANCE} with a warning.
@@ -118,6 +118,19 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
         this.populationSize = populationSize;
     }
 
+    /**
+     * Creates a master without a REST server, not registered as the singleton, for the tests of
+     * this package (see {@link AbstractMaster#AbstractMaster()}).
+     *
+     * @param problem        the optimization problem to be solved
+     * @param populationSize the number of individuals per generation
+     */
+    GenerationalMaster(Problem problem, int populationSize) {
+        super();
+        this.problem = problem;
+        this.populationSize = populationSize;
+    }
+
     // ── REST API (called by TaskController) ───────────────────────────────────
 
     /**
@@ -128,37 +141,38 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * {@link #submitTasks(List)} at the start of each generation, so the queue is either
      * already populated or the generation has not started yet.
      *
-     * <p>This method is called from a {@code Schedulers.boundedElastic()} thread by
-     * {@code TaskController} — never from the WebFlux event-loop thread — so blocking
-     * is safe.
+     * <p>This method is called from a virtual thread by {@code TaskController} (see
+     * {@code MasterSpringApp.virtualThreadScheduler()}) — never from the WebFlux event-loop
+     * thread — so blocking is safe, and many workers can wait in the long-poll at once.
      *
      * <p>A task obtained during the long-poll after a stop has been requested
      * ({@link #requestStop()}) is dropped instead of being put in flight, as in
      * {@link SteadyStateMaster#claimNextTask}: a task requeued after the stop, by a failed
      * evaluation or the watchdog, must not keep a waiting worker busy for nothing.
      *
+     * <p>Until the algorithm is ready ({@link #isReady()}) it returns {@code null} at once. A task
+     * handed out is registered with {@link #recordDispatch}, which also requeues the worker's
+     * previous task if it is still in flight.
+     *
      * @param workerId       the unique identifier of the requesting worker
      * @param timeoutSeconds maximum time in seconds to wait for a task if none is
      *                       immediately available (long-poll window)
      * @return the next pending task, or {@code null} if none arrived within
-     *         {@code timeoutSeconds} or a stop has been requested (the HTTP layer returns
-     *         {@code 204 No Content})
+     *         {@code timeoutSeconds}, the algorithm is not ready yet or a stop has been
+     *         requested (the HTTP layer returns {@code 204 No Content})
      * @throws InterruptedException if the thread is interrupted while waiting
      */
     public T claimNextTask(String workerId, int timeoutSeconds) throws InterruptedException {
+        if (!isReady()) {
+            return null;  // 204: the worker asks again a few seconds later
+        }
         T task = pendingTaskQueue.poll(timeoutSeconds, TimeUnit.SECONDS);
         if (task != null && isStopRequested()) {
             return null;  // a stop arrived while the worker was waiting: hand nothing out
         }
         if (task != null) {
             // Register the task as in-flight and mark the worker as busy
-            inFlightTasks.put(task.getIdentifier(), task);
-            workerRegistry.compute(workerId, (id, entry) -> {
-                if (entry == null) entry = new WorkerEntry(workerId);
-                entry.currentTaskId = task.getIdentifier();
-                entry.lastSeen = Instant.now();
-                return entry;
-            });
+            recordDispatch(workerId, task);
         }
         return task;
     }
@@ -196,8 +210,10 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * returns.
      *
      * <p>Liveness is guaranteed by the watchdog ({@link #requeueOrphanTasks}): if a
-     * worker dies while holding a task, the watchdog re-enqueues it within 30 seconds
-     * so another worker can complete it. Without the watchdog, a single worker crash
+     * worker dies while holding a task, the watchdog re-enqueues it once the worker has been
+     * silent for {@link es.unex.jdisrest.util.Timings#WORKER_TIMEOUT_S} seconds (noticed within
+     * another {@link es.unex.jdisrest.util.Timings#WATCHDOG_INTERVAL_S} seconds) so another
+     * worker can complete it. Without the watchdog, a single worker crash
      * could cause this method to block indefinitely.
      *
      * <p>The wait ends early in three cases, each noticed within about a second:

@@ -11,10 +11,11 @@ import reactor.core.publisher.Mono;
  * experiment.
  *
  * <p>Mapped to {@code GET /api/v1/status}. The response is designed to be
- * consumed by monitoring tools (e.g. {@code monitor.py}) without requiring
- * access to the master node's log files. The file-based counterpart written
- * periodically by {@link MasterFacade#writeStatusFile()} uses the exact same
- * JSON format so that both sources can be parsed by the same code.
+ * consumed by monitoring tools without requiring
+ * access to the master node's log files. The file-based counterpart,
+ * {@code status.json}, written periodically once {@link MasterFacade#init} has been
+ * called, uses the exact same JSON format so that both sources can be parsed by the
+ * same code.
  *
  * <p>Example response:
  * <pre>{@code
@@ -62,11 +63,14 @@ public class StatusController {
      *       algorithm started (since {@link MasterFacade#init} was called). Zero if
      *       the algorithm has not yet started.</li>
      *   <li><strong>{@code estimatedSecondsRemaining}</strong> — ETA in seconds,
-     *       computed as {@code elapsedSeconds / progress * (1 - progress)}.
+     *       computed as {@code elapsedSeconds / progress * (1 - progress)} from the
+     *       clamped {@code progress}, so it is never negative ({@code 0} once the budget
+     *       is reached but the run has not finished yet).
      *       Returns {@code -1} when progress is below 1 % (not yet computable),
      *       when the algorithm has already finished, or when elapsed time is zero.</li>
-     *   <li><strong>{@code aliveWorkers}</strong> — number of workers that have sent
-     *       a heartbeat within the last 45 seconds.</li>
+     *   <li><strong>{@code aliveWorkers}</strong> — number of workers heard from
+     *       (heartbeat, task claim or result) within the last
+     *       {@link es.unex.jdisrest.util.Timings#WORKER_TIMEOUT_S} seconds.</li>
      *   <li><strong>{@code inFlightTasks}</strong> — number of tasks currently
      *       claimed by workers and awaiting a result or error response.</li>
      *   <li><strong>{@code pendingTasks}</strong> — number of tasks sitting in
@@ -78,12 +82,16 @@ public class StatusController {
      *       luck.</li>
      * </ul>
      *
+     * <p>Before the master is ready (it is still building its initial state) the run
+     * is reported as running and not finished, with zero progress.
+     *
      * <p>This endpoint runs on the Netty event-loop thread; all reads from
      * {@link MasterFacade} are non-blocking atomic reads or lock-free queue
-     * size queries.
+     * size queries, plus the master's stopping condition ({@code finished}), which must
+     * therefore be cheap.
      *
      * @return a {@link Mono} emitting a {@code 200 OK} {@link ResponseEntity}
-     *         whose body is an ordered map of progress fields
+     *         whose body is a {@link StatusSnapshot}
      */
     @GetMapping
     public Mono<ResponseEntity<StatusSnapshot>> status() {

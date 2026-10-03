@@ -75,12 +75,21 @@ import java.util.function.Supplier;
  *       after {@code init}, which would otherwise overwrite the budget of a change, and after
  *       the start record, which would otherwise follow the first change in the log.</li>
  *   <li>The algorithm runs, and its result is written to {@code VAR.csv} and {@code FUN.csv}
- *       in the working directory.</li>
+ *       in the working directory (both empty for a run stopped before its first result).</li>
+ *   <li>The master is shut down ({@code AbstractMaster.shutdown()}), also when a step after
+ *       the second one fails: {@code .master-endpoint} is deleted, so that workers started later
+ *       do not connect to a master that is gone, the REST server closes, and {@code status.json}
+ *       gets a final snapshot that reports the run as finished. Workers that asked for a task
+ *       before the close got {@code 410} and stopped; those still evaluating find the master
+ *       gone and stop after their failed heartbeats or requests, typically 10 to 25 s later
+ *       (the bundled Python worker started from the endpoint file then sees the file deleted
+ *       and ends as finished, not as having lost its master).</li>
  * </ol>
  *
- * <p>Every failure is caught and turned into status 1: the REST server keeps the JVM alive, so a
- * {@code main} that let an exception escape would never end. {@link #main} always ends in
- * {@link System#exit}.
+ * <p>Every failure is caught and turned into status 1, and {@link #main} always ends in
+ * {@link System#exit}: a failure while the algorithm is being built can leave a REST server
+ * running that nothing can shut down, and the problem may have threads of its own, either of
+ * which would keep the JVM alive.
  *
  * @author Francisco Luna (Universidad de Málaga)
  * @author Jesús Galeano Brajones (Universidad de Extremadura)
@@ -119,8 +128,10 @@ public final class ConfiguredMaster {
     /**
      * Runs the master of a problem with {@code <host> <port> <configFile> [key=value ...]}, or
      * only checks the configuration with {@code --check <configFile> [key=value ...]}. Never
-     * throws: every failure is reported and gives status 1. The caller should pass the status to
-     * {@link System#exit}, because the REST server keeps the JVM alive after a run.
+     * throws: every failure is reported and gives status 1. The master is shut down before this
+     * method returns (see the class description), but the caller should still pass the status to
+     * {@link System#exit}: a failure while the algorithm is being built can leave a REST server
+     * running that nothing can shut down.
      *
      * @param problemFactory creates the problem, once, after the arguments have been checked
      * @param title          how messages name the problem, for instance its class name
@@ -239,25 +250,43 @@ public final class ConfiguredMaster {
         Log.info(title + " configuration: " + config.describe());
         SteadyStateEvolutionaryAlgorithm<DoubleSolution> algorithm =
                 createAlgorithm(launch.host(), launch.port(), problem, config);
-        MasterFacade.init(config.maxEvaluations(), STATUS_FILE_INTERVAL_S);
         try {
-            Path copy = history.recordStart(config);
-            if (copy != null) {
-                Log.info("Configuration recorded in " + copy);
+            MasterFacade.init(config.maxEvaluations(), STATUS_FILE_INTERVAL_S);
+            try {
+                Path copy = history.recordStart(config);
+                if (copy != null) {
+                    Log.info("Configuration recorded in " + copy);
+                }
+            } catch (IOException e) {
+                Log.warn("Could not record the configuration in the traces folder (" + e
+                        + ") — running without the record");
             }
-        } catch (IOException e) {
-            Log.warn("Could not record the configuration in the traces folder (" + e
-                    + ") — running without the record");
-        }
-        MasterFacade.setConfigurationHandler(new AlgorithmReconfiguration(algorithm, config, problem, history));
-        algorithm.run();
+            MasterFacade.setConfigurationHandler(new AlgorithmReconfiguration(algorithm, config, problem, history));
+            algorithm.run();
 
-        // A run stopped before its first result has none, and the archive behind getResult()
-        // throws when it is empty.
-        List<DoubleSolution> result = algorithm.getEvaluations() > 0 ? algorithm.getResult() : List.of();
-        TraceWriter.write(result, VARIABLES_FILE, OBJECTIVES_FILE, ",");
-        Log.info(title + " finished after " + algorithm.getEvaluations() + " evaluations: " + result.size()
-                + " solutions written to " + VARIABLES_FILE + " and " + OBJECTIVES_FILE);
+            // Empty for a run stopped before its first result.
+            List<DoubleSolution> result = algorithm.getResult();
+            TraceWriter.write(result, VARIABLES_FILE, OBJECTIVES_FILE, ",");
+            Log.info(title + " finished after " + algorithm.getEvaluations() + " evaluations: " + result.size()
+                    + " solutions written to " + VARIABLES_FILE + " and " + OBJECTIVES_FILE);
+        } finally {
+            shutDown(algorithm);
+        }
+    }
+
+    /**
+     * Shuts the master down ({@code AbstractMaster.shutdown()}), after the result has been written
+     * or the run has failed: {@code .master-endpoint} is deleted, the REST server closes, so the
+     * workers stop once they find the master gone, and {@code status.json} gets its final
+     * snapshot. A failure here is only logged, so that it neither hides the failure of the run
+     * nor fails a run whose result is already written.
+     */
+    private static void shutDown(SteadyStateEvolutionaryAlgorithm<DoubleSolution> algorithm) {
+        try {
+            algorithm.shutdown();
+        } catch (RuntimeException e) {
+            Log.error("Could not shut the master down cleanly: " + e + " — the result is not affected", e);
+        }
     }
 
     // ── Algorithms ────────────────────────────────────────────────────────────

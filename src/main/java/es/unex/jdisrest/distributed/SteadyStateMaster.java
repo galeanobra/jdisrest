@@ -20,15 +20,16 @@ import java.util.concurrent.*;
  *
  * <h2>Singleton pattern</h2>
  * Spring Boot beans ({@code TaskController}, {@code WorkerController},
- * {@code WatchdogScheduler}) are instantiated by the Spring IoC container before the
- * algorithm object is constructed by application code. {@link #INSTANCE} provides a
+ * {@code WatchdogScheduler}) are instantiated by the Spring IoC container while the
+ * {@link AbstractMaster} constructor starts the REST server, before this constructor registers
+ * the master. {@link #INSTANCE} provides a
  * static bridge that controllers can call via {@link #getInstance()} to reach the master.
  * Only one {@code SteadyStateMaster} instance should be active per JVM; constructing a second
  * instance overwrites {@code INSTANCE} with a warning.
  *
  * <h2>Task-creation lock</h2>
  * {@link #claimNextTask(String, int)} may be invoked concurrently from multiple
- * WebFlux {@code boundedElastic} threads when several workers poll for work
+ * request threads of the REST layer when several workers poll for work
  * simultaneously. The {@link #taskCreationLock} guard ensures that
  * {@link #createNewTask()} is called by at most one thread at a time, preventing
  * duplicate offspring from being generated in parallel.
@@ -69,7 +70,8 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * Mutex that serializes on-demand task creation inside {@link #claimNextTask}.
      *
      * <p>When the pending queue is empty and the algorithm is still running, multiple
-     * WebFlux threads may attempt to call {@link #createNewTask()} concurrently. This
+     * request threads (the virtual threads {@code TaskController} runs its handlers on) may
+     * attempt to call {@link #createNewTask()} concurrently. This
      * lock ensures only one thread enters the task-creation critical section at a time.
      * After acquiring the lock each thread re-checks the queue ({@code double-checked
      * locking} pattern) to avoid generating a task if another thread has already done so.
@@ -95,14 +97,25 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
         this.problem = problem;
     }
 
+    /**
+     * Creates a master without a REST server, not registered as the singleton, for the tests of
+     * this package (see {@link AbstractMaster#AbstractMaster()}).
+     *
+     * @param problem the optimization problem to be solved
+     */
+    SteadyStateMaster(Problem problem) {
+        super();
+        this.problem = problem;
+    }
+
     // ── REST API (called by TaskController) ───────────────────────────────────
 
     /**
      * Handles a worker's request for the next evaluation task.
      *
-     * <p>This method is called from a {@code Schedulers.boundedElastic()} thread by
-     * {@code TaskController} — never from the WebFlux event-loop thread — so blocking
-     * is safe.
+     * <p>This method is called from a virtual thread by {@code TaskController} (see
+     * {@code MasterSpringApp.virtualThreadScheduler()}) — never from the WebFlux event-loop
+     * thread — so blocking is safe.
      *
      * <p>The dispatch sequence is:
      * <ol>
@@ -114,7 +127,8 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      *       perform a timed poll for up to {@code timeoutSeconds} — this is the
      *       long-polling window.</li>
      *   <li>If a task was obtained, move it to {@link #inFlightTasks} and update the
-     *       worker's registry entry.</li>
+     *       worker's registry entry ({@link #recordDispatch}, which also requeues the
+     *       worker's previous task if it is still in flight).</li>
      * </ol>
      *
      * <p>Once a stop has been requested ({@link #requestStop()}) it hands out nothing: it
@@ -122,19 +136,24 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
      * instead of being put in flight. {@code TaskController} checks {@link #isFinished()}
      * before calling this method, so the worker gets {@code 410 Gone} on its next request.
      * A stop that lands between the last check and the dispatch still lets that one task
-     * out; its result is then refused by {@link #submitResult}.
+     * out; its result is then refused by
+     * {@link #submitResult(long, String, java.util.function.Consumer)}.
+     *
+     * <p>Until the algorithm is ready ({@link #isReady()}) it also returns {@code null} at once,
+     * without consulting the stopping condition or creating a task: the worker gets
+     * {@code 204 No Content} and asks again a few seconds later.
      *
      * @param workerId       the unique identifier of the requesting worker
      * @param timeoutSeconds maximum time in seconds to wait for a task if none is
      *                       immediately available (long-poll window)
      * @return the next task for the worker to evaluate, or {@code null} if no task
-     *         became available within {@code timeoutSeconds} (the HTTP layer returns
-     *         {@code 204 No Content} in that case)
+     *         became available within {@code timeoutSeconds} or the algorithm is not ready
+     *         yet (the HTTP layer returns {@code 204 No Content} in that case)
      * @throws InterruptedException if the thread is interrupted while waiting
      */
     public T claimNextTask(String workerId, int timeoutSeconds) throws InterruptedException {
-        if (isStopRequested()) {
-            return null;  // the worker gets 410 Gone on its next request
+        if (isStopRequested() || !isReady()) {
+            return null;  // 410 Gone, or 204 until the algorithm can serve
         }
         T task = pendingTaskQueue.poll();
 
@@ -156,19 +175,11 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
             task = null;  // a stop arrived while the worker was waiting: hand nothing out
         }
 
-        final T finalTask = task;
-
-        if (finalTask != null) {
+        if (task != null) {
             // Register the task as in-flight and mark the worker as busy
-            inFlightTasks.put(finalTask.getIdentifier(), finalTask);
-            workerRegistry.compute(workerId, (id, entry) -> {
-                if (entry == null) entry = new WorkerEntry(workerId);
-                entry.currentTaskId = finalTask.getIdentifier();
-                entry.lastSeen = Instant.now();
-                return entry;
-            });
+            recordDispatch(workerId, task);
         }
-        return finalTask;
+        return task;
     }
 
     // ── SteadyStateAlgorithm implementation ────────────────────────────────────────────
@@ -265,7 +276,8 @@ public abstract class SteadyStateMaster<T extends ParallelTask<?>, R> extends Ab
 
     /**
      * Returns the number of registered workers that are currently idle (not evaluating
-     * any task) and have sent a heartbeat within the last 45 seconds.
+     * any task) and have been heard from within the last {@link Timings#WORKER_TIMEOUT_S}
+     * seconds.
      *
      * <p>A worker is considered idle when its {@link WorkerEntry#currentTaskId} is
      * {@code -1}. This information can be used by callers to decide whether to pre-fill

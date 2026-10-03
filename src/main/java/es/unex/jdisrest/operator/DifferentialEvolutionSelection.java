@@ -31,9 +31,22 @@ import java.util.stream.Collectors;
  *
  * <p>Before each call to {@link #execute}, the caller must set
  * {@link #currentSolutionIndex} via {@link #setIndex(int)} so the operator knows
- * which solution is the current target.
+ * which solution is the current target. That index is mutable state, so an instance must not
+ * be shared by threads that select concurrently.
  *
- * @param <S> the solution type; must extend {@link DoubleSolution}
+ * <p>The current target is never drawn at random, so the population must hold at least
+ * {@code numberOfSolutionsToSelect + 1} solutions when the target is excluded (4 for
+ * DE/rand/1) and {@code numberOfSolutionsToSelect} when it is included. This class started as
+ * a copy of jMetal's {@code DifferentialEvolutionSelection}; since 1.2.0 it no longer shares
+ * that class's defects: a population one solution too small made {@link #execute} loop forever
+ * (it is now rejected), an index equal to the population size was accepted (it now fails the
+ * index check instead of excluding nothing or throwing an {@code IndexOutOfBoundsException}),
+ * and a request for no random individual still drew one (it now draws none).
+ *
+ * <p>No algorithm of jdisrest uses this operator; it is meant for custom DE algorithms.
+ *
+ * @param <S> unused: the operator works on lists of {@link DoubleSolution}; the parameter is
+ *            kept for source compatibility
  */
 public class DifferentialEvolutionSelection<S extends DoubleSolution> implements SelectionOperator<List<DoubleSolution>, List<DoubleSolution>> {
 
@@ -82,11 +95,21 @@ public class DifferentialEvolutionSelection<S extends DoubleSolution> implements
      * Full constructor.
      *
      * @param randomGenerator           bounded integer random generator
-     * @param numberOfSolutionsToSelect total number of solutions to return
+     * @param numberOfSolutionsToSelect total number of solutions to return: at least 0, and at
+     *                                  least 1 when the current target is included
      * @param selectCurrentSolution     if {@code true}, include the current target
      *                                  as the last selected solution
+     * @throws org.uma.jmetal.util.errorchecking.exception.NullParameterException
+     *         if the generator is {@code null}
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidConditionException
+     *         if the number of solutions is out of range
      */
     public DifferentialEvolutionSelection(BoundedRandomGenerator<Integer> randomGenerator, int numberOfSolutionsToSelect, boolean selectCurrentSolution) {
+        Check.notNull(randomGenerator, "randomGenerator");
+        Check.that(numberOfSolutionsToSelect >= (selectCurrentSolution ? 1 : 0),
+                "The number of solutions to select must be at least " + (selectCurrentSolution ? 1 : 0)
+                        + (selectCurrentSolution ? " to include the current solution: " : ": ")
+                        + numberOfSolutionsToSelect);
         this.randomGenerator = randomGenerator;
         this.numberOfSolutionsToSelect = numberOfSolutionsToSelect;
         this.selectCurrentSolution = selectCurrentSolution;
@@ -112,27 +135,37 @@ public class DifferentialEvolutionSelection<S extends DoubleSolution> implements
      * current target is appended at the end after the random draws).
      *
      * @param solutionList the full population; must contain at least
-     *                     {@link #numberOfSolutionsToSelect} elements
+     *                     {@link #numberOfSolutionsToSelect} + 1 elements when the current
+     *                     target is excluded, {@link #numberOfSolutionsToSelect} when it is
+     *                     included
      * @return a list of {@link #numberOfSolutionsToSelect} distinct solutions
-     * @throws org.uma.jmetal.util.errorchecking.JMetalException if {@code solutionList}
-     *         is {@code null}, the index is out of range, or the population is too small
+     * @throws org.uma.jmetal.util.errorchecking.exception.NullParameterException
+     *         if {@code solutionList} is {@code null}
+     * @throws org.uma.jmetal.util.errorchecking.exception.InvalidConditionException
+     *         if the index is not in {@code [0, size)} or the population is too small
      */
     @Override
     public List<DoubleSolution> execute(List<DoubleSolution> solutionList) {
         Check.notNull(solutionList);
-        Check.that((currentSolutionIndex >= 0) && (currentSolutionIndex <= solutionList.size()), "Index value invalid: " + currentSolutionIndex);
-        Check.that(solutionList.size() >= numberOfSolutionsToSelect, "The population has less than " + numberOfSolutionsToSelect + " solutions: " + solutionList.size());
-
-        List<Integer> indexList = new ArrayList<>();
+        Check.that((currentSolutionIndex >= 0) && (currentSolutionIndex < solutionList.size()), "Index value invalid: " + currentSolutionIndex);
 
         int solutionsToSelect = selectCurrentSolution ? numberOfSolutionsToSelect - 1 : numberOfSolutionsToSelect;
 
-        do {
+        // The current target is never drawn at random, so only size - 1 indices are eligible;
+        // asking for more would make the rejection loop below run forever.
+        Check.that(solutionList.size() - 1 >= solutionsToSelect,
+                "The population has " + solutionList.size() + " solutions, but selecting "
+                        + numberOfSolutionsToSelect + (selectCurrentSolution ? " including" : " besides")
+                        + " the current one needs at least " + (solutionsToSelect + 1));
+
+        List<Integer> indexList = new ArrayList<>(numberOfSolutionsToSelect);
+
+        while (indexList.size() < solutionsToSelect) {
             int index = randomGenerator.getRandomValue(0, solutionList.size() - 1);
             if (index != currentSolutionIndex && !indexList.contains(index)) {
                 indexList.add(index);
             }
-        } while (indexList.size() < solutionsToSelect);
+        }
 
         if (selectCurrentSolution) {
             indexList.add(currentSolutionIndex);

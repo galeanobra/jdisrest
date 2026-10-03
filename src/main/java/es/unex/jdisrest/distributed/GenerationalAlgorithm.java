@@ -19,9 +19,9 @@ import java.util.List;
  * <ol>
  *   <li>Create and submit the initial population tasks.</li>
  *   <li>Wait for all initial evaluations to complete.</li>
- *   <li>While no stop has been requested and the stopping condition is not met: call
- *       {@link #evolution(List)}, which applies selection and variation, submits the
- *       offspring ({@link #submitTasks(List)}) and waits for them
+ *   <li>While no stop has been requested, the thread has not been interrupted and the
+ *       stopping condition is not met: call {@link #evolution(List)}, which applies selection
+ *       and variation, submits the offspring ({@link #submitTasks(List)}) and waits for them
  *       ({@link #waitForEvaluatedTasks()}) itself.</li>
  * </ol>
  *
@@ -126,8 +126,8 @@ public interface GenerationalAlgorithm<T extends ParallelTask<?>, R> {
      * <ol>
      *   <li>Create and submit the initial population as tasks.</li>
      *   <li>Block until all initial evaluations complete ({@link #waitForEvaluatedTasks()}).</li>
-     *   <li>Repeat until a stop is requested ({@link #isStopRequested()}) or the stopping
-     *       condition is met:
+     *   <li>Repeat until a stop is requested ({@link #isStopRequested()}), the thread is
+     *       interrupted or the stopping condition is met:
      *     <ol>
      *       <li>Call {@link #evolution(List)} with the population list; it submits the next
      *           generation and waits for it itself.</li>
@@ -138,12 +138,18 @@ public interface GenerationalAlgorithm<T extends ParallelTask<?>, R> {
      * <p>Note that {@code evolution()} receives the evaluated population and is expected to
      * update it in place as well as submit and wait for the offspring tasks; the same list is
      * passed on every call.
+     *
+     * <p>An interrupt of the thread running the loop also ends it, before the next generation:
+     * {@link #waitForEvaluatedTasks()} returns at once while the interrupt flag is set, so the
+     * loop would otherwise spin through generations that are never awaited. The flag is left set,
+     * so the caller can tell an interrupted run from a finished one through
+     * {@code Thread.currentThread().isInterrupted()}.
      */
     default void run() {
         List<T> initialTasks = createInitialTasks();
         submitTasks(initialTasks);
         List<T> population = waitForEvaluatedTasks();
-        while (!isStopRequested() && stoppingConditionIsNotMet()) {
+        while (!isStopRequested() && !Thread.currentThread().isInterrupted() && stoppingConditionIsNotMet()) {
             evolution(population);
         }
     }

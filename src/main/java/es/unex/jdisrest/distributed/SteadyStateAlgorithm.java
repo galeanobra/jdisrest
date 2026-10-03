@@ -44,7 +44,9 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
      * <p>Implementations may load a warm-start population from a file (e.g., {@code iVAR.csv})
      * or generate random solutions using the problem's {@code createSolution()} factory method.
      *
-     * @return a non-empty list of tasks ready to be dispatched to workers
+     * @return the tasks ready to be dispatched to workers; usually one per member of the
+     *         population (the bundled algorithms create the tasks they are short of on demand,
+     *         in {@link #createNewTask()})
      */
     List<T> createInitialTasks();
 
@@ -88,21 +90,26 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
     /**
      * Creates the next task by applying crossover and mutation to the current population.
      *
-     * <p>Implementations should be thread-safe with respect to the population because
-     * {@link SteadyStateMaster#claimNextTask} may call this method concurrently from multiple
-     * WebFlux worker threads. Generating two offspring at once and enqueuing the spare
-     * in {@code pendingTaskQueue} is a common pattern to amortise the cost of selection.
+     * <p>{@link SteadyStateMaster#claimNextTask} calls this method on the virtual thread that
+     * serves the request of the worker asking for work, one call at a time (it holds a
+     * task-creation lock), while the algorithm thread may be processing a result in
+     * {@link #processComputedTask}.
+     * Implementations must therefore guard the population against that thread (the bundled
+     * algorithms read it under {@code synchronized (population)}, the lock under which it is
+     * modified). Generating two offspring at once and enqueuing the spare in
+     * {@code pendingTaskQueue} is a common pattern to amortise the cost of selection.
      *
      * @return a new, unevaluated task ready to be dispatched to a worker
      */
     T createNewTask();
 
     /**
-     * Returns the next task from the pending queue without blocking (non-destructive poll).
-     * Returns {@code null} immediately if the queue is empty.
+     * Removes and returns the next task of the pending queue, without blocking; returns
+     * {@code null} immediately if the queue is empty. The framework itself does not call it.
      *
      * @return the next pending task, or {@code null} if none is available
-     * @throws InterruptedException if the thread is interrupted while waiting
+     * @throws InterruptedException declared for implementations that wait; the bundled one
+     *                              never throws it
      */
     T getPendingTask() throws InterruptedException;
 
@@ -142,7 +149,8 @@ public interface SteadyStateAlgorithm<T extends ParallelTask<?>, R> {
 
     /**
      * Returns the number of workers that are currently registered and idle (not evaluating
-     * any task). Used to decide how eagerly to pre-fill the pending queue.
+     * any task). The framework itself does not call it; an implementation may use it to decide
+     * how eagerly to pre-fill the pending queue.
      *
      * @return the count of idle, recently-seen workers
      */

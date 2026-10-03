@@ -19,6 +19,14 @@ log = logging.getLogger("jdisrest")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
+# Exit status of main() when the worker gave the master up as lost, so that a batch script can
+# tell a worker that ran to the end (0) from one whose master is gone. A worker that came from an
+# endpoint file and was still busy when the master shut down at the end of the run finds the file
+# deleted and exits with 0 (see Worker.run); one given --master cannot tell, and exits with 3 then
+# too. 1 and 2 are taken.
+EXIT_MASTER_LOST = 3
+_MASTER_LOST = Worker.MASTER_LOST
+
 
 def add_worker_arguments(parser: argparse.ArgumentParser) -> None:
     """
@@ -56,7 +64,7 @@ def configure_logging(level: int | str = "INFO") -> None:
     logging.basicConfig(level=level, format=LOG_FORMAT)
 
 
-def run_worker(args: argparse.Namespace, evaluate: Evaluator | Callable[[Variables], EvalResult]) -> None:
+def run_worker(args: argparse.Namespace, evaluate: Evaluator | Callable[[Variables], EvalResult]) -> str:
     """
     Connects to the master given by the options of :func:`add_worker_arguments` and evaluates its
     tasks until the run finishes, the master is gone or the worker is interrupted.
@@ -64,6 +72,10 @@ def run_worker(args: argparse.Namespace, evaluate: Evaluator | Callable[[Variabl
     Args:
         args:     Parsed options with ``master``, ``endpoint``, ``timeout`` and ``worker_id``.
         evaluate: An :class:`Evaluator` or a function, as :meth:`Worker.run` takes them.
+
+    Returns:
+        Why the worker stopped, as :meth:`Worker.run` returns it: ``"finished"``,
+        ``"master-lost"`` or ``"interrupted"``.
 
     Raises:
         ValueError: if ``args.master`` is an empty string, for instance an unset variable in a
@@ -80,7 +92,7 @@ def run_worker(args: argparse.Namespace, evaluate: Evaluator | Callable[[Variabl
         worker = Worker(args.master, worker_id=args.worker_id)
     else:
         worker = Worker.wait_for_endpoint(args.endpoint, timeout=args.timeout, worker_id=args.worker_id)
-    worker.run(evaluate)
+    return worker.run(evaluate)
 
 
 def _load_evaluator(spec: str, code_dir: str | None = None, number_of_variables: int | None = None,
@@ -115,8 +127,12 @@ def _load_evaluator(spec: str, code_dir: str | None = None, number_of_variables:
 
 def main(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
     """
-    Runs the command-line worker; returns the exit status (0 once the worker stops, 1 if the
-    evaluator cannot be loaded or the master's endpoint file never appears, 2 for bad options).
+    Runs the command-line worker; returns the exit status: 0 once the worker stops because the
+    run finished or was stopped, or because the worker was interrupted; 3
+    (:data:`EXIT_MASTER_LOST`) when it gave the master up as lost (with ``--master``, also when
+    the master shut down at the end of the run while the worker was busy; see
+    :data:`EXIT_MASTER_LOST`); 1 if the evaluator cannot be loaded or the master's endpoint file
+    never appears; 2 for bad options.
 
     SIGTERM, which batch schedulers send to cancel or preempt a job, interrupts the worker as
     Ctrl+C does, so it stops cleanly; the task it was evaluating is requeued by the master's
@@ -132,16 +148,17 @@ def main(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
         return 1
     previous = _interrupt_on_sigterm()
     try:
-        run_worker(args, evaluator)
+        reason = run_worker(args, evaluator)
     except TimeoutError as error:
         log.error(str(error))
         return 1
     except KeyboardInterrupt:
         log.info("Worker interrupted before connecting to the master")
+        return 0
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
-    return 0
+    return EXIT_MASTER_LOST if reason == _MASTER_LOST else 0
 
 
 def _parser(prog: str | None) -> argparse.ArgumentParser:

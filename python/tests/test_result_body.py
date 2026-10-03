@@ -1,6 +1,6 @@
 """Wire-format rules of the result body built by the worker."""
 import math
-import numbers
+from types import MappingProxyType
 
 import pytest
 
@@ -70,4 +70,28 @@ def test_coerce_accepts_scalar_dict_and_objects():
 
     r = _coerce(Obj())
     assert r.objectives == [2.0] and r.constraints is None and r.variables == [0.5, 1.5]
-    assert isinstance(FakeNumpyInt(1), numbers.Integral)
+
+
+def test_coerce_accepts_a_sequence_of_objectives():
+    assert _coerce([1.0, 2.0]).objectives == [1.0, 2.0]
+    assert _coerce((3, 4.5)).objectives == [3, 4.5]
+    assert _result_body("w", _coerce((3, 4.5)), 0)["objectives"] == [3.0, 4.5]
+
+
+def test_coerce_accepts_any_mapping():
+    r = _coerce(MappingProxyType({"objectives": [1.0], "constraints": [-1.0]}))
+    assert (r.objectives, r.constraints, r.variables) == ([1.0], [-1.0], None)
+
+
+@pytest.mark.parametrize("bad", [None, "1.0", b"1", True, object()])
+def test_coerce_rejects_what_is_not_a_result(bad):
+    with pytest.raises(TypeError, match=f"Cannot convert {type(bad).__name__} to EvalResult"):
+        _coerce(bad)
+
+
+@pytest.mark.parametrize("empty", [[], ()])
+def test_a_result_without_objectives_is_rejected_before_sending(empty):
+    with pytest.raises(ValueError, match="at least one objective"):
+        _result_body("w", _coerce(empty), 0)
+    with pytest.raises(ValueError, match="at least one objective"):
+        _result_body("w", EvalResult(objectives=list(empty)), 0)

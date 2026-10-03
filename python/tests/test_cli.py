@@ -54,10 +54,15 @@ def code(tmp_path):
 
 @pytest.fixture
 def workers(monkeypatch):
-    """Replaces Worker in the command line with a stand-in that records how it is used; returns those created."""
+    """
+    Replaces Worker in the command line with a stand-in that records how it is used and whose run
+    returns ``StandIn.reason``; returns those created.
+    """
     created = []
 
     class StandIn:
+        reason = jdisrest.Worker.FINISHED
+
         def __init__(self, master_url, worker_id=None):
             self.master_url, self.worker_id, self.endpoint, self.evaluator = master_url, worker_id, None, None
             created.append(self)
@@ -70,6 +75,7 @@ def workers(monkeypatch):
 
         def run(self, evaluate):
             self.evaluator = evaluate
+            return self.reason
 
     monkeypatch.setattr(_cli, "Worker", StandIn)
     return created
@@ -202,6 +208,14 @@ def test_run_worker_rejects_a_master_url_without_a_scheme(workers):
     assert workers == []
 
 
+@pytest.mark.parametrize("reason", [jdisrest.Worker.FINISHED, jdisrest.Worker.MASTER_LOST,
+                                    jdisrest.Worker.INTERRUPTED])
+def test_run_worker_returns_why_the_worker_stopped(workers, monkeypatch, reason):
+    monkeypatch.setattr(_cli.Worker, "reason", reason)
+
+    assert run_worker(_namespace(master="http://m:1"), lambda variables: 1.0) == reason
+
+
 @pytest.mark.parametrize("url", ["http://10.0.0.1:8080", "https://master.example:443/", "HTTP://M:1"])
 def test_http_and_https_master_urls_are_accepted(url):
     assert _parse("--evaluator", "fit:evaluate", "--master", url).master == url
@@ -216,6 +230,39 @@ def test_main_loads_the_evaluator_and_runs_the_worker(code, workers):
     assert status == 0
     assert [(w.master_url, w.worker_id) for w in workers] == [("http://m:1", "w-1")]
     assert workers[0].evaluator.evaluate([1.0, 2.0]).objectives == [3.0, 2.0]
+
+
+@pytest.mark.parametrize("reason, status", [(jdisrest.Worker.FINISHED, 0), (jdisrest.Worker.INTERRUPTED, 0),
+                                            (jdisrest.Worker.MASTER_LOST, 3)])
+def test_main_exits_with_3_only_when_the_master_was_lost(code, workers, monkeypatch, reason, status):
+    monkeypatch.setattr(_cli.Worker, "reason", reason)
+
+    assert _cli.main(["--evaluator", "fit:evaluate", "--code-dir", str(code), "--master", "http://m:1"]) == status
+    assert _cli.EXIT_MASTER_LOST == 3
+
+
+@pytest.mark.parametrize("deleted, status", [(True, 0), (False, 3)])
+def test_main_exits_with_0_when_the_master_shut_down_under_a_busy_worker_and_with_3_when_it_died(
+        code, tmp_path, monkeypatch, deleted, status):
+    responses = pytest.importorskip("responses")
+    import requests
+    for delay in ("RETRY_DELAY", "NO_TASK_DELAY", "HEARTBEAT_RETRY_DELAY"):
+        monkeypatch.setattr(jdisrest.Worker, delay, 0)
+    master = "http://master.test:8080"
+    endpoint = tmp_path / ".master-endpoint"
+    endpoint.write_text(f'{{"url": "{master}"}}')
+
+    def refused(request):
+        if deleted:
+            endpoint.unlink(missing_ok=True)  # shutdown() deletes the file, then closes the server
+        return requests.ConnectionError("refused")
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add_callback(responses.GET, f"{master}/api/v1/tasks/next", callback=refused)
+        rsps.add_callback(responses.POST, f"{master}/api/v1/workers/heartbeat", callback=refused)
+
+        assert _cli.main(["--evaluator", "fit:evaluate", "--code-dir", str(code),
+                          "--endpoint", str(endpoint), "--timeout", "0"]) == status
 
 
 def test_main_fails_without_connecting_when_the_evaluator_cannot_be_loaded(tmp_path, workers, caplog):

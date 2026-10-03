@@ -25,8 +25,9 @@ import com.fasterxml.jackson.annotation.Nulls;
  *                                  {@code [0.0, 1.0]}; {@code 0.0} when the budget is
  *                                  unknown
  * @param elapsedSeconds            wall-clock seconds since the algorithm started
- * @param estimatedSecondsRemaining ETA in seconds; {@code -1} when not yet computable
- *                                  (progress {@literal <} 1 % or run finished)
+ * @param estimatedSecondsRemaining ETA in seconds ({@code 0} or more), or {@code -1} when
+ *                                  not computable (progress {@literal <} 1 %, run
+ *                                  finished, or no time elapsed yet)
  * @param aliveWorkers              workers seen within the heartbeat timeout window
  * @param inFlightTasks             tasks currently held by workers
  * @param pendingTasks              tasks waiting in the dispatch queue

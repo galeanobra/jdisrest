@@ -255,6 +255,81 @@ class TaskControllerTest {
     }
 
     @Test
+    void lamarckianVariablesOutsideTheBoundsAreRejectedBeforeAnyWrite() {
+        IntegerSolution integer = intSolution(1, 0, 5, 6);
+        String r = TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(1, 1001)), integer);
+        assertEquals("variables[1] = 1001 is outside the bounds [-1000, 1000] of its variable", r);
+
+        DoubleSolution real = doubleSolution(1, 0, 0, 0);
+        r = TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(-1000.5, 0)), real);
+        assertNotNull(r);
+        assertTrue(r.startsWith("variables[0] = -1000.5 is outside the bounds"), r);
+
+        CompositeSolution mixed = new CompositeSolution(List.of(intSolution(1, 0, 1, 2), doubleSolution(1, 0, 0, 0)));
+        r = TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(1, 2, 0.5, 2000.0)), mixed);
+        assertNotNull(r);
+        assertTrue(r.startsWith("variables[3] = 2000.0"), "positions count across segments: " + r);
+
+        assertNull(TaskController.rejectionReason(result(List.of(1.0), List.of(), List.<Number>of(-1000, 1000)), integer),
+            "the bounds themselves are allowed");
+        assertEquals(List.of(5, 6), integer.variables(), "validation must not modify the solution");
+    }
+
+    @Test
+    void recordWritesTheRepairedVariablesThenObjectivesAndConstraints() {
+        DoubleSolution s = doubleSolution(2, 1, 0, 0);
+
+        TaskController.record(s, result(List.of(1.5, -2.5), List.of(-0.25), List.<Number>of(3, 4.5)));
+
+        assertEquals(List.of(3.0, 4.5), s.variables());
+        assertArrayEquals(new double[] {1.5, -2.5}, s.objectives());
+        assertArrayEquals(new double[] {-0.25}, s.constraints());
+    }
+
+    @Test
+    void recordOfAnInvalidResultWritesNothing() {
+        DoubleSolution s = doubleSolution(2, 0, 1, 2);
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> TaskController.record(s, result(List.of(1.5, Double.NaN), List.of(), List.<Number>of(3, 4))));
+
+        assertTrue(e.getMessage().contains("objectives[1]"), e.getMessage());
+        assertEquals(List.of(1.0, 2.0), s.variables(), "not even the variables, although they were valid");
+        assertArrayEquals(new double[2], s.objectives());
+    }
+
+    // ── GET /next payload of a solution that cannot travel ────────────────────
+
+    @Test
+    void solutionWithANonFiniteVariableIsRejectedInsteadOfSentAsAJsonString() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> TaskController.toPayload(1, doubleSolution(1, 0, 0.5, Double.NaN)));
+        assertTrue(e.getMessage().startsWith("variables[1] is not finite: NaN"), e.getMessage());
+
+        CompositeSolution mixed = new CompositeSolution(List.of(
+            intSolution(1, 0, 1, 2), doubleSolution(1, 0, 0.5, Double.POSITIVE_INFINITY)));
+        e = assertThrows(IllegalArgumentException.class, () -> TaskController.toPayload(2, mixed));
+        assertTrue(e.getMessage().startsWith("variables[3] is not finite: Infinity"), e.getMessage());
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void solutionWithANullOrForeignVariableIsRejectedInsteadOfSentAsJsonNull() {
+        IntegerSolution withNull = intSolution(1, 0, 1, 2);
+        ((List) withNull.variables()).set(1, null);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> TaskController.toPayload(1, withNull));
+        assertEquals("variables[1] is null", e.getMessage());
+
+        IntegerSolution withDouble = intSolution(1, 0, 1, 2);
+        ((List) withDouble.variables()).set(0, 2.5);
+        e = assertThrows(IllegalArgumentException.class, () -> TaskController.toPayload(2, withDouble),
+            "an IllegalArgumentException, which the controller turns into a failed evaluation, "
+                + "not a ClassCastException later");
+        assertTrue(e.getMessage().startsWith("variables[0] = 2.5 is a Double"), e.getMessage());
+    }
+
+    @Test
     void segmentSizesAreUnchanged() {
         assertNull(TaskController.segmentSizes(intSolution(1, 0, 1, 2)));
         assertEquals(List.of(2, 3), TaskController.segmentSizes(new CompositeSolution(

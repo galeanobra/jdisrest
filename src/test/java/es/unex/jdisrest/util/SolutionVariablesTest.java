@@ -238,6 +238,98 @@ class SolutionVariablesTest {
         assertEquals(List.of(0.0, 0.0), target.variables().get(1).variables());
     }
 
+    // ── custom solutions and corrupted variables ──────────────────────────────
+
+    /** A solution of no jMetal type whose variables are the given objects. */
+    static Solution<Object> customSolution(Object... values) {
+        return new Solution<>() {
+            private final List<Object> vars = new ArrayList<>(java.util.Arrays.asList(values));
+            @Override public List<Object> variables() { return vars; }
+            @Override public double[] objectives() { return new double[1]; }
+            @Override public double[] constraints() { return new double[0]; }
+            @Override public Map<Object, Object> attributes() { return new HashMap<>(); }
+            @Override public Solution<Object> copy() { return this; }
+        };
+    }
+
+    @Test
+    void customSolutionIsAcceptedWhenAllItsVariablesShareOneType() {
+        assertEquals(SolutionVariables.Encoding.INT, SolutionVariables.encodingOf(customSolution(3, 1, 2)),
+            "an integer permutation");
+        assertEquals(SolutionVariables.Encoding.DOUBLE, SolutionVariables.encodingOf(customSolution(0.5, 1.5)));
+        assertEquals(List.of(3, 1, 2), SolutionVariables.flatten(customSolution(3, 1, 2)));
+    }
+
+    @Test
+    void customSolutionMixingIntegersAndDoublesIsRejectedUpFront() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> SolutionVariables.wireEncoding(customSolution(1, 2.5)));
+        assertTrue(e.getMessage().contains("variables[0] is Integer but variables[1] is Double"), e.getMessage());
+
+        assertThrows(IllegalArgumentException.class, () -> SolutionVariables.flatten(customSolution(0.5, 1)),
+            "a flat vector has one encoding: announcing it as either would break the other values");
+        assertThrows(IllegalArgumentException.class, () -> SolutionVariables.encodingOf(customSolution(1, null)));
+        assertThrows(IllegalArgumentException.class, () -> SolutionVariables.encodingOf(customSolution(1, 2L)));
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void flattenReportsANullOrForeignVariableWithItsPosition() {
+        IntegerSolution withNull = intSolution(1, 2);
+        ((List) withNull.variables()).set(1, null);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> SolutionVariables.flatten(composite(doubleSolution(0.5), withNull)));
+        assertEquals("variables[2] is null", e.getMessage(), "the position in the flat vector");
+
+        DoubleSolution withString = doubleSolution(0.5);
+        ((List) withString.variables()).set(0, "x");
+        e = assertThrows(IllegalArgumentException.class, () -> SolutionVariables.flatten(withString),
+            "an IllegalArgumentException, not a ClassCastException");
+        assertEquals("variables[0] = x is a String but its segment is double-encoded", e.getMessage());
+    }
+
+    @Test
+    void flattenKeepsNonFiniteValuesAndCheckFiniteReportsThem() {
+        List<Number> flat = SolutionVariables.flatten(doubleSolution(0.5, Double.NaN));
+
+        assertEquals(2, flat.size(), "keys and traces may hold a NaN gene");
+        assertEquals("variables[1] is not finite: NaN", SolutionVariables.checkFinite(flat));
+        assertEquals("variables[0] is not finite: -Infinity",
+            SolutionVariables.checkFinite(List.of(Double.NEGATIVE_INFINITY)));
+        assertNull(SolutionVariables.checkFinite(List.of(1, 2.5, -3L)));
+    }
+
+    @Test
+    void nestedCompositeIsReportedAsSuchNotAsALengthMismatch() {
+        CompositeSolution nested = composite(composite(intSolution(1), intSolution(2)), intSolution(3));
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> SolutionVariables.convert(nested, List.of(1, 2, 3)));
+        assertTrue(e.getMessage().contains("nested CompositeSolution segments are not supported"), e.getMessage());
+    }
+
+    // ── bounds ────────────────────────────────────────────────────────────────
+
+    @Test
+    void checkBoundsAcceptsTheBoundsThemselvesAndNamesTheFirstValueOutside() {
+        IntegerSolution integer = intSolution(0, 0);
+        assertNull(SolutionVariables.checkBounds(integer, List.of(-1000, 1000)));
+        assertEquals("variables[0] = -1001 is outside the bounds [-1000, 1000] of its variable",
+            SolutionVariables.checkBounds(integer, List.of(-1001, 0)));
+
+        DoubleSolution real = doubleSolution(0);
+        assertEquals("variables[0] = 1000.25 is outside the bounds [-1000.0, 1000.0] of its variable",
+            SolutionVariables.checkBounds(real, List.of(1000.25)));
+
+        CompositeSolution mixed = composite(intSolution(0), doubleSolution(0, 0));
+        String reason = SolutionVariables.checkBounds(mixed, List.of(5, 0.5, -2000.0));
+        assertNotNull(reason);
+        assertTrue(reason.startsWith("variables[2] = -2000.0"), "positions count across segments: " + reason);
+
+        assertNull(SolutionVariables.checkBounds(customSolution(1, 2), List.of(1_000_000, -1_000_000)),
+            "a solution without declared bounds accepts any value");
+    }
+
     @Test
     void flattenedKeysHaveValueEquality() {
         assertEquals(SolutionVariables.flatten(intSolution(1, 2)), SolutionVariables.flatten(intSolution(1, 2)));

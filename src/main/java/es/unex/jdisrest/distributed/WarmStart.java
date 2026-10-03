@@ -17,10 +17,11 @@ import java.util.List;
  * <p>Callers:
  * <ul>
  *   <li>{@link SteadyStateEvolutionaryAlgorithm#createInitialSolutions(int)}, and through it every
- *       steady-state algorithm that keeps the inherited
- *       {@link SteadyStateEvolutionaryAlgorithm#createInitialTasks() createInitialTasks()}.
+ *       bundled steady-state algorithm: those that keep the inherited
+ *       {@link SteadyStateEvolutionaryAlgorithm#createInitialTasks() createInitialTasks()}, PAES
+ *       (which asks for one solution) and MOEA/D (solution {@code i} for subproblem {@code i}).
  *       An algorithm that overrides {@code createInitialTasks()} without calling
- *       {@code createInitialSolutions} (MOEA/D does) ignores the warm start.</li>
+ *       {@code createInitialSolutions} ignores the warm start.</li>
  *   <li>The local
  *       {@link es.unex.jdisrest.local.algorithms.NSGAII#createInitialPopulation() NSGA-II}.</li>
  * </ul>
@@ -70,9 +71,10 @@ public final class WarmStart {
      *       it returns a list of another size than {@code count}, a warning is logged and the
      *       list is returned unchanged: what a short or long list means is up to the caller
      *       (the steady-state algorithms fill the missing slots with the tasks they create
-     *       later; an algorithm that starts from a single solution needs at least one), and
-     *       rejecting it would break problems that have always returned such lists. The file is
-     *       then copied when {@code tracesFolder} is not {@code null}.</li>
+     *       later; an algorithm that starts from a single solution needs at least one; the local
+     *       NSGA-II tops a short list up with random solutions and drops the surplus of a long
+     *       one), and rejecting it would break problems that have always returned such lists.
+     *       The file is then copied when {@code tracesFolder} is not {@code null}.</li>
      * </ul>
      *
      * <p>The copy goes to {@code tracesFolder/<file name>}; the folder is created when missing

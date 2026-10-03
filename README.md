@@ -143,8 +143,19 @@ var algo = new NSGAII<>(
     /*tracesFolder=*/ null);
 
 MasterFacade.init(5000, /*statusFileIntervalSec=*/ 30);
-algo.run();
+try {
+    algo.run();
+    // write algo.getResult() here
+} finally {
+    algo.shutdown();    // closes the REST server, so the JVM can exit
+}
 ```
+
+The constructor starts the REST server and writes the `.master-endpoint`
+file; `shutdown()` deletes the file, closes the server (workers still
+evaluating find the master gone and stop after a few failed attempts) and
+writes a final `status.json`. Until `run()` has built its first
+tasks, workers that ask for one are told to come back a few seconds later.
 
 A matching Python worker:
 
@@ -159,7 +170,9 @@ Worker("http://10.0.0.1:8080").run(evaluate)
 ```
 
 Use `localhost` for both when the master and the workers share one
-machine.
+machine. Each worker needs its own worker id (the bundled workers
+generate a random one), because the master tracks one task in flight per
+id.
 
 ### With a configuration file
 
@@ -207,10 +220,10 @@ python -m jdisrest --evaluator zdt1:evaluate --code-dir . \
 When the 5000 evaluations are done (or after
 `curl -X POST http://10.0.0.1:8080/api/v1/stop`), the master writes its
 result, the approximation of the Pareto front, to `VAR.csv` and `FUN.csv`
-in its working directory and exits, and the workers exit too. The
-`traces` folder of the example holds snapshots of the population and the
-archive, a copy of the configuration, and a record of every change made
-with `POST /api/v1/config` during the run. `--check` and the run exit
+in its working directory, shuts down and exits, and the workers exit too.
+The `traces` folder of the example holds snapshots of the population and
+the archive, a copy of the configuration, and a record of every change
+made with `POST /api/v1/config` during the run. `--check` and the run exit
 with status 0 on success and 1 otherwise, so a script can gate a job on
 them.
 
@@ -239,8 +252,8 @@ jdisrest/
 ## Key classes
 
 - `es.unex.jdisrest.distributed.AbstractMaster`: shared master infrastructure
-  (Spring Boot startup, worker registry, watchdog, the limit of failed
-  evaluations per task and the early stop).
+  (Spring Boot startup and `shutdown()`, worker registry, watchdog, the
+  limit of failed evaluations per task and the early stop).
 - `es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithm`: generic steady-state
   distributed evolutionary algorithm.
 - `es.unex.jdisrest.distributed.algorithms.steadystate.{NSGAII,MOEAD,SMSEMOA,PAES}`:
@@ -248,7 +261,9 @@ jdisrest/
   for any population size, or a simplex lattice) and its aggregation
   functions live in `MOEADWeights` and `MOEADAggregation`.
 - `es.unex.jdisrest.distributed.RestWorker`: Java worker that connects to a
-  running master over REST (heartbeats, retries, and shutdown handled for you).
+  running master over REST (heartbeats, retries, failure reports, a check
+  of the task's layout against the local problem, repaired variables sent
+  back, and shutdown handled for you).
 - `es.unex.jdisrest.distributed.WarmStartCapable`: optional interface implemented
   by problems that can seed the initial population from disk (`iVAR.csv`,
   which `WarmStart` also copies into the traces folder).
@@ -259,7 +274,10 @@ jdisrest/
 - `es.unex.jdisrest.distributed.rest.MasterSpringApp`: embedded Spring Boot entry
   point (auto-loaded by the master).
 - `es.unex.jdisrest.local.algorithms.NSGAII`: sequential local variant (no REST)
-  for debugging small problems or measuring distribution overhead.
+  for debugging small problems or measuring distribution overhead. Its
+  `PythonProcessEvaluator` evaluates in a Python child process that speaks
+  a line-based JSON protocol over its standard input and output, which the
+  developer manual describes.
 - `es.unex.jdisrest.config.AlgorithmConfig`: reads NSGA-II, PAES and MOEA/D
   settings (budget, population or archive size, operators with their
   probabilities and parameters, traces folder) from a properties file, and
@@ -282,10 +300,11 @@ configuration of a master that registered a `ConfigurationHandler` with
 The developer manual at [`docs/DEVELOPER_MANUAL.md`](docs/DEVELOPER_MANUAL.md)
 covers the REST protocol (including the limit of failed evaluations per
 task), how to define problems and warm-start them, worker
-implementations in Java/Python/MATLAB, master wiring with the available
-algorithms and operators, configuration files and the `ConfiguredMaster`
-launcher, SLURM deployment patterns, monitoring and control (status,
-stop and configuration endpoints) and internals.
+implementations in Java/Python/MATLAB, master wiring and shutdown with
+the available algorithms and operators, the local mode and its Python
+child protocol, configuration files and the `ConfiguredMaster` launcher,
+SLURM deployment patterns, monitoring and control (status, stop and
+configuration endpoints), internals, and what changed in 1.2.
 [`python/README.md`](python/README.md) covers the Python client, its
 command-line worker and the trace tools.
 
