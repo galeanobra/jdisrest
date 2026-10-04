@@ -1,6 +1,11 @@
 package es.unex.jdisrest.config;
 
 import es.unex.jdisrest.operator.DoubleNPointCrossover;
+import es.unex.jdisrest.operator.IntegerBLXCrossover;
+import es.unex.jdisrest.operator.IntegerGaussianMutation;
+import es.unex.jdisrest.operator.IntegerPolynomialMutation;
+import es.unex.jdisrest.operator.IntegerSBXCrossover;
+import es.unex.jdisrest.operator.IntegerSimpleRandomMutation;
 import es.unex.jdisrest.operator.LevyFlightMutationRandomStepSize;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -9,17 +14,26 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.uma.jmetal.operator.crossover.CrossoverOperator;
 import org.uma.jmetal.operator.crossover.impl.ArithmeticCrossover;
 import org.uma.jmetal.operator.crossover.impl.BLXAlphaCrossover;
+import org.uma.jmetal.operator.crossover.impl.HUXCrossover;
 import org.uma.jmetal.operator.crossover.impl.LaplaceCrossover;
 import org.uma.jmetal.operator.crossover.impl.SBXCrossover;
+import org.uma.jmetal.operator.crossover.impl.SinglePointCrossover;
+import org.uma.jmetal.operator.crossover.impl.UniformCrossover;
 import org.uma.jmetal.operator.crossover.impl.WholeArithmeticCrossover;
 import org.uma.jmetal.operator.mutation.MutationOperator;
+import org.uma.jmetal.operator.mutation.impl.BitFlipMutation;
 import org.uma.jmetal.operator.mutation.impl.LevyFlightMutation;
 import org.uma.jmetal.operator.mutation.impl.LinkedPolynomialMutation;
 import org.uma.jmetal.operator.mutation.impl.PolynomialMutation;
 import org.uma.jmetal.operator.mutation.impl.SimpleRandomMutation;
 import org.uma.jmetal.operator.mutation.impl.UniformMutation;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
+import org.uma.jmetal.solution.binarysolution.impl.DefaultBinarySolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 import org.uma.jmetal.solution.doublesolution.impl.DefaultDoubleSolution;
+import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import org.uma.jmetal.solution.integersolution.impl.DefaultIntegerSolution;
+import org.uma.jmetal.util.binarySet.BinarySet;
 import org.uma.jmetal.util.bounds.Bounds;
 
 import java.util.ArrayList;
@@ -33,10 +47,12 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * The operator catalogues of the configuration files: every type passes its values to the jMetal or
- * jdisrest operator, the checks enforce the rules of each operator and accept only values its
- * constructor accepts, every crossover takes two parents and gives two children, and every operator
- * keeps the variables within their bounds, a variable with equal bounds included.
+ * The operator catalogues of the configuration files, for real, integer and binary variables:
+ * every type passes its values to the jMetal or jdisrest operator, the checks enforce the rules of
+ * each operator and accept only values its constructor accepts, every crossover takes two parents
+ * and gives two children, every real and integer operator keeps the variables within their bounds,
+ * a variable with equal bounds included, and every binary operator keeps the lengths of the
+ * variables.
  */
 class OperatorTypeTest {
 
@@ -66,7 +82,9 @@ class OperatorTypeTest {
     }
 
     static Stream<OperatorType<?>> everyType() {
-        return Stream.concat(Stream.of(CrossoverType.values()), Stream.of(MutationType.values()));
+        return Stream.of(CrossoverType.values(), MutationType.values(), IntegerCrossoverType.values(),
+                IntegerMutationType.values(), BinaryCrossoverType.values(), BinaryMutationType.values())
+                .flatMap(Stream::of);
     }
 
     /** Every assignment of {@code candidates} to the parameters of {@code type}. */
@@ -242,6 +260,155 @@ class OperatorTypeTest {
 
             assertTrue(withinBounds(solution), () -> type + " left the bounds: " + solution.variables());
         }
+    }
+
+    // ── Integer and binary catalogues ─────────────────────────────────────────
+
+    private static final int INTEGER_LOWER = -5;
+    private static final int INTEGER_UPPER = 5;
+    private static final int INTEGER_FIXED = 1;
+    private static final List<Integer> BITS = List.of(7, 3, 1);
+
+    /** {@link #VARIABLES} variables in [-5, 5], except the first, whose bounds are both 1. */
+    static IntegerSolution integerSolutionWithAFixedVariable() {
+        List<Bounds<Integer>> bounds = new ArrayList<>(
+                Collections.nCopies(VARIABLES, Bounds.create(INTEGER_LOWER, INTEGER_UPPER)));
+        bounds.set(0, Bounds.create(INTEGER_FIXED, INTEGER_FIXED));
+        return new DefaultIntegerSolution(bounds, 2, 0);
+    }
+
+    static boolean withinBounds(IntegerSolution solution) {
+        return solution.variables().getFirst() == INTEGER_FIXED
+                && solution.variables().stream().allMatch(value -> value >= INTEGER_LOWER && value <= INTEGER_UPPER);
+    }
+
+    static List<Integer> lengths(BinarySolution solution) {
+        return solution.variables().stream().map(BinarySet::getBinarySetLength).toList();
+    }
+
+    @Test
+    void integerSbxIsTheCrossoverOfJdisrestThatRounds() {
+        var crossover = assertInstanceOf(IntegerSBXCrossover.class,
+                IntegerCrossoverType.SBX.create(0.7, Map.of("distributionIndex", 15.0)));
+
+        assertAll(
+                () -> assertEquals(0.7, crossover.crossoverProbability(), "probability"),
+                () -> assertEquals(15.0, crossover.getDistributionIndex(), "distributionIndex"));
+    }
+
+    @Test
+    void integerBlxAlphaReceivesTheProbabilityAndAlpha() {
+        var crossover = assertInstanceOf(IntegerBLXCrossover.class,
+                IntegerCrossoverType.BLX_ALPHA.create(0.8, Map.of("alpha", 0.3)));
+
+        assertAll(
+                () -> assertEquals(0.8, crossover.crossoverProbability(), "probability"),
+                () -> assertEquals(0.3, crossover.alpha(), "alpha"));
+    }
+
+    @Test
+    void integerPolynomialIsTheMutationOfJdisrestThatRounds() {
+        var mutation = assertInstanceOf(IntegerPolynomialMutation.class,
+                IntegerMutationType.POLYNOMIAL.create(0.1, Map.of("distributionIndex", 30.0)));
+
+        assertAll(
+                () -> assertEquals(0.1, mutation.mutationProbability(), "probability"),
+                () -> assertEquals(30.0, mutation.getDistributionIndex(), "distributionIndex"));
+    }
+
+    @Test
+    void integerRandomAndGaussianReceiveTheProbability() {
+        var random = assertInstanceOf(IntegerSimpleRandomMutation.class, IntegerMutationType.RANDOM.create(0.2, Map.of()));
+        var gaussian = assertInstanceOf(IntegerGaussianMutation.class, IntegerMutationType.GAUSSIAN.create(0.3, Map.of()));
+
+        assertAll(
+                () -> assertEquals(0.2, random.mutationProbability(), "random, of jdisrest"),
+                () -> assertEquals(0.3, gaussian.mutationProbability(), "gaussian"));
+    }
+
+    @Test
+    void theBinaryOperatorsAreJMetalsWithTheProbability() {
+        var singlePoint = assertInstanceOf(SinglePointCrossover.class, BinaryCrossoverType.SINGLE_POINT.create(0.6, Map.of()));
+        var hux = assertInstanceOf(HUXCrossover.class, BinaryCrossoverType.HUX.create(0.7, Map.of()));
+        var uniform = assertInstanceOf(UniformCrossover.class, BinaryCrossoverType.UNIFORM.create(0.8, Map.of()));
+        var bitFlip = assertInstanceOf(BitFlipMutation.class, BinaryMutationType.BIT_FLIP.create(0.05, Map.of()));
+
+        assertAll(
+                () -> assertEquals(0.6, singlePoint.crossoverProbability(), "singlePoint"),
+                () -> assertEquals(0.7, hux.crossoverProbability(), "hux"),
+                () -> assertEquals(0.8, uniform.crossoverProbability(), "uniform"),
+                () -> assertEquals(0.05, bitFlip.mutationProbability(), "bitFlip"));
+    }
+
+    @ParameterizedTest
+    @EnumSource(IntegerCrossoverType.class)
+    void everyIntegerCrossoverTakesTwoParentsAndKeepsTheChildrenWithinTheBounds(IntegerCrossoverType type) {
+        CrossoverOperator<IntegerSolution> crossover = type.create(1.0, defaults(type));
+        List<IntegerSolution> parents = List.of(integerSolutionWithAFixedVariable(), integerSolutionWithAFixedVariable());
+
+        assertAll(
+                () -> assertEquals(2, crossover.numberOfRequiredParents(), type + " takes two parents"),
+                () -> assertTrue(crossover.numberOfGeneratedChildren() >= 2, type + " gives at least two children"));
+        for (int run = 0; run < RUNS; run++) {
+            List<IntegerSolution> children = crossover.execute(parents);
+
+            assertTrue(children.stream().allMatch(OperatorTypeTest::withinBounds),
+                    () -> type + " left the bounds: " + children.stream().map(IntegerSolution::variables).toList());
+            parents = children.subList(0, 2);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(IntegerMutationType.class)
+    void everyIntegerMutationKeepsTheVariablesWithinTheBoundsAndAFixedVariableAtItsValue(IntegerMutationType type) {
+        MutationOperator<IntegerSolution> mutation = type.create(1.0, defaults(type));
+        IntegerSolution solution = integerSolutionWithAFixedVariable();
+
+        for (int run = 0; run < RUNS; run++) {
+            mutation.execute(solution);
+
+            assertTrue(withinBounds(solution), () -> type + " left the bounds: " + solution.variables());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(BinaryCrossoverType.class)
+    void everyBinaryCrossoverTakesTwoParentsAndKeepsTheirLengthsWithoutChangingThem(BinaryCrossoverType type) {
+        CrossoverOperator<BinarySolution> crossover = type.create(1.0, defaults(type));
+        List<BinarySolution> parents = List.of(new DefaultBinarySolution(BITS, 2, 0), new DefaultBinarySolution(BITS, 2, 0));
+
+        assertAll(
+                () -> assertEquals(2, crossover.numberOfRequiredParents(), type + " takes two parents"),
+                () -> assertTrue(crossover.numberOfGeneratedChildren() >= 2, type + " gives at least two children"));
+        for (int run = 0; run < RUNS; run++) {
+            List<String> before = parents.stream().map(parent -> parent.variables().toString()).toList();
+            List<BinarySolution> children = crossover.execute(parents);
+
+            List<BinarySolution> crossed = parents;
+            assertAll(
+                    () -> assertTrue(children.stream().allMatch(child -> lengths(child).equals(BITS)),
+                            () -> type + " changed the lengths: " + children.stream().map(OperatorTypeTest::lengths).toList()),
+                    () -> assertEquals(before, crossed.stream().map(parent -> parent.variables().toString()).toList(),
+                            type + " changed a parent"));
+            parents = children.subList(0, 2);
+        }
+    }
+
+    @Test
+    void bitFlipWithProbabilityOneFlipsEveryBitAndKeepsTheLengths() {
+        MutationOperator<BinarySolution> mutation = BinaryMutationType.BIT_FLIP.create(1.0, Map.of());
+        BinarySolution solution = new DefaultBinarySolution(BITS, 2, 0);
+        List<BinarySet> before = solution.variables().stream().map(bits -> (BinarySet) bits.clone()).toList();
+
+        mutation.execute(solution);
+
+        for (int i = 0; i < BITS.size(); i++) {
+            BinarySet flipped = solution.variables().get(i);
+            for (int bit = 0; bit < BITS.get(i); bit++) {
+                assertNotEquals(before.get(i).get(bit), flipped.get(bit), "variable " + i + ", bit " + bit);
+            }
+        }
+        assertEquals(BITS, lengths(solution), "the lengths of the variables");
     }
 
     // ── Checks ────────────────────────────────────────────────────────────────

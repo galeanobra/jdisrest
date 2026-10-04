@@ -3,9 +3,14 @@ package es.unex.jdisrest.config;
 import es.unex.jdisrest.config.AlgorithmConfig.MOEADConfig;
 import es.unex.jdisrest.config.AlgorithmConfig.NSGAIIConfig;
 import es.unex.jdisrest.config.AlgorithmConfig.PAESConfig;
+import es.unex.jdisrest.config.SolutionLayout.Segment;
+import es.unex.jdisrest.config.Variation.SegmentOperators;
 import es.unex.jdisrest.distributed.algorithms.steadystate.MOEAD;
 import es.unex.jdisrest.distributed.algorithms.steadystate.MOEADWeights;
 import es.unex.jdisrest.distributed.algorithms.steadystate.PAES;
+import es.unex.jdisrest.util.SolutionVariables.Encoding;
+import org.uma.jmetal.operator.crossover.CrossoverOperator;
+import org.uma.jmetal.operator.mutation.MutationOperator;
 
 import java.io.IOException;
 import java.io.StringReader;
@@ -22,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -36,13 +42,16 @@ import java.util.stream.Collectors;
  * an interface is public, and these are implementation details (the raw {@link Properties}
  * parse, the effective text of a file with its overrides, the objectives check) that only this
  * package calls. Every public type of the package ({@link AlgorithmConfig} and its records,
- * {@link OperatorConfig}, {@link OperatorType} and the two catalogues, {@link ConfigHistory},
- * {@link AlgorithmReconfiguration}, {@link ConfiguredMaster} and
- * {@link InvalidConfigurationException}) is public on purpose; the helpers here are not.
+ * {@link SolutionLayout}, {@link NamedSegments}, {@link Variation}, {@link OperatorConfig},
+ * {@link OperatorType} and its catalogues, {@link ConfigHistory}, {@link AlgorithmReconfiguration},
+ * {@link ConfiguredMaster} and {@link InvalidConfigurationException}) is public on purpose; the
+ * helpers here are not.
  *
- * <p>An instance parses one set of properties once. It remembers every key it looks up, whether
- * the key is present or not, so that any other key can be reported as unknown, together with the
- * list of valid keys in the order they were looked up.
+ * <p>An instance parses one set of properties once, for the {@link SolutionLayout} of a problem:
+ * the operators of each segment in turn, from the catalogue of its encoding, under the keys of the
+ * segment. It remembers every key it looks up, whether the key is present or not, so that any other
+ * key can be reported as unknown, together with the list of valid keys in the order they were
+ * looked up.
  *
  * @author Francisco Luna (Universidad de Málaga)
  */
@@ -59,7 +68,7 @@ final class AlgorithmConfigParser {
     /** Java's UTF-8 decoder keeps it, and {@link Properties} would take it as part of the first key. */
     private static final char BYTE_ORDER_MARK = '\uFEFF';
 
-    /** {@code k/n}, with spaces allowed around the slash: k over the number of variables. */
+    /** {@code k/n}, with spaces allowed around the slash: k over the size of a segment or of the layout. */
     private static final Pattern PER_VARIABLES = Pattern.compile("(.*?)\\s*/\\s*n", Pattern.CASE_INSENSITIVE);
 
     /**
@@ -81,10 +90,12 @@ final class AlgorithmConfigParser {
             "# Command-line overrides; the lines of the file they replace are commented out above";
 
     private final Properties properties;
-    private final int numberOfVariables;
+    private final SolutionLayout layout;
     private final Set<String> knownKeys = new LinkedHashSet<>();
 
     /**
+     * A parser for a real-coded problem that is not composite.
+     *
      * @param properties        the properties to parse, not modified
      * @param numberOfVariables number of variables of the problem, which {@code k/n} and the
      *                          operator checks refer to
@@ -94,8 +105,18 @@ final class AlgorithmConfigParser {
         if (numberOfVariables <= 0) {
             throw new IllegalArgumentException("numberOfVariables must be greater than 0: " + numberOfVariables);
         }
+        this(properties, SolutionLayout.real(numberOfVariables));
+    }
+
+    /**
+     * @param properties the properties to parse, not modified
+     * @param layout     the segments of the problem's solutions, which decide the operator keys,
+     *                   their catalogues and what {@code k/n} and the operator checks refer to
+     * @throws NullPointerException if {@code layout} is {@code null}
+     */
+    AlgorithmConfigParser(Properties properties, SolutionLayout layout) {
         this.properties = properties;
-        this.numberOfVariables = numberOfVariables;
+        this.layout = Objects.requireNonNull(layout, "layout must not be null");
     }
 
     // ── Reading files and texts ───────────────────────────────────────────────
@@ -108,6 +129,16 @@ final class AlgorithmConfigParser {
      */
     static AlgorithmConfig parse(Properties properties, int numberOfVariables) {
         return new AlgorithmConfigParser(properties, numberOfVariables).parse();
+    }
+
+    /**
+     * Parses properties already loaded for the segments of a problem's solutions, checking
+     * everything that depends on them.
+     *
+     * @throws InvalidConfigurationException if a value is missing or wrong, or a key is unknown
+     */
+    static AlgorithmConfig parse(Properties properties, SolutionLayout layout) {
+        return new AlgorithmConfigParser(properties, layout).parse();
     }
 
     /**
@@ -414,14 +445,12 @@ final class AlgorithmConfigParser {
             case "nsgaii" -> new NSGAIIConfig(
                     maxEvaluations(),
                     positiveInteger("populationSize", DEFAULT_SIZE),
-                    operator("crossover", List.of(CrossoverType.values()), CrossoverType.SBX,
-                            Double.toString(DEFAULT_CROSSOVER_PROBABILITY)),
-                    operator("mutation", List.of(MutationType.values()), MutationType.POLYNOMIAL, PER_VARIABLE),
+                    variation(true),
                     tracesFolder());
             case "paes" -> new PAESConfig(
                     maxEvaluations(),
                     positiveInteger("archiveSize", DEFAULT_SIZE),
-                    operator("mutation", List.of(MutationType.values()), MutationType.POLYNOMIAL, PER_VARIABLE),
+                    variation(false),
                     probability("archiveSelectionProbability", "0.0"),
                     resultSource(),
                     tracesFolder());
@@ -444,10 +473,7 @@ final class AlgorithmConfigParser {
                 Math.min(DEFAULT_REPLACED_SOLUTIONS, neighborSize), "neighborSize", neighborSize);
         MOEAD.AggregationFunction aggregation = aggregation();
         return new MOEADConfig(maxEvaluations, populationSize, weights, neighborSize, neighborhoodSelectionProbability,
-                maximumNumberOfReplacedSolutions, aggregation, bool("normalizeObjectives", false),
-                operator("crossover", List.of(CrossoverType.values()), CrossoverType.SBX,
-                        Double.toString(DEFAULT_CROSSOVER_PROBABILITY)),
-                operator("mutation", List.of(MutationType.values()), MutationType.POLYNOMIAL, PER_VARIABLE),
+                maximumNumberOfReplacedSolutions, aggregation, bool("normalizeObjectives", false), variation(true),
                 tracesFolder());
     }
 
@@ -555,18 +581,71 @@ final class AlgorithmConfigParser {
     }
 
     /**
+     * Reads the operators of every segment of the layout, in order: the crossover of the segment,
+     * if the algorithm crosses, then its mutation, each from the catalogue of the segment's
+     * encoding and under the keys of the segment ({@link Segment#key}).
+     *
+     * @param withCrossover whether the algorithm crosses: false for PAES, whose crossover keys
+     *                      are then unknown
+     */
+    private Variation variation(boolean withCrossover) {
+        List<SegmentOperators> segments = new ArrayList<>(layout.segments().size());
+        for (Segment segment : layout.segments()) {
+            segments.add(new SegmentOperators(segment, withCrossover ? crossover(segment) : null, mutation(segment)));
+        }
+        return new Variation(segments);
+    }
+
+    private OperatorConfig<? extends CrossoverOperator<?>> crossover(Segment segment) {
+        String key = segment.key("crossover");
+        String probability = Double.toString(DEFAULT_CROSSOVER_PROBABILITY);
+        return switch (segment.encoding()) {
+            case DOUBLE -> operator(key, List.of(CrossoverType.values()), CrossoverType.SBX, probability, segment);
+            case INT -> operator(key, List.of(IntegerCrossoverType.values()), IntegerCrossoverType.SBX, probability,
+                    segment);
+            case BINARY -> operator(key, List.of(BinaryCrossoverType.values()), BinaryCrossoverType.SINGLE_POINT,
+                    probability, segment);
+        };
+    }
+
+    private OperatorConfig<? extends MutationOperator<?>> mutation(Segment segment) {
+        String key = segment.key("mutation");
+        return switch (segment.encoding()) {
+            case DOUBLE -> operator(key, List.of(MutationType.values()), MutationType.POLYNOMIAL, PER_VARIABLE, segment);
+            case INT -> operator(key, List.of(IntegerMutationType.values()), IntegerMutationType.POLYNOMIAL,
+                    PER_VARIABLE, segment);
+            case BINARY -> operator(key, List.of(BinaryMutationType.values()), BinaryMutationType.BIT_FLIP,
+                    PER_VARIABLE, segment);
+        };
+    }
+
+    /**
+     * {@link #operator(String, List, OperatorType, String, Segment)} for the single segment of a
+     * layout that is not composite, and only for such a layout: it takes the first segment, whose
+     * size would be the wrong {@code n} for the operators of another segment of a composite. The
+     * parser itself always passes the segment of each operator.
+     */
+    <O> OperatorConfig<O> operator(String prefix, List<? extends OperatorType<O>> types,
+            OperatorType<O> defaultType, String defaultProbability) {
+        return operator(prefix, types, defaultType, defaultProbability, layout.segments().getFirst());
+    }
+
+    /**
      * Reads {@code prefix} (the operator name), {@code prefix.probability} and
-     * {@code prefix.<parameter>} for each parameter of that operator, checks the values with
-     * {@link OperatorType#check} and builds the operator once, so that a value its constructor
-     * rejects is reported here, naming the key, instead of when the run starts or is reconfigured.
+     * {@code prefix.<parameter>} for each parameter of that operator, which changes the values of
+     * {@code segment}: {@code k/n} in its probability is k over the size of the segment, which
+     * {@link OperatorType#check} receives too. Checks the values with {@code check} and builds the
+     * operator once, so that a value its constructor rejects is reported here, naming the key,
+     * instead of when the run starts or is reconfigured.
      *
      * @param types              the catalogue the name is looked up in, without regard to case
      * @param defaultType        the operator when {@code prefix} is missing
      * @param defaultProbability the text of the probability when {@code prefix.probability} is missing
+     * @param segment            the segment whose values the operator changes
      * @throws InvalidConfigurationException if a value is wrong or the operator cannot be built
      */
-    <O> OperatorConfig<O> operator(String prefix, List<? extends OperatorType<O>> types,
-            OperatorType<O> defaultType, String defaultProbability) {
+    private <O> OperatorConfig<O> operator(String prefix, List<? extends OperatorType<O>> types,
+            OperatorType<O> defaultType, String defaultProbability, Segment segment) {
         String name = value(prefix, defaultType.key());
         OperatorType<O> type = null;
         for (OperatorType<O> candidate : types) {
@@ -575,18 +654,21 @@ final class AlgorithmConfigParser {
             }
         }
         if (type == null) {
+            // The catalogue of a real-coded problem that is not composite is the one of 1.2.
+            boolean realOnly = !layout.composite() && segment.encoding() == Encoding.DOUBLE;
             throw invalid(prefix + " must be one of "
                     + types.stream().map(OperatorType::key).collect(Collectors.joining(", "))
+                    + (realOnly ? "" : " (" + SolutionLayout.encodingName(segment.encoding()) + " variables)")
                     + ", got '" + name + "'");
         }
-        double probability = probability(prefix + ".probability", defaultProbability);
+        double probability = probability(prefix + ".probability", defaultProbability, segment.size());
         Map<String, Double> parameters = new LinkedHashMap<>();
         for (OperatorType.Parameter parameter : type.parameters()) {
             String key = prefix + "." + parameter.name();
             String text = value(key);
             parameters.put(parameter.name(), text == null ? parameter.defaultValue() : nonNegative(key, text));
         }
-        String reason = type.check(parameters, numberOfVariables);
+        String reason = type.check(parameters, segment.size());
         if (reason != null) {
             throw invalid(prefix + "." + reason);
         }
@@ -600,8 +682,16 @@ final class AlgorithmConfigParser {
         return new OperatorConfig<>(type, probability, values);
     }
 
-    /** A probability in [0, 1], written as a number or as {@code k/n}, k over the number of variables. */
+    /**
+     * A probability that is not of an operator, in [0, 1], written as a number or as {@code k/n},
+     * k over the values of every segment ({@link SolutionLayout#numberOfVariables()}).
+     */
     private double probability(String key, String defaultText) {
+        return probability(key, defaultText, layout.numberOfVariables());
+    }
+
+    /** A probability in [0, 1], written as a number or as {@code k/n}, k over {@code n}. */
+    private double probability(String key, String defaultText, int n) {
         String text = value(key, defaultText);
         Matcher perVariables = PER_VARIABLES.matcher(text);
         boolean relative = perVariables.matches();
@@ -609,7 +699,7 @@ final class AlgorithmConfigParser {
         if (number == null) {
             throw invalid(key + " must be a number or k/n, got '" + text + "'");
         }
-        double probability = relative ? number / numberOfVariables : number;
+        double probability = relative ? number / n : number;
         if (probability < 0.0 || probability > 1.0) {
             throw invalid(key + " must be in [0, 1] or k/n, got '" + text + "'"
                     + (relative ? " (" + OperatorConfig.format(probability) + ")" : ""));

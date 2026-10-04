@@ -305,8 +305,9 @@ jdisrest/
 - `es.unex.jdisrest.config.AlgorithmConfig`: reads NSGA-II, PAES and MOEA/D
   settings (budget, population or archive size, operators with their
   probabilities and parameters, traces folder) from a properties file, and
-  checks them before anything starts. Real-coded problems (`DoubleProblem`)
-  only.
+  checks them before anything starts. Problems of every encoding: real,
+  integer and binary variables, and composites of them, with the operators
+  of each segment under its name (`SolutionLayout`, `Variation`).
 - `es.unex.jdisrest.config.ConfiguredMaster`: launcher that runs a master
   for a `DoubleProblem` class with such a file, or only validates the file
   (`--check`). A program that builds its problem itself calls
