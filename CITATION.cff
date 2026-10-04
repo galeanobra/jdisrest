@@ -14,6 +14,8 @@ abstract: >-
   expensive evaluations, such as external simulators, trained models, or
   legacy code, across a cluster (including SLURM-managed HPC nodes) without
   coupling the algorithm implementation to the evaluation language.
+  Problems may use real, integer or binary variables, or composite
+  solutions that mix them, from code or from configuration files.
 authors:
   - family-names: "Galeano Brajones"
     given-names: "Jesús"
