@@ -4,6 +4,9 @@ import es.unex.jdisrest.util.Log;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.uma.jmetal.problem.Problem;
+import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import org.uma.jmetal.solution.integersolution.impl.DefaultIntegerSolution;
+import org.uma.jmetal.util.bounds.Bounds;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -21,7 +24,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Warm start: when the problem is asked for its initial solutions, what is copied into the
- * traces folder, and what is logged.
+ * traces folder, and what is logged; and {@link WarmStart#initialPopulation}, which reads the
+ * file for the problem, completes it, and rejects it as a whole when a row does not fit.
  *
  * <p>Every test passes its own warm-start file inside a temporary folder, so nothing is read
  * from or written to the working directory. Log lines are captured from stderr, where
@@ -66,6 +70,45 @@ class WarmStartTest {
 
     static Path writePopulation(Path folder) throws IOException {
         return Files.writeString(folder.resolve("iVAR.csv"), POPULATION, UTF_8);
+    }
+
+    /**
+     * A problem of two integers in [0, 10] that reads its warm start from {@code file} with
+     * {@link WarmStart#initialPopulation}, as a problem that reads {@link WarmStart#FILE} does in
+     * one line; counts the solutions it creates.
+     */
+    static final class IntegerProblem implements Problem<IntegerSolution>, WarmStartCapable<IntegerSolution> {
+        private final Path file;
+        int created;
+
+        IntegerProblem(Path file) {
+            this.file = file;
+        }
+
+        @Override public int numberOfVariables() { return 2; }
+        @Override public int numberOfObjectives() { return 2; }
+        @Override public int numberOfConstraints() { return 0; }
+        @Override public String name() { return "IntegerProblem"; }
+        @Override public IntegerSolution evaluate(IntegerSolution solution) { return solution; }
+
+        @Override
+        public IntegerSolution createSolution() {
+            created++;
+            return new DefaultIntegerSolution(Collections.nCopies(2, Bounds.create(0, 10)), 2, 0);
+        }
+
+        @Override
+        public List<IntegerSolution> createInitialPopulationFromFile(int populationSize) {
+            return WarmStart.initialPopulation(this, populationSize, file);
+        }
+    }
+
+    static Path writeRows(Path folder, String rows) throws IOException {
+        return Files.writeString(folder.resolve("iVAR.csv"), rows, UTF_8);
+    }
+
+    static List<List<Integer>> variables(List<IntegerSolution> solutions) {
+        return solutions.stream().map(IntegerSolution::variables).toList();
     }
 
     static List<Path> listing(Path folder) throws IOException {
@@ -141,7 +184,7 @@ class WarmStartTest {
     }
 
     @Test
-    void loadedIsLoggedBeforeTheProblemReadsTheFile(@TempDir Path dir) throws IOException {
+    void loadedIsLoggedOnceTheProblemHasBuiltItsPopulation(@TempDir Path dir) throws IOException {
         Path file = writePopulation(dir);
         WarmProblem problem = new WarmProblem(count -> {
             Log.warn("row 2 is malformed");
@@ -152,8 +195,8 @@ class WarmStartTest {
 
         int loaded = log.indexOf("Initial population loaded from " + file + " file");
         assertTrue(loaded >= 0, "the warm start is announced: " + log);
-        assertTrue(loaded < log.indexOf("row 2 is malformed"),
-            "the problem's own messages must follow the line announcing the warm start: " + log);
+        assertTrue(log.indexOf("row 2 is malformed") < loaded,
+            "the line announcing the warm start follows what the problem logged while reading the file: " + log);
     }
 
     // ── Warm start used with an unexpected population ─────────────────────────
@@ -184,6 +227,8 @@ class WarmStartTest {
         assertTrue(load.log().contains(
             "WARN: The problem built no initial population from " + file + " — using random initialization"),
             "the fallback to random solutions is warned: " + load.log());
+        assertFalse(load.log().contains("Initial population loaded"),
+            "a file the run did not start from is not reported as loaded, as 1.2.1 did: " + load.log());
         assertFalse(Files.exists(traces), "a file the run did not start from is not copied");
     }
 
@@ -200,6 +245,111 @@ class WarmStartTest {
         assertTrue(load.log().contains(") — the run goes on without the copy"),
             "the warning says what happens next: " + load.log());
         assertEquals("not a folder", Files.readString(traces, UTF_8), "the obstructing file is left as it was");
+    }
+
+    // ── Reading the file for the problem ──────────────────────────────────────
+
+    @Test
+    void initialPopulationReadsTheFileAndCompletesItWithRandomSolutions(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "1,2\n3,4\n");
+        IntegerProblem problem = new IntegerProblem(file);
+
+        Logged<List<IntegerSolution>> read = logged(() -> WarmStart.initialPopulation(problem, 4, file));
+
+        assertEquals(4, read.value().size(), "the list always holds the solutions requested");
+        assertEquals(List.of(List.of(1, 2), List.of(3, 4)), variables(read.value().subList(0, 2)),
+            "the rows of the file come first, in their order");
+        assertEquals(4, problem.created, "one solution of the problem per row, and one per missing slot");
+        assertTrue(read.log().contains("INFO: " + file + " holds 2 of the 4 solutions requested — random solutions "
+            + "complete them"), "how much of the population comes from the file is logged: " + read.log());
+    }
+
+    @Test
+    void initialPopulationReadsOnlyTheRowsItNeeds(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "5,6\nnot a row\n");
+        IntegerProblem problem = new IntegerProblem(file);
+
+        Logged<List<IntegerSolution>> read = logged(() -> WarmStart.initialPopulation(problem, 1, file));
+
+        assertEquals(List.of(List.of(5, 6)), variables(read.value()), "PAES asks for a single solution");
+        assertEquals("", read.log(), "a row after those requested is never read, so it cannot reject the file");
+    }
+
+    @Test
+    void fileWithARowThatDoesNotFitIsRejectedAsAWholeWithoutBeingLoadedOrCopied(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "1,2\n3,4,5\n6,7\n");
+        Path traces = dir.resolve("traces");
+
+        Logged<List<IntegerSolution>> load = logged(() -> WarmStart.load(new IntegerProblem(file), 3, file, traces));
+
+        assertNull(load.value(), "a file that does not fit the problem must not seed part of the run");
+        assertTrue(load.log().contains("WARN: Warm-start file rejected as a whole: " + file
+            + " line 2: 3 variables, but the solutions of IntegerProblem have 2"),
+            "the warning names the file once, the line and the reason: " + load.log());
+        assertTrue(load.log().contains(
+            "WARN: The problem built no initial population from " + file + " — using random initialization"),
+            "the run starts from random solutions: " + load.log());
+        assertFalse(load.log().contains("Initial population loaded"),
+            "a rejected file is never reported as loaded: " + load.log());
+        assertFalse(Files.exists(traces), "nor copied into the traces");
+    }
+
+    @Test
+    void valueOutsideItsBoundsRejectsTheFile(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "1,2\n3,11\n");
+        IntegerProblem problem = new IntegerProblem(file);
+
+        Logged<List<IntegerSolution>> read = logged(() -> WarmStart.initialPopulation(problem, 2, file));
+
+        assertNull(read.value(), "a value no operator expects must not enter the population");
+        assertTrue(read.log().contains("WARN: Warm-start file rejected as a whole: " + file
+            + " line 2: variables[1] = 11 is outside the bounds [0, 10] of its variable"), read.log());
+    }
+
+    @Test
+    void fileWithoutRowsGivesNoPopulation(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "\n");
+        IntegerProblem problem = new IntegerProblem(file);
+
+        Logged<List<IntegerSolution>> read = logged(() -> WarmStart.initialPopulation(problem, 2, file));
+
+        assertNull(read.value(), "an empty file starts the run from random solutions, as a malformed one does");
+        assertTrue(read.log().contains("WARN: " + file + " holds no solution"), read.log());
+    }
+
+    @Test
+    void fileThatCannotBeReadGivesNoPopulation(@TempDir Path dir) {
+        Path file = dir.resolve("iVAR.csv");
+        IntegerProblem problem = new IntegerProblem(file);
+
+        Logged<List<IntegerSolution>> read = logged(() -> WarmStart.initialPopulation(problem, 2, file));
+
+        assertNull(read.value(), "the warm start never throws for its file");
+        assertTrue(read.log().contains("WARN: " + file + " could not be read: java.nio.file.NoSuchFileException"),
+            read.log());
+    }
+
+    @Test
+    void negativeCountIsRefused(@TempDir Path dir) {
+        Path file = dir.resolve("iVAR.csv");
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> WarmStart.initialPopulation(new IntegerProblem(file), -1, file));
+
+        assertEquals("count must be at least 0, got -1", e.getMessage());
+    }
+
+    @Test
+    void problemThatReadsItsFileWithTheHelperStartsFromItAndCopiesIt(@TempDir Path dir) throws IOException {
+        Path file = writeRows(dir, "1,2\n3,4\n");
+        Path traces = dir.resolve("traces");
+
+        Logged<List<IntegerSolution>> load = logged(() -> WarmStart.load(new IntegerProblem(file), 2, file, traces));
+
+        assertEquals(List.of(List.of(1, 2), List.of(3, 4)), variables(load.value()));
+        assertTrue(load.log().contains("Initial population loaded from " + file + " file"), load.log());
+        assertTrue(Files.exists(traces.resolve("iVAR.csv")), "the file the run started from is copied");
+        assertFalse(load.log().contains("WARN"), "a complete warm start logs no warning: " + load.log());
     }
 
     // ── Warm start not used ───────────────────────────────────────────────────

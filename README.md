@@ -256,7 +256,7 @@ jdisrest/
 │   ├── distributed/              # Master, algorithms, REST controllers
 │   ├── local/                    # Sequential (non-REST) mode for debugging
 │   ├── operator/                 # Custom jMetal operators
-│   └── util/                     # Logging, timings, variable encodings, trace output
+│   └── util/                     # Logging, timings, variable encodings, trace files
 ├── src/test/java/                # JUnit unit tests, and *IT integration tests (mvn verify)
 ├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D
 ├── python/
@@ -286,6 +286,10 @@ jdisrest/
 - `es.unex.jdisrest.distributed.WarmStartCapable`: optional interface implemented
   by problems that can seed the initial population from disk (`iVAR.csv`,
   which `WarmStart` also copies into the traces folder).
+  `WarmStart.initialPopulation` implements it in one line for a file of rows
+  like those of the `VAR` traces, which `es.unex.jdisrest.util.TraceReader`
+  reads back into solutions, so a run can start from the variables another
+  run of the same problem wrote.
 - `es.unex.jdisrest.util.SolutionVariables`: flattens `IntegerSolution`,
   `DoubleSolution`, `BinarySolution` (one `0` or `1` per bit) and
   `CompositeSolution` variables into the wire vector, describes its layout

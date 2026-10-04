@@ -290,7 +290,9 @@ same files. A `FUN` row holds the objectives of one solution, separated by comma
 holds its variables, one value per variable, with a binary variable as its bit string, bit 0
 first: separated by commas for flat solutions (`0.25,1.0E-5`, `3,-7` or `101,00110`), and by spaces
 for composites, followed by the objectives and the constraints
-(`3 -7 0.25 101 00110,[1.0  2.0],[0.0]`).
+(`3 -7 0.25 101 00110,[1.0  2.0],[0.0]`). A `VAR` file copied to `iVAR.csv` starts another run
+of the same problem from its solutions when the problem reads it with `WarmStart.initialPopulation`
+(the [warm start](../docs/DEVELOPER_MANUAL.md#warm-start) of the developer manual).
 
 ### `watch_front.py`
 

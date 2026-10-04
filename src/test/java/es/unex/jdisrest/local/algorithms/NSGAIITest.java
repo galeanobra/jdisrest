@@ -3,6 +3,8 @@ package es.unex.jdisrest.local.algorithms;
 import es.unex.jdisrest.operator.IntegerPolynomialMutation;
 import es.unex.jdisrest.operator.IntegerSBXCrossover;
 import es.unex.jdisrest.operator.SafeCompositeCrossover;
+import es.unex.jdisrest.util.TraceReader;
+import es.unex.jdisrest.util.TraceWriter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,8 +53,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * The local NSGA-II on top of jMetal's: population sizes checked at construction,
  * constraint-aware replacement, reproduction that never mutates a parent, a result before the
  * run, and the trace snapshots (cadence without overflow, final snapshot once, binary variables as
- * bit strings, solutions the traces cannot hold rejected before the first evaluation by a check
- * that draws no random number).
+ * bit strings that read back into solutions, solutions the traces cannot hold rejected before the
+ * first evaluation by a check that draws no random number).
  *
  * <p>The runs draw from the shared {@link JMetalRandom}; every test runs with a seeded generator
  * of its own and puts the previous one back afterwards.
@@ -170,6 +172,18 @@ class NSGAIITest {
     /** The variables of each row of a composite trace: the text before {@code ,[}. */
     static List<String> variableRows(Path file) throws IOException {
         return Files.readAllLines(file).stream().map(row -> row.split(",\\[", 2)[0]).toList();
+    }
+
+    /**
+     * Checks that the rows of a VAR trace read back into solutions of {@code problem} that the
+     * traces write with the same variables, as a warm start from that trace reads them.
+     */
+    static <S extends Solution<?>> void assertReadBack(Problem<S> problem, Path file) throws IOException {
+        List<S> read = TraceReader.read(problem, file);
+        Path again = file.resolveSibling("again-" + file.getFileName());
+        TraceWriter.write(read, again.toString(), file.resolveSibling("again-FUN.csv").toString(), ",");
+
+        assertEquals(variableRows(file), variableRows(again), file.getFileName() + " read back and written again");
     }
 
     /**
@@ -351,6 +365,7 @@ class NSGAIITest {
             List<String> rows = Files.readAllLines(traces.resolve(file));
             assertFalse(rows.isEmpty(), file);
             rows.forEach(r -> assertTrue(row.matcher(r).matches(), file + ": one bit string per variable, got " + r));
+            assertReadBack(new ZDT5(), traces.resolve(file));
         }
     }
 
@@ -374,6 +389,7 @@ class NSGAIITest {
             assertEquals(POPULATION, rows.size(), file);
             rows.forEach(r -> assertTrue(variables.matcher(r).matches(),
                     file + ": the integers, then one bit string per binary variable, got " + r));
+            assertReadBack(problem, traces.resolve(file));
         }
         assertEquals(EVALUATIONS, problem.evaluations);
     }

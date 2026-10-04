@@ -18,6 +18,11 @@ import java.util.List;
  * {@link WarmStart#FILE}, the file whose presence enabled the warm start and the
  * one copied into the traces.
  *
+ * <p>{@link WarmStart#initialPopulation(org.uma.jmetal.problem.Problem, int)}
+ * implements {@link #createInitialPopulationFromFile(int)} for a file of rows like
+ * those of the {@code VAR} traces, such as the {@code VAR.csv} of another run of the
+ * problem: {@code return WarmStart.initialPopulation(this, populationSize);}.
+ *
  * <p>This interface exists purely to decouple the framework from problem
  * implementations: {@code SteadyStateEvolutionaryAlgorithm} must not depend on any
  * specific problem class.
@@ -38,15 +43,18 @@ public interface WarmStartCapable<S> {
      * typically wants the first solution of the file.
      *
      * <p>Implementations that cannot load their persisted state (missing or
-     * malformed file) should log the error and return a population padded
-     * entirely with random solutions rather than throwing. A list of another
-     * size, or {@code null}, is tolerated with a warning (see
-     * {@link WarmStart#load}): the algorithm decides what a short or long list
-     * means, and {@code null} makes the run start from random solutions.
+     * malformed file) should log the error and return {@code null} rather than
+     * throwing, as {@link WarmStart#initialPopulation} does: the run then starts
+     * from random solutions, and {@link WarmStart#load} neither reports the file
+     * as loaded nor copies it into the traces, which it does for a population
+     * padded entirely with random solutions. A list of another size is tolerated
+     * with a warning (see {@link WarmStart#load}): the algorithm decides what a
+     * short or long list means.
      *
      * @param populationSize number of solutions requested by the algorithm
      * @return a list of {@code populationSize} solutions (see above for what
-     *         happens with another size)
+     *         happens with another size), or {@code null} to start from random
+     *         solutions
      */
     List<S> createInitialPopulationFromFile(int populationSize);
 }

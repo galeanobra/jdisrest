@@ -7,6 +7,7 @@ import es.unex.jdisrest.distributed.RestWorker;
 import es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithm;
 import es.unex.jdisrest.distributed.SteadyStateMaster;
 import es.unex.jdisrest.distributed.rest.MasterFacade;
+import es.unex.jdisrest.util.TraceReader;
 import es.unex.jdisrest.util.TraceWriter;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -49,7 +50,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * however fast they are; the run ends on its budget of {@link #budget()} evaluations. The tests
  * then check that no task was discarded, that every worker evaluated tasks, that every final
  * solution carries the repair, that the result and the last snapshot of the traces hold the rows
- * the encoding should give, that the Python evaluator received every vector with the layout of
+ * the encoding should give and read back into solutions of the problem with {@link TraceReader},
+ * as a warm start reads them, that the Python evaluator received every vector with the layout of
  * the problem and had none of its results refused, and that {@code python/tools/watch_front.py
  * --once} reads the traces and keeps their integers and bit strings as written in
  * {@code front_extremes.csv}.
@@ -253,6 +255,19 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
     }
 
     @Test
+    void resultAndTracesReadBackIntoSolutionsOfTheProblem() throws IOException {
+        Path traced = dataPath.resolve("traces").resolve("aVAR_" + budget() + ".csv");
+        for (Path file : List.of(dataPath.resolve("VAR.csv"), traced)) {
+            List<S> read = TraceReader.read(problem(), file);
+            Path again = dataPath.resolve("again-" + file.getFileName());
+            TraceWriter.write(read, again.toString(), dataPath.resolve("again-FUN.csv").toString(), ",");
+
+            assertEquals(variableRows(file), variableRows(again), file.getFileName() + " read back and written again");
+            read.forEach(s -> assertTrue(isRepaired(s), file.getFileName() + ": the repaired variable reads back too"));
+        }
+    }
+
+    @Test
     void watchFrontKeepsTheVariablesOfTheTracesAsWritten() throws Exception {
         assumeTrue(PYTHON != null, NO_PYTHON + ": watch_front.py did not read the traces");
         Path output = dataPath.resolve("watch-front");
@@ -338,6 +353,11 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
     private static Path checkout() throws URISyntaxException {
         return Path.of(EncodingRunScenario.class.getProtectionDomain().getCodeSource().getLocation().toURI())
                 .getParent().getParent();
+    }
+
+    /** The variables of each row of a VAR file: the text before {@code ,[}, the whole row of a flat solution. */
+    private static List<String> variableRows(Path file) throws IOException {
+        return Files.readAllLines(file).stream().map(row -> row.split(",\\[", 2)[0]).toList();
     }
 
     /** The evaluations the Python evaluator has recorded so far. */
