@@ -112,11 +112,12 @@ mvn install        # deposits into ~/.m2/repository
 runs the integration tests (the `*IT` classes), each class in a JVM of its
 own: they start a real master on a free port and talk to it over HTTP,
 some through `RestWorker`s and the Python command-line worker that
-evaluate a whole run of an integer, a binary or a composite problem,
-built from the configuration files of `examples/` where there is one.
-The Python worker joins them, and `python/tools/watch_front.py` reads the
-traces of the run, when a Python 3.11 or later with `requests` is found;
-both are skipped otherwise.
+evaluate a whole run of a real, an integer or a binary problem, or of a
+composite of those, with each bundled algorithm, built from the
+configuration files of `examples/` where there is one. The Python worker
+joins them, and `python/tools/watch_front.py` reads the traces of the
+run, when a Python 3.11 or later with `requests` is found; both are
+skipped otherwise.
 
 Consumers reference it via:
 

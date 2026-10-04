@@ -55,9 +55,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * solution carries the repair, that the result and the last snapshot of the traces hold the rows
  * the encoding should give and read back into solutions of the problem with {@link TraceReader},
  * as a warm start reads them, that the Python evaluator received every vector with the layout of
- * the problem and had none of its results refused, and that {@code python/tools/watch_front.py
- * --once} reads the traces and keeps their integers and bit strings as written in
- * {@code front_extremes.csv}.
+ * the problem and values of the Python types of their encodings, and had none of its results
+ * refused, and that {@code python/tools/watch_front.py --once} reads the traces, keeps their
+ * integers and bit strings as written in {@code front_extremes.csv} and saves their reals there as
+ * Python writes them, as it did in 1.2.
  *
  * <p>The Python worker needs Python 3.11 or later with {@code requests}: the interpreter that
  * {@code -Djdisrest.test.python} names, else {@code python3} or {@code python} on the
@@ -85,6 +86,21 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
 
     private static final String NO_PYTHON = "no Python 3.11 or later with requests (python3 or python on the "
             + "PATH, or -Djdisrest.test.python=<interpreter>)";
+
+    /**
+     * A real as Java writes it in the traces: always with a point, and with an exponent below
+     * 0.001 and from 10<sup>7</sup> on, such as {@code 0.25} or {@code 1.0E-5}.
+     */
+    static final String JAVA_REAL = "-?\\d+\\.\\d+(E-?\\d+)?";
+
+    /**
+     * A real as {@code watch_front.py} saves it in {@code front_extremes.csv}, as Python writes it:
+     * with a point or an exponent, the exponent below 0.0001 and from 10<sup>16</sup> on, such as
+     * {@code 0.25}, {@code 1e-05} or {@code 1.5e-05}. From 0.001 to 10<sup>7</sup> Java writes a real
+     * alike, so only a real outside that range, such as the 1/3000 that the workers of
+     * {@code DoubleRunIT} and {@code MixedIntegerDoubleRunIT} set, tells the two forms apart.
+     */
+    static final String PYTHON_REAL = "-?\\d+(\\.\\d+(e[-+]\\d+)?|e[-+]\\d+)";
 
     /** Where the master writes {@code .master-endpoint}, its traces and the result. */
     @TempDir
@@ -133,7 +149,10 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
      */
     abstract List<String> pythonWorkerOptions();
 
-    /** The layout of every vector the Python evaluator must receive, as it records it (a JSON object). */
+    /**
+     * What the Python evaluator must record of every vector it receives (a JSON object): its type,
+     * its layout and the Python types of the values of each of its segments.
+     */
     abstract String pythonLayout();
 
     /**

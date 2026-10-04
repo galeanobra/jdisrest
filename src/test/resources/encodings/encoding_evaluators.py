@@ -1,12 +1,15 @@
 """
 Evaluators of the encoding integration tests (EncodingRunScenario) for the command-line worker.
 
-Each applies the repair of the scenario's Java workers, setting the first bit of the first binary
-variable or, without one, the first variable to 100, evaluates the problem as its Java class does,
-and records the layout of every decision vector it receives, one JSON line per evaluation, in the
-file that JDISREST_IT_RECORD names.
+Each applies the repair of the scenario's Java workers: it sets the first bit of the first binary
+variable or, in a problem without one, the first integer variable to 100 and the last real
+variable to 1/3000, of those the problem has. It then evaluates the problem as its Java class
+does, and records what it receives, one JSON line per evaluation, in the file that
+JDISREST_IT_RECORD names: the type and the layout of the decision vector, and the Python types of
+the values of each of its segments.
 """
 import json
+import math
 import os
 
 try:
@@ -18,9 +21,20 @@ except ImportError:  # the repaired bits then go back as Python bools
 def _record(variables):
     line = {"type": type(variables).__name__, "encoding": variables.encoding,
             "segmentSizes": list(variables.segment_sizes), "segmentEncodings": list(variables.segment_encodings),
-            "bitsPerVariable": list(variables.bits_per_variable)}
+            "bitsPerVariable": list(variables.bits_per_variable),
+            "valueTypes": [sorted({type(x).__name__ for x in segment}) for segment in variables.segments()]}
     with open(os.environ["JDISREST_IT_RECORD"], "a", encoding="utf-8") as record:
         record.write(json.dumps(line) + "\n")
+
+
+def zdt1(variables):
+    """jMetal's ZDT1; the variables go back as floats."""
+    _record(variables)
+    repaired = list(variables)
+    repaired[-1] = 1 / 3000
+    f1 = repaired[0]
+    g = 9.0 / (len(repaired) - 1) * sum(repaired[1:]) + 1.0
+    return {"objectives": [f1, (1.0 - math.sqrt(f1 / g)) * g], "variables": repaired}
 
 
 def nmmin(variables):
@@ -44,6 +58,23 @@ def zdt5(variables):
     return {"objectives": [f1, g / f1], "variables": numpy.array(repaired) if numpy else repaired}
 
 
+def mixed_integer_double(variables):
+    """
+    jMetal's MixedIntegerDoubleProblem, whose objectives add up the distances of the values to 100
+    and to -100, truncated to an int after each one as Java's int += double does; the integers go
+    back as ints and the reals as floats.
+    """
+    _record(variables)
+    integers, reals = variables.segments()
+    integers[0] = 100
+    reals[-1] = 1 / 3000
+    to_100 = to_minus_100 = 0
+    for x in integers + reals:
+        to_100 = int(to_100 + abs(100 - x))
+        to_minus_100 = int(to_minus_100 + abs(-100 - x))
+    return {"objectives": [to_100, to_minus_100], "variables": integers + reals}
+
+
 def integer_and_bits(variables):
     """CompositeSmsemoaIT.IntegerAndBits; the integers go back as ints and the bits as Python bools."""
     _record(variables)
@@ -62,3 +93,13 @@ def integers_reals_and_bits(variables):
     total, ones = sum(integers) + reals[0] + reals[1], sum(bits)
     return {"objectives": [total + ones, (32 - total) * (32 - total) / 32.0 + (8 - ones)],
             "variables": integers + reals + bits}
+
+
+def bit_segments(variables):
+    """BinarySegmentsRunIT.BitSegments; the repaired bits go back as the floats 0.0 and 1.0."""
+    _record(variables)
+    first, second = variables.segments()
+    first[0] = 1
+    ones_first, ones_second = sum(first), sum(second)
+    return {"objectives": [ones_first + ones_second, (6 - ones_first) * (6 - ones_first) / 6.0 + (12 - ones_second)],
+            "variables": [float(bit) for bit in first + second]}

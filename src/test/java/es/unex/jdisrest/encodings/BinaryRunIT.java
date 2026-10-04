@@ -72,6 +72,6 @@ class BinaryRunIT extends EncodingRunScenario<BinarySolution> {
     String pythonLayout() {
         return """
                 {"type": "DecisionVector", "encoding": "binary", "segmentSizes": [80], "segmentEncodings": ["binary"],
-                 "bitsPerVariable": [30, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]}""";
+                 "bitsPerVariable": [30, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], "valueTypes": [["int"]]}""";
     }
 }

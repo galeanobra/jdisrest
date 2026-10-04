@@ -119,6 +119,6 @@ class CompositeSmsemoaIT extends EncodingRunScenario<CompositeSolution> {
     String pythonLayout() {
         return """
                 {"type": "DecisionVector", "encoding": "mixed", "segmentSizes": [3, 10],
-                 "segmentEncodings": ["int", "binary"], "bitsPerVariable": [4, 6]}""";
+                 "segmentEncodings": ["int", "binary"], "bitsPerVariable": [4, 6], "valueTypes": [["int"], ["int"]]}""";
     }
 }

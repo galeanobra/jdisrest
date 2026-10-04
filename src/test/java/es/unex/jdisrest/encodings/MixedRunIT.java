@@ -167,13 +167,14 @@ class MixedRunIT extends EncodingRunScenario<CompositeSolution> {
     Pattern varRow() {
         // One token per jMetal variable, joined by spaces: three integers, two reals, then one bit
         // string per binary variable, the repaired bit first; then the objectives and the constraints.
-        return Pattern.compile("(\\d+ ){3}\\S+ \\S+ 1[01]{4} [01]{3},\\[\\S+  \\S+],\\[]");
+        return Pattern.compile("(\\d+ ){3}(" + JAVA_REAL + " ){2}1[01]{4} [01]{3},\\[\\S+  \\S+],\\[]");
     }
 
     @Override
     Pattern extremeVariables() {
-        // The same tokens, each in a column of its own: the integers and the bit strings as written.
-        return Pattern.compile("(\\d+,){3}[^,]+,[^,]+,1[01]{4},[01]{3}");
+        // The same tokens, each in a column of its own: the integers and the bit strings as written,
+        // and the reals in shape only, since Java and Python write those from 0.001 to 1 alike.
+        return Pattern.compile("(\\d+,){3}(" + PYTHON_REAL + ",){2}1[01]{4},[01]{3}");
     }
 
     @Override
@@ -186,7 +187,8 @@ class MixedRunIT extends EncodingRunScenario<CompositeSolution> {
     String pythonLayout() {
         return """
                 {"type": "DecisionVector", "encoding": "mixed", "segmentSizes": [3, 2, 8],
-                 "segmentEncodings": ["int", "double", "binary"], "bitsPerVariable": [5, 3]}""";
+                 "segmentEncodings": ["int", "double", "binary"], "bitsPerVariable": [5, 3],
+                 "valueTypes": [["int"], ["float"], ["int"]]}""";
     }
 
     // ── Changes during the run ────────────────────────────────────────────────

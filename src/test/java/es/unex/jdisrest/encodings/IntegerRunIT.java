@@ -73,6 +73,6 @@ class IntegerRunIT extends EncodingRunScenario<IntegerSolution> {
     String pythonLayout() {
         return """
                 {"type": "DecisionVector", "encoding": "int", "segmentSizes": [20], "segmentEncodings": ["int"],
-                 "bitsPerVariable": []}""";
+                 "bitsPerVariable": [], "valueTypes": [["int"]]}""";
     }
 }
