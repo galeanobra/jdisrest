@@ -15,6 +15,7 @@ from typing import Any, Callable, Union
 import requests
 
 from ._types import EvalResult, Evaluator, Variables
+from ._vector import DecisionVector, _binary_positions, _unknown_encodings
 
 log = logging.getLogger("jdisrest")
 
@@ -88,6 +89,8 @@ class Worker:
         self._session.headers.update({"Content-Type": "application/json"})
         # The endpoint file the worker was created from and its content (see from_endpoint).
         self._endpoint: tuple[Path, bytes] | None = None
+        # The encodings this version does not know that tasks had, each warned about once.
+        self._warned_encodings: set[str] = set()
 
         log.info(f"Worker {self.worker_id} → {self.master_url}")
 
@@ -208,22 +211,33 @@ class Worker:
           evaluator that always fails then no longer spins through the tasks, and
           once the wait has reached its cap takes at most one task in that time.
         - A task payload that names its task but cannot be evaluated (no list of
-          finite numbers as variables), and a result that did not get through (a
-          network error, or an answer that is not one of the above), best-effort:
-          a report that fails too is only logged.
+          finite numbers as variables, or a layout that does not fit them: see
+          :meth:`DecisionVector.from_payload`), and a result that did not get
+          through (a network error, or an answer that is not one of the above),
+          best-effort: a report that fails too is only logged.
+
+        A task whose encoding this version does not know, which a newer master
+        may send, is evaluated: the evaluator gets its values as they are, with
+        a layout checked for its form only (see :class:`DecisionVector`), and
+        the worker logs a warning the first time it meets that encoding.
 
         Args:
             evaluate: An :class:`Evaluator` instance, any other object with an
                       ``evaluate(variables)`` method, or a plain callable
-                      ``(variables) -> result``. ``variables`` is a list of
-                      ints for integer-encoded problems and of floats for
-                      real-encoded ones (a mix for composite problems whose
-                      segments differ).
+                      ``(variables) -> result``. ``variables`` is a
+                      :class:`DecisionVector`: a list of ints for
+                      integer-encoded problems, of floats for real-encoded
+                      ones, of the ints 0 and 1 for the bits of binary ones,
+                      and the segments one after the other for composite
+                      ones, which also says how the vector is laid out.
                       The result may be an :class:`EvalResult`, a plain number
                       (single objective), a sequence of objectives (a list, a
                       tuple or a numpy array), a dict with ``"objectives"`` and
                       optional ``"constraints"`` and ``"variables"``, or an object
-                      with those attributes.
+                      with those attributes. Repaired ``variables`` must have the
+                      length of the task's vector, or be empty; at the
+                      positions of binary variables a ``bool`` or
+                      ``numpy.bool_`` is sent as 0 or 1.
 
         Returns:
             Why the worker stopped: :attr:`FINISHED` (``"finished"``) when the
@@ -305,7 +319,7 @@ class Worker:
                 _expect(resp, 200)
 
                 task_id, variables = self._read_task(resp.json())
-                log.info(f"[task-{task_id}] received ({len(variables)} variables)")
+                log.info(f"[task-{task_id}] received ({_vector_size(variables)})")
 
                 body, error_message = self._evaluate(evaluator, task_id, variables)
                 if body is None:
@@ -357,30 +371,38 @@ class Worker:
         # Only the heartbeat thread sets _stop while the loop runs.
         return self.MASTER_LOST
 
-    def _read_task(self, task: Any) -> tuple[int, list]:
+    def _read_task(self, task: Any) -> tuple[int, DecisionVector]:
         """
-        The id and the variables of a task payload.
+        The id and the decision vector of a task payload.
 
         Raises:
             requests.RequestException: if the payload has no integer ``taskId``,
                         which counts as a failed request, as in RestWorker: an
                         endpoint that answers 200 with JSON to everything (a
                         catch-all gateway) must not keep the worker polling forever.
-            ValueError: if its variables are not a list of finite numbers; the
-                        failure is first reported to the master (best-effort), so
-                        it does not keep the task in flight.
+            ValueError: if its variables are not a list of finite numbers, or its
+                        layout does not fit them; the failure is first reported to
+                        the master (best-effort), so it does not keep the task in
+                        flight.
         """
         task_id = task.get("taskId") if isinstance(task, dict) else None
         if isinstance(task_id, bool) or not isinstance(task_id, numbers.Integral):
             raise _NoTaskId(f"invalid task payload from master: no integer taskId in a {type(task).__name__} payload")
         task_id = int(task_id)
-        problem = _variables_problem(task.get("variables"))
-        if problem is not None:
+        try:
+            variables = DecisionVector.from_payload(task)
+        except ValueError as problem:
             self._report_failure(task_id, f"invalid task payload: {problem}")
-            raise ValueError(f"task {task_id}: {problem}")
-        return task_id, task["variables"]
+            raise ValueError(f"task {task_id}: {problem}") from None
+        for encoding in _unknown_encodings(variables):
+            if encoding not in self._warned_encodings:
+                self._warned_encodings.add(encoding)
+                log.warning(f"[task-{task_id}] variables of an unknown encoding {encoding!r}, perhaps from a newer "
+                            f"master: the evaluator gets them as they are (not repeated for this encoding)")
+        return task_id, variables
 
-    def _evaluate(self, evaluator: Evaluator, task_id: int, variables: list) -> tuple[dict | None, str | None]:
+    def _evaluate(self, evaluator: Evaluator, task_id: int,
+                  variables: DecisionVector) -> tuple[dict | None, str | None]:
         """
         Evaluates one task: returns the result body and None, or None and the
         message for the master once the failure is logged. The traceback is logged
@@ -398,7 +420,8 @@ class Worker:
                 # variable is reported as an evaluation error (the master
                 # requeues the task, or discards it after the failure limit)
                 # instead of as an unreadable request.
-                return _result_body(self.worker_id, _coerce(returned), int((time.monotonic() - t0) * 1000)), None
+                return _result_body(self.worker_id, _coerce(returned), int((time.monotonic() - t0) * 1000),
+                                    variables), None
             except Exception as result_err:
                 failure, with_traceback = result_err, False
         elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -573,7 +596,7 @@ def _coerce(result) -> EvalResult:
     return EvalResult(objectives=list(result))
 
 
-def _result_body(worker_id: str, result: EvalResult, elapsed_ms: int) -> dict:
+def _result_body(worker_id: str, result: EvalResult, elapsed_ms: int, task: DecisionVector | None = None) -> dict:
     """
     Build the JSON body for POST /result, validating and normalizing numbers.
 
@@ -581,10 +604,16 @@ def _result_body(worker_id: str, result: EvalResult, elapsed_ms: int) -> dict:
     finite; variables keep their kind (ints stay ints, everything else becomes
     a float) so the master sees JSON integers for integer-encoded problems.
     numpy scalars are accepted (they register as numbers.Integral / numbers.Real).
+    With the decision vector of the ``task``, repaired variables must have its
+    length (an empty list, which leaves the variables as they are, is sent as
+    it is), and at the positions of its binary variables a bool, a
+    ``numpy.bool_`` or a number within 1e-9 of 0 or 1 is sent as the int 0 or 1.
 
     Raises:
-        ValueError: on a NaN/inf/None value, a non-numeric element or no
-                    objective at all; the message names the field and index.
+        ValueError: on a NaN/inf/None value, a non-numeric element, a value that
+                    is not a bit at a binary position, repaired variables of
+                    another length or no objective at all; the message names
+                    the field and index.
     """
     objectives = _finite_floats("objectives", result.objectives)
     if not objectives:
@@ -599,7 +628,7 @@ def _result_body(worker_id: str, result: EvalResult, elapsed_ms: int) -> dict:
     # original decision (e.g. Lamarckian repair). Workers that do not modify
     # variables omit the field, keeping the wire format backwards-compatible.
     if result.variables is not None:
-        body["variables"] = _wire_numbers("variables", result.variables)
+        body["variables"] = _wire_variables(result.variables, task)
     return body
 
 
@@ -616,32 +645,60 @@ def _finite_floats(field: str, values) -> list[float]:
     return out
 
 
-def _wire_numbers(field: str, values) -> list:
-    """Ints stay ints, other reals become finite floats; raise ValueError otherwise."""
-    out: list = []
-    for i, v in enumerate(values):
-        if v is None or isinstance(v, bool) or not isinstance(v, numbers.Real):
-            raise ValueError(f"{field}[{i}] is not a number: {v!r}")
-        if isinstance(v, numbers.Integral):
-            out.append(int(v))
-        else:
-            f = float(v)
-            if not math.isfinite(f):
-                raise ValueError(f"{field}[{i}] is not finite: {f}")
-            out.append(f)
-    return out
+def _wire_variables(values, task: DecisionVector | None) -> list:
+    """
+    Repaired variables as JSON numbers: with the task's vector, bits at its binary
+    positions (see _result_body), elsewhere as _wire_number; raise ValueError otherwise.
+    """
+    values = list(values)
+    if task is None or not values:
+        return [_wire_number(i, v) for i, v in enumerate(values)]
+    binary = _binary_positions(task)
+    if len(values) != len(binary):
+        # The master would refuse it with 422; refused here, the evaluation error says why in the worker's log too.
+        raise ValueError(f"variables has {len(values)} values but the task has {len(binary)}")
+    return [_wire_bit(i, v) if bit else _wire_number(i, v) for i, (v, bit) in enumerate(zip(values, binary))]
 
 
-def _variables_problem(variables: Any) -> str | None:
-    """Why the variables of a task payload cannot be evaluated, or None if they can."""
-    if not isinstance(variables, list):
-        return "variables is missing" if variables is None else f"variables is a {type(variables).__name__}, not a list"
-    for i, v in enumerate(variables):
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            return f"variables[{i}] is not a number: {v!r}"
-        if isinstance(v, float) and not math.isfinite(v):
-            return f"variables[{i}] is not finite: {v}"
-    return None
+def _wire_number(i: int, v) -> int | float:
+    """A variable: ints stay ints, other reals become finite floats; raise ValueError otherwise."""
+    if v is None or isinstance(v, bool) or not isinstance(v, numbers.Real):
+        raise ValueError(f"variables[{i}] is not a number: {v!r}")
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError(f"variables[{i}] is not finite: {f}")
+    return f
+
+
+def _wire_bit(i: int, v) -> int:
+    """
+    A bit as the int 0 or 1: a bool or a ``numpy.bool_`` (which is not a number
+    for the numbers module), an integer 0 or 1, or a finite real within the
+    master's integrality tolerance (1e-9) of 0 or 1; raise ValueError otherwise.
+    """
+    if isinstance(v, bool) or _is_numpy_bool(v):
+        return int(bool(v))
+    if v is None or not isinstance(v, numbers.Real):
+        raise ValueError(f"variables[{i}] is not a number: {v!r}")
+    if isinstance(v, numbers.Integral):
+        if v == 0 or v == 1:
+            return int(v)
+    else:
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError(f"variables[{i}] is not finite: {f}")
+        if abs(f) <= 1e-9:
+            return 0
+        if abs(f - 1) <= 1e-9:
+            return 1
+    raise ValueError(f"variables[{i}] = {v} is not a bit (0 or 1) but its variable is binary")
+
+
+def _is_numpy_bool(v) -> bool:
+    """Whether ``v`` is a numpy boolean scalar, told by its dtype so that numpy need not be imported."""
+    return getattr(getattr(v, "dtype", None), "kind", None) == "b" and getattr(v, "ndim", None) == 0
 
 
 def _expect(resp: requests.Response, *statuses: int) -> None:
@@ -651,6 +708,20 @@ def _expect(resp: requests.Response, *statuses: int) -> None:
         return
     resp.raise_for_status()  # 4xx and 5xx, with requests' usual message
     raise requests.HTTPError(f"unexpected status {resp.status_code} for url: {resp.url}", response=resp)
+
+
+def _vector_size(vector: DecisionVector) -> str:
+    """
+    The size of a task's vector, for the log: ``30 variables``, or ``11 variables, 80 values``
+    when some variables are binary, each of their bits a value; ``80 values`` alone with an
+    encoding this version does not know, whose variables it cannot count.
+    """
+    if _unknown_encodings(vector):
+        return f"{len(vector)} values"
+    bits = vector.bits_per_variable
+    if not bits:
+        return f"{len(vector)} variables"
+    return f"{len(vector) - sum(bits) + len(bits)} variables, {len(vector)} values"
 
 
 def _describe(error: BaseException) -> str:

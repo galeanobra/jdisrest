@@ -10,13 +10,15 @@ import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.multiobjective.zdt.ZDT5;
 import org.uma.jmetal.solution.binarysolution.BinarySolution;
 
+import java.util.List;
 import java.util.regex.Pattern;
 
 /**
  * NSGA-II on jMetal's ZDT5, a flat binary problem whose variables have different lengths (one of
  * 30 bits, ten of 5), with jMetal's single-point crossover and bit-flip mutation. The tasks travel
  * as 80 bits with {@code bitsPerVariable}, and the workers set the first bit of the first variable
- * before they evaluate.
+ * before they evaluate; the Python worker sends its repaired bits back as booleans,
+ * {@code numpy.bool_} when numpy is installed.
  */
 @EnabledIfSystemProperty(named = "jdisrest.it", matches = "true",
         disabledReason = "an integration test: mvn verify runs it in a JVM of its own; -Djdisrest.it=true runs it alone")
@@ -55,5 +57,23 @@ class BinaryRunIT extends EncodingRunScenario<BinarySolution> {
     Pattern varRow() {
         // One bit string per variable, joined by commas; the repaired bit first.
         return Pattern.compile("1[01]{29}(,[01]{5}){10}");
+    }
+
+    @Override
+    Pattern extremeVariables() {
+        return varRow();  // a flat row is already the variables joined by commas
+    }
+
+    @Override
+    List<String> pythonWorkerOptions() {
+        return List.of("--evaluator", "encoding_evaluators:zdt5", "--encoding", "binary", "--variables", "80",
+                "--objectives", "2");
+    }
+
+    @Override
+    String pythonLayout() {
+        return """
+                {"type": "DecisionVector", "encoding": "binary", "segmentSizes": [80], "segmentEncodings": ["binary"],
+                 "bitsPerVariable": [30, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]}""";
     }
 }

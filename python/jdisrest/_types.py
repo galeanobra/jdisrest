@@ -4,10 +4,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 # Decision vector as delivered by the master: all ints for integer-encoded
-# problems, all floats for real-encoded ones, a mix for composite problems
-# whose segments differ. The evaluator receives only this list, so it tells
-# the kinds apart by the Python type of each value (the task payload's
-# "encoding" field, which says the same, is not passed on).
+# problems, all floats for real-encoded ones, the ints 0 and 1 for each bit of
+# a binary variable, and for composite problems the segments one after the
+# other. The worker hands it to the evaluator as a DecisionVector, a list that
+# also carries the layout the task payload describes (its encoding, the size
+# and encoding of each segment and the length of each binary variable).
 Variables = list[int] | list[float] | list[int | float]
 
 
@@ -32,13 +33,17 @@ class EvalResult:
                  Leave as None to keep the master's original variables.
                  For CompositeSolution problems, the list is the flat
                  concatenation [seg0 | seg1 | ...] in declaration order, same
-                 as what the worker received in the task payload. Integers are
-                 sent as JSON integers and floats as JSON floats; the master
-                 converts each value to the type of the destination variable.
-                 Each value must fit its variable (an integral value for an
-                 integer variable, within the variable's bounds): the master
-                 rejects a vector that does not (422) and counts a failed
-                 evaluation of the task.
+                 as what the worker received in the task payload, with one
+                 value per bit of a binary variable; it must have the length
+                 of the task's vector, or be empty, which also keeps the
+                 original variables. Integers are sent as JSON
+                 integers and floats as JSON floats; the master converts each
+                 value to the type of the destination variable. A bit may also
+                 be a bool or a numpy.bool_, which is sent as 0 or 1; anywhere
+                 else a bool is refused. Each value must fit its variable (an
+                 integral value for an integer variable, 0 or 1 for a bit,
+                 within the variable's bounds): the master rejects a vector
+                 that does not (422) and counts a failed evaluation of the task.
     """
     objectives:  list[float]
     constraints: list[float] | None = field(default=None)
@@ -61,8 +66,12 @@ class Evaluator(ABC):
         Evaluate a candidate solution.
 
         Args:
-            variables: Decision variables sent by the master — ints for an
-                       integer-encoded problem, floats for a real-encoded one.
+            variables: Decision variables sent by the master, a
+                       :class:`DecisionVector`: ints for an integer-encoded
+                       problem, floats for a real-encoded one, the ints 0 and 1
+                       for each bit of a binary variable, the segments one
+                       after the other for a composite one. Its attributes and
+                       ``segments()`` and ``binary_variables()`` give the layout.
 
         Returns:
             EvalResult with at least one objective value (or anything else

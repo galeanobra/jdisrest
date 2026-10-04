@@ -143,6 +143,13 @@ class PythonProcessEvaluatorTest {
                 print(json.dumps(answer), flush=True)
             """;
 
+    /**
+     * A Python 3 interpreter: the one {@code jdisrest.test.python} names, else the first of
+     * {@code python3} and {@code python} on the {@code PATH} ({@code python} first on Windows);
+     * {@code null} if none runs. {@code EncodingRunScenario.findPython} tries the same candidates
+     * for Python 3.11 or later with {@code requests}, which the Python worker needs: keep the two
+     * in step.
+     */
     static String findPython() {
         String configured = System.getProperty("jdisrest.test.python");
         List<String> candidates = configured != null ? List.of(configured)

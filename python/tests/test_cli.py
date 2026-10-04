@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import jdisrest
-from jdisrest import FunctionEvaluator, add_worker_arguments, configure_logging, run_worker
+from jdisrest import DecisionVector, FunctionEvaluator, add_worker_arguments, configure_logging, run_worker
 from jdisrest import _cli, _loader
 
 CODE = {"fit.py": "from jdisrest import EvalResult, Evaluator\n\n"
@@ -98,17 +98,18 @@ def test_the_endpoint_file_is_the_default_master_source():
 
     assert (args.master, args.endpoint, args.timeout, args.worker_id) == (None, ".master-endpoint", 300, None)
     assert (args.code_dir, args.variables, args.objectives, args.non_finite_penalty) == (None, None, None, None)
-    assert args.log_level == "INFO"
+    assert (args.encoding, args.log_level) == (None, "INFO")
 
 
 def test_every_option_is_parsed():
     args = _parse("--evaluator", "fit:evaluate", "--code-dir", "code", "--master", "http://10.0.0.1:8080",
                   "--timeout", "60", "--worker-id", "w-1", "--variables", "3", "--objectives", "2",
-                  "--non-finite-penalty", "1e6", "--log-level", "debug")
+                  "--non-finite-penalty", "1e6", "--log-level", "debug", "--encoding", "binary")
 
     assert (args.evaluator, args.code_dir, args.master, args.timeout, args.worker_id) == (
         "fit:evaluate", "code", "http://10.0.0.1:8080", 60, "w-1")
     assert (args.variables, args.objectives, args.non_finite_penalty, args.log_level) == (3, 2, 1e6, "DEBUG")
+    assert args.encoding == "binary"
 
 
 def test_the_master_url_and_the_endpoint_file_are_mutually_exclusive():
@@ -133,6 +134,7 @@ def test_the_master_url_and_the_endpoint_file_are_mutually_exclusive():
     ["--evaluator", "fit:evaluate", "--non-finite-penalty", "nan"],
     ["--evaluator", "fit:evaluate", "--non-finite-penalty", "inf"],
     ["--evaluator", "fit:evaluate", "--log-level", "LOUD"],
+    ["--evaluator", "fit:evaluate", "--encoding", "bits"],
 ])
 def test_bad_options_are_rejected(arguments):
     with pytest.raises(SystemExit):
@@ -173,10 +175,12 @@ def test_an_attribute_that_cannot_evaluate_is_rejected(code, attribute, error):
 
 def test_the_checks_of_the_options_wrap_the_evaluator(code):
     evaluator = _cli._load_evaluator("fit:evaluate", str(code), number_of_variables=3, number_of_objectives=2,
-                                     non_finite_penalty=1e6)
+                                     non_finite_penalty=1e6, encoding="double")
 
     with pytest.raises(ValueError, match="variables has 2 values but the evaluator expects 3"):
         evaluator.evaluate([1.0, 2.0])
+    with pytest.raises(ValueError, match="variables has encoding int but the evaluator expects double"):
+        evaluator.evaluate(DecisionVector([1, 2, 3]))
     assert evaluator.evaluate([1.0, 2.0, float("nan")]).objectives == [1e6, 1e6]
 
 
@@ -227,11 +231,12 @@ def test_http_and_https_master_urls_are_accepted(url):
 
 def test_main_loads_the_evaluator_and_runs_the_worker(code, workers):
     status = _cli.main(["--evaluator", "fit:evaluate", "--code-dir", str(code), "--master", "http://m:1",
-                        "--worker-id", "w-1"])
+                        "--worker-id", "w-1", "--encoding", "double"])
 
     assert status == 0
     assert [(w.master_url, w.worker_id) for w in workers] == [("http://m:1", "w-1")]
     assert workers[0].evaluator.evaluate([1.0, 2.0]).objectives == [3.0, 2.0]
+    assert workers[0].evaluator.encoding == "double"
 
 
 @pytest.mark.parametrize("reason, status", [(jdisrest.Worker.FINISHED, 0), (jdisrest.Worker.INTERRUPTED, 0),

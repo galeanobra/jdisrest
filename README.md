@@ -111,8 +111,11 @@ mvn install        # deposits into ~/.m2/repository
 `mvn test` runs the unit tests. `mvn verify`, and so `mvn install`, also
 runs the integration tests (the `*IT` classes), each class in a JVM of its
 own: they start a real master on a free port and talk to it over HTTP,
-some through `RestWorker`s that evaluate a whole run of a binary or a
-composite problem.
+some through `RestWorker`s and the Python command-line worker that
+evaluate a whole run of a binary or a composite problem. The Python
+worker joins them, and `python/tools/watch_front.py` reads the traces of
+the run, when a Python 3.11 or later with `requests` is found; both are
+skipped otherwise.
 
 Consumers reference it via:
 
@@ -137,8 +140,10 @@ reinstalling.
 
 The Python `jdisrest` package exposes `Worker`, `Evaluator`, and
 `EvalResult` used by worker processes to connect to a running Java master,
-and a command-line worker (`python -m jdisrest`, also installed as
-`jdisrest-worker`) that evaluates with a function of your own module. See
+`DecisionVector`, the list of variables an evaluator receives, which also
+carries the layout of the task, and a command-line worker
+(`python -m jdisrest`, also installed as `jdisrest-worker`) that evaluates
+with a function of your own module. See
 [`python/README.md`](python/README.md) for both and for the trace tools in
 `python/tools`.
 
@@ -176,7 +181,8 @@ from jdisrest import Worker, EvalResult
 
 def evaluate(variables) -> EvalResult:
     # ints for an integer-encoded problem, floats for a real-encoded one,
-    # 0 and 1 (ints) for each bit of a binary variable
+    # 0 and 1 (ints) for each bit of a binary variable; variables.segments()
+    # and variables.binary_variables() cut a composite or binary vector
     return EvalResult(objectives=[float(sum(x ** 2 for x in variables))])
 
 Worker("http://10.0.0.1:8080").run(evaluate)

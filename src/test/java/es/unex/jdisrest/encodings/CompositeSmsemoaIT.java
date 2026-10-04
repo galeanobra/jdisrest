@@ -28,7 +28,8 @@ import java.util.regex.Pattern;
  * per-segment operators: jdisrest's rounding integer SBX and polynomial mutation, and jMetal's
  * single-point crossover and bit-flip mutation. The tasks travel as three integers and ten bits,
  * with {@code segmentSizes} [3, 10], and the workers set the first bit of the binary segment
- * before they evaluate.
+ * before they evaluate; the Python worker sends the integers back as ints and its repaired bits
+ * as Python booleans.
  */
 @EnabledIfSystemProperty(named = "jdisrest.it", matches = "true",
         disabledReason = "an integration test: mvn verify runs it in a JVM of its own; -Djdisrest.it=true runs it alone")
@@ -100,5 +101,24 @@ class CompositeSmsemoaIT extends EncodingRunScenario<CompositeSolution> {
         // One token per jMetal variable, joined by spaces: three integers, then one bit string per
         // binary variable, the repaired bit first; then the objectives and the constraints.
         return Pattern.compile("(\\d+ ){3}1[01]{3} [01]{6},\\[\\S+  \\S+],\\[]");
+    }
+
+    @Override
+    Pattern extremeVariables() {
+        // The same tokens, each in a column of its own: the integers as written, not as floats.
+        return Pattern.compile("(\\d+,){3}1[01]{3},[01]{6}");
+    }
+
+    @Override
+    List<String> pythonWorkerOptions() {
+        return List.of("--evaluator", "encoding_evaluators:integer_and_bits", "--encoding", "mixed",
+                "--variables", "13", "--objectives", "2");
+    }
+
+    @Override
+    String pythonLayout() {
+        return """
+                {"type": "DecisionVector", "encoding": "mixed", "segmentSizes": [3, 10],
+                 "segmentEncodings": ["int", "binary"], "bitsPerVariable": [4, 6]}""";
     }
 }

@@ -11,6 +11,7 @@ import pytest
 responses = pytest.importorskip("responses")
 import requests
 
+import jdisrest
 from jdisrest import EvalResult, Worker
 from jdisrest._worker import _backoff, _describe
 
@@ -99,6 +100,160 @@ def test_bits_reach_the_evaluator_as_ints_and_a_repair_goes_back_as_ints(payload
     assert [type(v) for v in posted["variables"][-8:]] == [int] * 8, "sent as JSON 0 and 1, which the master takes"
     assert b"true" not in (body if isinstance(body, bytes) else body.encode())
     assert not _calls(responses, f"/tasks/{payload['taskId']}/error")
+
+
+# ── The decision vector and its layout ─────────────────────────────────────
+
+# An integer variable, then two binary variables of 2 and 3 bits in a binary segment.
+INT_BINARY = {"taskId": 12, "variables": [4, 1, 0, 0, 1, 1], "segmentSizes": [1, 5], "encoding": "mixed",
+              "segmentEncodings": ["int", "binary"], "bitsPerVariable": [2, 3]}
+
+
+@pytest.mark.parametrize("payload, layout, segments", [
+    ({"taskId": 44, "variables": [3, -17, 0.25], "segmentSizes": [2, 1], "encoding": "mixed",
+      "segmentEncodings": ["int", "double"]},
+     ("mixed", True, (2, 1), ("int", "double"), ()), [[3, -17], [0.25]]),
+    ({"taskId": 45, "variables": [1, 0, 1, 0, 0, 1, 1, 0], "encoding": "binary", "bitsPerVariable": [3, 5]},
+     ("binary", False, (8,), ("binary",), (3, 5)), [[1, 0, 1, 0, 0, 1, 1, 0]]),
+    (INT_BINARY, ("mixed", True, (1, 5), ("int", "binary"), (2, 3)), [[4], [1, 0, 0, 1, 1]]),
+    ({"taskId": 1, "variables": [3, 7, -1], "segmentSizes": [1, 2]},
+     ("int", True, (1, 2), ("int", "int"), ()), [[3], [7, -1]]),
+])
+@responses.activate
+def test_the_evaluator_gets_the_values_of_the_task_with_their_layout(payload, layout, segments):
+    _mock_master(responses, payload, 200)
+    seen = []
+
+    def evaluate(variables):
+        seen.append((variables, (variables.encoding, variables.composite, variables.segment_sizes,
+                                 variables.segment_encodings, variables.bits_per_variable), variables.segments()))
+        return 1.0
+
+    assert Worker(MASTER, worker_id="w").run(evaluate) == "finished"
+
+    assert [(type(v), list(v), layout_, segments_) for v, layout_, segments_ in seen] == [
+        (jdisrest.DecisionVector, payload["variables"], layout, segments)]
+    assert not _calls(responses, f"/tasks/{payload['taskId']}/error")
+
+
+@responses.activate
+def test_bits_repaired_as_bools_are_sent_as_0_and_1():
+    _mock_master(responses, INT_BINARY, 200)
+
+    def evaluate(variables):
+        integers, bits = variables.segments()
+        return EvalResult(objectives=[1.0], variables=integers + [bit == 0 for bit in bits])  # each bit flipped
+
+    assert Worker(MASTER, worker_id="w").run(evaluate) == "finished"
+
+    body = _calls(responses, "/tasks/12/result")[0].request.body
+    body = body if isinstance(body, bytes) else body.encode()
+    posted = json.loads(body)
+    assert posted["variables"] == [4, 0, 1, 1, 0, 0]
+    assert [type(v) for v in posted["variables"]] == [int] * 6
+    assert b"true" not in body and b"false" not in body, "the master answers JSON booleans with 400"
+    assert not _calls(responses, "/tasks/12/error")
+
+
+@pytest.mark.parametrize("repaired, problem", [
+    ([True, 1, 0, 0, 1, 1], "variables[0] is not a number: True"),
+    ([4, 1, 2, 0, 1, 1], "variables[2] = 2 is not a bit (0 or 1) but its variable is binary"),
+    ([4, 1, 0, 0, 0.5, 1], "variables[4] = 0.5 is not a bit (0 or 1) but its variable is binary"),
+    ([4, 1, 0, 0, 1], "variables has 5 values but the task has 6"),
+])
+@responses.activate
+def test_a_repair_the_master_would_refuse_is_reported_as_an_evaluation_error(repaired, problem):
+    _mock_master(responses, INT_BINARY, result_status=None)
+
+    Worker(MASTER, worker_id="w").run(lambda v: EvalResult(objectives=[1.0], variables=repaired))
+
+    assert not _calls(responses, "/tasks/12/result")
+    assert [e["errorMessage"] for e in _errors(responses, 12)] == [f"ValueError: {problem}"]
+
+
+@responses.activate
+def test_an_empty_repair_still_keeps_the_variables_of_the_master():
+    _mock_master(responses, INT_BINARY, 200)
+
+    Worker(MASTER, worker_id="w").run(lambda v: EvalResult(objectives=[1.0], variables=[]))
+
+    assert json.loads(_calls(responses, "/tasks/12/result")[0].request.body)["variables"] == []
+    assert not _calls(responses, "/tasks/12/error")
+
+
+@responses.activate
+def test_a_repair_in_place_is_checked_against_the_layout_as_received():
+    _mock_master(responses, INT_BINARY, result_status=None)
+
+    def evaluate(variables):
+        variables.append(1)  # the vector now has 7 values, its task 6
+        return EvalResult(objectives=[1.0], variables=variables)
+
+    Worker(MASTER, worker_id="w").run(evaluate)
+
+    assert [e["errorMessage"] for e in _errors(responses, 12)] == [
+        "ValueError: variables has 7 values but the task has 6"]
+
+
+@responses.activate
+def test_an_unknown_encoding_is_evaluated_with_a_single_warning(caplog):
+    responses.add(responses.POST, HEARTBEAT, status=200)
+    for task_id in (1, 2):
+        responses.add(responses.GET, NEXT, json={"taskId": task_id, "variables": [2, 0, 1], "encoding": "permutation"},
+                      status=200)
+        responses.add(responses.POST, f"{MASTER}/api/v1/tasks/{task_id}/result", status=200)
+    responses.add(responses.GET, NEXT, status=410)
+    seen = []
+
+    def evaluate(variables):
+        seen.append((list(variables), variables.encoding))
+        return EvalResult(objectives=[1.0], variables=variables)
+
+    assert Worker(MASTER, worker_id="w").run(evaluate) == "finished"
+
+    assert seen == [([2, 0, 1], "permutation")] * 2
+    assert [json.loads(c.request.body)["variables"] for c in _calls(responses, "/result")] == [[2, 0, 1]] * 2
+    warnings = [m for m in _messages(caplog, logging.WARNING) if "unknown encoding" in m]
+    assert warnings == ["[task-1] variables of an unknown encoding 'permutation', perhaps from a newer master: "
+                        "the evaluator gets them as they are (not repeated for this encoding)"]
+
+
+@responses.activate
+def test_the_segment_sizes_of_an_unknown_encoding_are_not_checked_against_the_values():
+    # A newer encoding could count bits in segmentSizes and send them packed into fewer values.
+    _mock_master(responses, {"taskId": 13, "variables": [5, 6, 7], "segmentSizes": [8, 1], "encoding": "mixed",
+                             "segmentEncodings": ["packed", "int"]}, 200)
+    seen = []
+
+    def evaluate(variables):
+        seen.append((list(variables), variables.segment_sizes))
+        return EvalResult(objectives=[1.0], variables=[5, 6, 8])
+
+    assert Worker(MASTER, worker_id="w").run(evaluate) == "finished"
+
+    assert seen == [([5, 6, 7], (8, 1))]
+    assert json.loads(_calls(responses, "/tasks/13/result")[0].request.body)["variables"] == [5, 6, 8]
+    assert not _calls(responses, "/tasks/13/error")
+
+
+@pytest.mark.parametrize("payload, line", [
+    ({"taskId": 5, "variables": [0.5, -2.0], "encoding": "double"}, "[task-5] received (2 variables)"),
+    ({"taskId": 45, "variables": [1, 0, 1, 0, 0, 1, 1, 0], "encoding": "binary", "bitsPerVariable": [3, 5]},
+     "[task-45] received (2 variables, 8 values)"),
+    (INT_BINARY, "[task-12] received (3 variables, 6 values)"),
+    # A newer encoding could count something else in bitsPerVariable.
+    ({"taskId": 13, "variables": [5, 6, 7], "encoding": "packed", "bitsPerVariable": [8, 16]},
+     "[task-13] received (3 values)"),
+])
+@responses.activate
+def test_the_line_of_a_task_received_counts_the_bits_of_binary_variables_as_values(payload, line, caplog):
+    caplog.set_level(logging.INFO, logger="jdisrest")
+    _mock_master(responses, payload, 200)
+
+    assert Worker(MASTER, worker_id="w").run(lambda v: 1.0) == "finished"
+
+    assert [m for m in _messages(caplog, logging.INFO) if " received (" in m] == [line], \
+        "a binary variable is one variable of as many values as bits"
 
 
 @responses.activate
@@ -214,6 +369,12 @@ def test_a_result_lost_on_the_way_is_reported_through_error():
     ({"taskId": 9, "variables": [1, "NaN"]}, "variables[1] is not a number: 'NaN'"),
     ({"taskId": 9, "variables": [1, None]}, "variables[1] is not a number: None"),
     ({"taskId": 9, "variables": [True]}, "variables[0] is not a number: True"),
+    ({"taskId": 9, "variables": [1, 2, 3, 4], "segmentSizes": [2, 1]},
+     "segmentSizes [2, 1] add up to 3, but variables has 4 values"),
+    ({"taskId": 9, "variables": [1, 0, 1], "encoding": "binary", "bitsPerVariable": [2]},
+     "bitsPerVariable [2] add up to 2, but the vector has 3 bits"),
+    ({"taskId": 9, "variables": [1, 0, 1], "encoding": "binary"},
+     "bitsPerVariable is missing, but the vector has 3 bits"),
 ])
 @responses.activate
 def test_a_malformed_task_that_names_its_task_is_reported_through_error(payload, problem, caplog):
