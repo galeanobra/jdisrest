@@ -1,11 +1,8 @@
 package es.unex.jdisrest.encodings;
 
+import es.unex.jdisrest.config.ConfiguredMaster;
 import es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithm;
-import es.unex.jdisrest.distributed.algorithms.steadystate.NSGAII;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
-import org.uma.jmetal.component.catalogue.common.termination.impl.TerminationByEvaluations;
-import org.uma.jmetal.operator.crossover.impl.SinglePointCrossover;
-import org.uma.jmetal.operator.mutation.impl.BitFlipMutation;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.multiobjective.zdt.ZDT5;
 import org.uma.jmetal.solution.binarysolution.BinarySolution;
@@ -15,10 +12,11 @@ import java.util.regex.Pattern;
 
 /**
  * NSGA-II on jMetal's ZDT5, a flat binary problem whose variables have different lengths (one of
- * 30 bits, ten of 5), with jMetal's single-point crossover and bit-flip mutation. The tasks travel
- * as 80 bits with {@code bitsPerVariable}, and the workers set the first bit of the first variable
- * before they evaluate; the Python worker sends its repaired bits back as booleans,
- * {@code numpy.bool_} when numpy is installed.
+ * 30 bits, ten of 5), built by {@code ConfiguredMaster.createAlgorithm} from
+ * {@code examples/binary.properties}: jMetal's single-point crossover and bit-flip mutation, of
+ * probability 1/80 per bit. The tasks travel as 80 bits with {@code bitsPerVariable}, and the
+ * workers set the first bit of the first variable before they evaluate; the Python worker sends
+ * its repaired bits back as booleans, {@code numpy.bool_} when numpy is installed.
  */
 @EnabledIfSystemProperty(named = "jdisrest.it", matches = "true",
         disabledReason = "an integration test: mvn verify runs it in a JVM of its own; -Djdisrest.it=true runs it alone")
@@ -34,8 +32,8 @@ class BinaryRunIT extends EncodingRunScenario<BinarySolution> {
     @Override
     SteadyStateEvolutionaryAlgorithm<BinarySolution> algorithm(String host, int port, Problem<BinarySolution> problem,
                                                                String tracesFolder) {
-        return new NSGAII<>(host, port, problem, POPULATION_SIZE, new SinglePointCrossover<>(0.9),
-                new BitFlipMutation<>(1.0 / 80), new TerminationByEvaluations(budget()), tracesFolder);
+        return ConfiguredMaster.createAlgorithm(host, port, problem, example("binary.properties", problem,
+                "maxEvaluations=" + budget(), "populationSize=" + POPULATION_SIZE, "tracesFolder=" + tracesFolder));
     }
 
     @Override

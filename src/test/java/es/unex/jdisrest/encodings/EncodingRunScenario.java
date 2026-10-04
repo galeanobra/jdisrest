@@ -2,6 +2,7 @@ package es.unex.jdisrest.encodings;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import es.unex.jdisrest.config.AlgorithmConfig;
 import es.unex.jdisrest.distributed.AbstractMaster;
 import es.unex.jdisrest.distributed.RestWorker;
 import es.unex.jdisrest.distributed.SteadyStateEvolutionaryAlgorithm;
@@ -44,10 +45,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * evaluate ({@link #repair}), so their results carry changed variables back to the master, which
  * must write them into its solutions with the layout it sent them in.
  *
- * <p>Each subclass is one run, started once before its tests: the master is built and its run
- * started; once it is ready the Python worker starts, from the package in {@code python/} of
- * this checkout, and the Java workers start after its first evaluation, so that it takes part
- * however fast they are; the run ends on its budget of {@link #budget()} evaluations. The tests
+ * <p>Each subclass is one run, started once before its tests: the master is built, by hand or by
+ * {@code ConfiguredMaster.createAlgorithm} from a configuration file, and its run started; once
+ * it is ready, {@link #beforeTheWorkersStart} may change its configuration, then the Python worker
+ * starts, from the package in {@code python/} of this checkout, and the Java workers start after
+ * its first evaluation, so that it takes part however fast they are; the run ends on its budget of
+ * {@link #budget()} evaluations. The tests
  * then check that no task was discarded, that every worker evaluated tasks, that every final
  * solution carries the repair, that the result and the last snapshot of the traces hold the rows
  * the encoding should give and read back into solutions of the problem with {@link TraceReader},
@@ -133,6 +136,15 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
     /** The layout of every vector the Python evaluator must receive, as it records it (a JSON object). */
     abstract String pythonLayout();
 
+    /**
+     * Runs once the algorithm is ready, before any worker starts, so before the first result: a
+     * subclass can change the configuration of the run there. Does nothing by default.
+     *
+     * @param url the URL of the master
+     */
+    void beforeTheWorkersStart(String url) throws Exception {
+    }
+
     @BeforeAll
     void runUntilTheBudgetIsSpent() throws Exception {
         assertNull(SteadyStateMaster.getInstance(),
@@ -151,6 +163,7 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
             assertTrue(Instant.now().isBefore(deadline), "the algorithm never became ready");
             Thread.sleep(5);
         }
+        beforeTheWorkersStart(url);
         // Started once the master hands out tasks, so that no worker waits after a 204; the Java
         // workers only after the first evaluation of the Python one, which starts much slower.
         if (PYTHON != null) {
@@ -350,9 +363,27 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
     }
 
     /** The checkout the tests run from, two levels above {@code target/test-classes}. */
-    private static Path checkout() throws URISyntaxException {
+    static Path checkout() throws URISyntaxException {
         return Path.of(EncodingRunScenario.class.getProtectionDomain().getCodeSource().getLocation().toURI())
                 .getParent().getParent();
+    }
+
+    /**
+     * A file of {@code examples/} in this checkout, read for the problem as
+     * {@code ConfiguredMaster} reads it, with {@code key=value} overrides: the tests run from
+     * another working directory.
+     */
+    static AlgorithmConfig example(String name, Problem<?> problem, String... overrides) {
+        try {
+            return AlgorithmConfig.load(checkout().resolve("examples").resolve(name), List.of(overrides), problem);
+        } catch (URISyntaxException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** A request to the master that must be answered, its status and its body as text. */
+    HttpResponse<String> send(HttpRequest.Builder request) throws Exception {
+        return http.send(request.timeout(Duration.ofSeconds(TIMEOUT_S)).build(), HttpResponse.BodyHandlers.ofString());
     }
 
     /** The variables of each row of a VAR file: the text before {@code ,[}, the whole row of a flat solution. */
@@ -396,8 +427,7 @@ abstract class EncodingRunScenario<S extends Solution<?>> {
 
     /** A {@code GET} that must answer {@code 200}, and its JSON body. */
     private JsonNode get(String path) throws Exception {
-        HttpResponse<String> response = http.send(HttpRequest.newBuilder(URI.create(url + path))
-                .timeout(Duration.ofSeconds(TIMEOUT_S)).GET().build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = send(HttpRequest.newBuilder(URI.create(url + path)).GET());
         assertEquals(200, response.statusCode(), "GET " + path);
         return JSON.readTree(response.body());
     }

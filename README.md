@@ -112,10 +112,11 @@ mvn install        # deposits into ~/.m2/repository
 runs the integration tests (the `*IT` classes), each class in a JVM of its
 own: they start a real master on a free port and talk to it over HTTP,
 some through `RestWorker`s and the Python command-line worker that
-evaluate a whole run of a binary or a composite problem. The Python
-worker joins them, and `python/tools/watch_front.py` reads the traces of
-the run, when a Python 3.11 or later with `requests` is found; both are
-skipped otherwise.
+evaluate a whole run of an integer, a binary or a composite problem,
+built from the configuration files of `examples/` where there is one.
+The Python worker joins them, and `python/tools/watch_front.py` reads the
+traces of the run, when a Python 3.11 or later with `requests` is found;
+both are skipped otherwise.
 
 Consumers reference it via:
 
@@ -195,13 +196,17 @@ id.
 
 ### With a configuration file
 
-For a real-coded problem (a jMetal `DoubleProblem` with a public
-no-argument constructor) you need not write the master at all:
+For a problem class with a public no-argument constructor, whose
+solutions have real, integer or binary variables or are composites of
+those, you need not write the master at all:
 `es.unex.jdisrest.config.ConfiguredMaster` reads the algorithm (NSGA-II,
 PAES or MOEA/D), the evaluation budget and the operators from a
 properties file. The files in [`examples/`](examples) list every key with
-its default. For instance, jMetal's ZDT1 (30 variables, 2 objectives)
-with `examples/nsgaii.properties`, from a clone of this repository:
+its default, for real-coded problems and for the operators of each other
+encoding (`integer.properties`, `binary.properties` and
+`composite.properties`). For instance, jMetal's ZDT1 (30 variables, 2
+objectives) with `examples/nsgaii.properties`, from a clone of this
+repository:
 
 ```bash
 mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
@@ -258,7 +263,7 @@ jdisrest/
 │   ├── operator/                 # Custom jMetal operators
 │   └── util/                     # Logging, timings, variable encodings, trace files
 ├── src/test/java/                # JUnit unit tests, and *IT integration tests (mvn verify)
-├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D
+├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D, every encoding
 ├── python/
 │   ├── pyproject.toml            # PEP 621 metadata
 │   ├── jdisrest/                 # Worker-side Python package and command-line worker
@@ -309,8 +314,8 @@ jdisrest/
   integer and binary variables, and composites of them, with the operators
   of each segment under its name (`SolutionLayout`, `Variation`).
 - `es.unex.jdisrest.config.ConfiguredMaster`: launcher that runs a master
-  for a `DoubleProblem` class with such a file, or only validates the file
-  (`--check`). A program that builds its problem itself calls
+  for a problem class of any encoding with such a file, or only validates
+  the file (`--check`). A program that builds its problem itself calls
   `ConfiguredMaster.run` from its own `main`.
 
 Every master also answers `POST /api/v1/stop`, which ends the run as if

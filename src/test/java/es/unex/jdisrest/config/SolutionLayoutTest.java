@@ -34,8 +34,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Layouts of the configuration files: the layout derived from the solutions of each kind of
  * problem, flat and composite, with default names and with those of {@link NamedSegments}; the
- * random numbers the derivation draws; the problems it rejects; the rules of the records; and the
- * comparison with the layout of a flat vector.
+ * random numbers the derivation draws; the problems it rejects; the rules of the records; the
+ * comparison with the layout of a flat vector; and the layouts a configuration read for a layout
+ * fits.
  */
 class SolutionLayoutTest {
 
@@ -305,5 +306,56 @@ class SolutionLayoutTest {
                 () -> assertEquals("the configuration was read for real (1 variable), but the solutions of ZDT5 are "
                         + "binary (80 bits)", SolutionLayout.real(1).mismatch(new ZDT5()), "flat layouts"),
                 () -> assertNull(SolutionLayout.of(mixed()).mismatch(mixed()), "the same shape"));
+    }
+
+    @Test
+    void aRealCodedLayoutOfAnySizeFitsARealCodedProblemAsTheLayoutOfItsVariables() {
+        AtomicInteger created = new AtomicInteger();
+        ZDT1 problem = new ZDT1() {
+            @Override
+            public DoubleSolution createSolution() {
+                created.incrementAndGet();
+                return super.createSolution();
+            }
+        };
+
+        assertAll(
+                () -> assertEquals(SolutionLayout.real(30), SolutionLayout.real(1).fittedTo(problem),
+                        "the records of 1.2 do not know the number of variables"),
+                () -> assertTrue(TestProblems.drawsNoRandomNumber(() -> SolutionLayout.real(30).fittedTo(problem)),
+                        "no random number"),
+                () -> assertEquals(0, created.get(), "no solution"));
+    }
+
+    @Test
+    void anotherLayoutDoesNotFitARealCodedProblem() {
+        SolutionLayout integers = SolutionLayout.of(new NMMin());
+        SolutionLayout realFirst = new SolutionLayout(List.of(new Segment("real", Encoding.DOUBLE, 30),
+                new Segment("integer", Encoding.INT, 2)));
+
+        assertAll(
+                () -> assertEquals("the configuration was read for integer (20 variables), but the solutions of ZDT1 "
+                        + "are real (30 variables)", assertThrows(IllegalArgumentException.class,
+                        () -> integers.fittedTo(new ZDT1())).getMessage(), "the encoding is compared"),
+                () -> assertEquals("the configuration was read for a composite of real (30 variables), integer (2 "
+                        + "variables), but the solutions of ZDT1 are real (30 variables)", assertThrows(
+                        IllegalArgumentException.class, () -> realFirst.fittedTo(new ZDT1())).getMessage(),
+                        "a composite whose first segment is real is no real-coded layout"));
+    }
+
+    @Test
+    void aLayoutFitsAnotherProblemWithItsShapeOnly() {
+        Named problem = mixed();
+        SolutionLayout read = SolutionLayout.of(problem);
+        int before = problem.created.get();
+
+        SolutionLayout fitted = read.fittedTo(problem);
+
+        assertAll(
+                () -> assertSame(read, fitted, "the layout read"),
+                () -> assertEquals(before + 1, problem.created.get(), "one solution gives the shape"),
+                () -> assertEquals("the configuration was read for real (1 variable), but the solutions of ZDT5 are "
+                        + "binary (80 bits)", assertThrows(IllegalArgumentException.class,
+                        () -> SolutionLayout.real(1).fittedTo(new ZDT5())).getMessage(), "another shape"));
     }
 }

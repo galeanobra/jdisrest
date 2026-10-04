@@ -36,8 +36,8 @@
         optimization problems. Provides an embedded Spring Boot master that
         exposes a task API consumed by remote workers; steady-state NSGA-II,
         MOEA/D, SMS-EMOA and PAES; a base class for generational masters;
-        configuration files and a launcher for real-coded problems; and a
-        Java worker.
+        configuration files and a launcher for problems of every encoding;
+        and a Java worker.
     </description>
     <url>https://github.com/galeanobra/jdisrest</url>
 

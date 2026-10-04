@@ -10,7 +10,6 @@ import es.unex.jdisrest.distributed.algorithms.steadystate.PAES;
 import es.unex.jdisrest.distributed.rest.ConfigurationHandler;
 import es.unex.jdisrest.distributed.rest.MasterFacade;
 import es.unex.jdisrest.util.Log;
-import es.unex.jdisrest.util.SolutionVariables.Encoding;
 import org.uma.jmetal.component.catalogue.common.termination.impl.TerminationByEvaluations;
 import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.doubleproblem.DoubleProblem;
@@ -128,30 +127,43 @@ public final class AlgorithmReconfiguration implements ConfigurationHandler {
      */
     public <S extends Solution<?>> AlgorithmReconfiguration(SteadyStateEvolutionaryAlgorithm<S> algorithm,
             AlgorithmConfig initial, Problem<S> problem, ConfigHistory history) {
+        this(algorithm, initial, fittedLayout(algorithm, initial, problem), problem.numberOfObjectives(), history);
+    }
+
+    /**
+     * Creates the handler of a run whose initial configuration was read for {@code layout}, the
+     * layout of the problem's solutions, which is not checked again: {@link ConfiguredMaster} has
+     * just read it from the problem, creating one solution unless the problem is a
+     * {@link DoubleProblem}, and need not create another.
+     *
+     * @param layout             the layout new configurations are read for
+     * @param numberOfObjectives the objectives of the problem, which the MOEA/D lattice size of new
+     *                           configurations must fit
+     * @throws IllegalArgumentException if the algorithm is not the one the configuration describes
+     */
+    AlgorithmReconfiguration(SteadyStateEvolutionaryAlgorithm<?> algorithm, AlgorithmConfig initial,
+            SolutionLayout layout, int numberOfObjectives, ConfigHistory history) {
         this.algorithm = Objects.requireNonNull(algorithm, "algorithm must not be null");
         this.current = Objects.requireNonNull(initial, "initial must not be null");
-        Objects.requireNonNull(problem, "problem must not be null");
+        this.layout = Objects.requireNonNull(layout, "layout must not be null");
+        this.numberOfObjectives = numberOfObjectives;
         this.history = Objects.requireNonNull(history, "history must not be null");
-        String reason = mismatch(initial);
-        if (problem instanceof DoubleProblem) {
-            // As in 1.2, whose configurations of a real-coded problem do not record their size: the
-            // layout of the problem's number of variables, read without creating a solution.
-            layout = SolutionLayout.of(problem);
-            SolutionLayout read = initial.layout();
-            if (reason == null && (read.composite() || read.segments().getFirst().encoding() != Encoding.DOUBLE)) {
-                reason = "the configuration was read for " + read.shape() + ", but the solutions of " + problem.name()
-                        + " are " + layout.shape();
-            }
-        } else {
-            layout = initial.layout();
-            if (reason == null) {
-                reason = layout.mismatch(problem);
-            }
-        }
-        if (reason != null) {
-            throw new IllegalArgumentException(reason);
-        }
-        numberOfObjectives = problem.numberOfObjectives();
+        requireDrives(initial, algorithm);
+    }
+
+    /**
+     * The layout new configurations are read for, once the algorithm is the one {@code initial}
+     * describes: that of {@code initial}, checked against the problem
+     * ({@link SolutionLayout#fittedTo}), which for a {@link DoubleProblem} is the layout of its
+     * number of variables, read without creating a solution, as in 1.2.
+     */
+    private static SolutionLayout fittedLayout(SteadyStateEvolutionaryAlgorithm<?> algorithm, AlgorithmConfig initial,
+            Problem<?> problem) {
+        Objects.requireNonNull(algorithm, "algorithm must not be null");
+        Objects.requireNonNull(initial, "initial must not be null");
+        Objects.requireNonNull(problem, "problem must not be null");
+        requireDrives(initial, algorithm);
+        return initial.layout().fittedTo(problem);
     }
 
     @Override
@@ -296,18 +308,20 @@ public final class AlgorithmReconfiguration implements ConfigurationHandler {
     }
 
     /**
-     * Why the algorithm is not one the configuration can drive, or {@code null} if it is: PAES and
-     * MOEA/D need their own class, whose {@code reconfigure} takes their settings; NSGA-II needs
-     * an algorithm whose variation is the crossover and mutation pair of
+     * Throws unless the algorithm is one the configuration can drive: PAES and MOEA/D need their
+     * own class, whose {@code reconfigure} takes their settings; NSGA-II needs an algorithm whose
+     * variation is the crossover and mutation pair of
      * {@link SteadyStateEvolutionaryAlgorithm#setVariation}, which PAES and MOEA/D are not.
      */
-    private String mismatch(AlgorithmConfig config) {
+    private static void requireDrives(AlgorithmConfig config, SteadyStateEvolutionaryAlgorithm<?> algorithm) {
         boolean fits = switch (config) {
             case NSGAIIConfig _ -> !(algorithm instanceof PAES || algorithm instanceof MOEAD);
             case PAESConfig _ -> algorithm instanceof PAES;
             case MOEADConfig _ -> algorithm instanceof MOEAD;
         };
-        return fits ? null : "a " + config.getClass().getSimpleName() + " cannot drive a running "
-                + algorithm.getClass().getName();
+        if (!fits) {
+            throw new IllegalArgumentException("a " + config.getClass().getSimpleName() + " cannot drive a running "
+                    + algorithm.getClass().getName());
+        }
     }
 }

@@ -151,7 +151,8 @@ public record SolutionLayout(List<Segment> segments) {
      * @throws IllegalArgumentException if the solution or one of its components is of another
      *                                  type, a composite is nested in it, a segment has no values,
      *                                  a binary variable has no bits, or the names of
-     *                                  {@link NamedSegments} do not fit the segments
+     *                                  {@link NamedSegments} do not fit the segments; the class
+     *                                  of the exception, a subclass, is not part of the API
      */
     public static SolutionLayout of(Problem<?> problem) {
         Objects.requireNonNull(problem, "problem must not be null");
@@ -257,7 +258,21 @@ public record SolutionLayout(List<Segment> segments) {
     }
 
     private static IllegalArgumentException cannotConfigure(Problem<?> problem, String reason, Throwable cause) {
-        return new IllegalArgumentException("cannot configure the operators of " + problem.name() + ": " + reason, cause);
+        return new UnsupportedProblemException("cannot configure the operators of " + problem.name() + ": " + reason,
+                cause);
+    }
+
+    /**
+     * Why {@link #of(Problem)} cannot configure the operators of a problem's solutions. Its callers
+     * see an {@link IllegalArgumentException}; its own class lets {@link ConfiguredMaster} tell it
+     * from a failure of the problem itself, such as an exception thrown by its
+     * {@code createSolution()}, which is not wrapped.
+     */
+    @SuppressWarnings("serial")
+    static final class UnsupportedProblemException extends IllegalArgumentException {
+        UnsupportedProblemException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     /**
@@ -309,8 +324,41 @@ public record SolutionLayout(List<Segment> segments) {
         return hasShape(actual.composite(), actual.segments.stream().map(Segment::encoding).toList(),
                 actual.segments.stream().map(Segment::size).toList())
                 ? null
-                : "the configuration was read for " + shape() + ", but the solutions of " + problem.name() + " are "
-                        + actual.shape();
+                : misfit(problem, actual);
+    }
+
+    /**
+     * The layout of the problem's solutions that a configuration read for this layout drives,
+     * checked once: {@link AlgorithmReconfiguration} reads the changes of a run for it, and
+     * {@link ConfiguredMaster#createAlgorithm} builds no algorithm without it. A
+     * {@link DoubleProblem} gives {@link #real} of its number of variables, read without creating
+     * a solution, and this layout need only be that of a real-coded problem that is not
+     * composite, of any size: the records built with the constructors of 1.2 do not know the
+     * number of variables, and their operators fit every real-coded problem. Any other problem
+     * creates one solution, and this layout must have the shape of the problem's
+     * ({@link #mismatch}); it is then the layout returned.
+     *
+     * @throws IllegalArgumentException naming both layouts if this one does not fit, or if the
+     *                                  problem's solutions cannot be configured
+     */
+    SolutionLayout fittedTo(Problem<?> problem) {
+        if (problem instanceof DoubleProblem) {
+            SolutionLayout actual = of(problem);
+            if (composite() || segments.getFirst().encoding() != Encoding.DOUBLE) {
+                throw new IllegalArgumentException(misfit(problem, actual));
+            }
+            return actual;
+        }
+        String reason = mismatch(problem);
+        if (reason != null) {
+            throw new IllegalArgumentException(reason);
+        }
+        return this;
+    }
+
+    private String misfit(Problem<?> problem, SolutionLayout actual) {
+        return "the configuration was read for " + shape() + ", but the solutions of " + problem.name() + " are "
+                + actual.shape();
     }
 
     /** Whether this layout is composite or not as given, with these encodings and sizes in order. */

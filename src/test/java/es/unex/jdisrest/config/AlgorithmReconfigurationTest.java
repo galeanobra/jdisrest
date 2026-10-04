@@ -325,4 +325,27 @@ class AlgorithmReconfigurationTest {
                 () -> assertEquals(1, created, "one solution checks the layout of the configuration"),
                 () -> assertEquals(before + 1, problem.created.get(), "a change is read for that layout"));
     }
+
+    @Test
+    void theHandlerOfTheLauncherTakesTheLayoutItWasGivenWithoutASolution() throws IOException {
+        Named problem = mixed();
+        ServerlessAlgorithm<CompositeSolution> algorithm = algorithm(problem, START);
+        AlgorithmConfig initial = AlgorithmConfig.parseText(START, problem);
+        ConfigHistory history = history(initial, START);
+        int before = problem.created.get();
+
+        AlgorithmReconfiguration handler = new AlgorithmReconfiguration(algorithm, initial, initial.layout(),
+                problem.numberOfObjectives(), history);
+        String applied = handler.apply(NEXT + "bits.mutation.probability=4/n\n");
+
+        assertAll(
+                () -> assertEquals(before, problem.created.get(), "ConfiguredMaster has just read the layout"),
+                () -> assertTrue(applied.contains(", bits [crossover singlePoint (probability 0.9), mutation bitFlip "
+                        + "(probability 0.5)], "), "a change read for that layout: " + applied),
+                () -> assertEquals("a PAESConfig cannot drive a running " + ServerlessAlgorithm.class.getName(),
+                        assertThrows(IllegalArgumentException.class, () -> new AlgorithmReconfiguration(algorithm,
+                                AlgorithmConfig.parseText("algorithm=paes\nmaxEvaluations=1000\n", problem),
+                                initial.layout(), problem.numberOfObjectives(), history)).getMessage(),
+                        "the algorithm is still checked"));
+    }
 }

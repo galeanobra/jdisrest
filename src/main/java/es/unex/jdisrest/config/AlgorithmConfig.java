@@ -45,7 +45,9 @@ import java.util.Objects;
  * normalizeObjectives = false            # MOEA/D only (see MOEADAggregation)
  * </pre>
  *
- * <p>The repository's {@code examples} folder holds a self-documenting file for each algorithm.
+ * <p>The repository's {@code examples} folder holds a self-documenting file for each algorithm,
+ * with the operators of real variables, and one for the operators of each other encoding:
+ * {@code integer.properties}, {@code binary.properties} and {@code composite.properties}.
  *
  * <h2>Scope</h2>
  * <p>The algorithms are exactly {@code nsgaii}, {@code paes} and {@code moead}, one record each
