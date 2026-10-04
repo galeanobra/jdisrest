@@ -2,7 +2,9 @@ package es.unex.jdisrest.distributed;
 
 import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
 import org.uma.jmetal.problem.Problem;
+import org.uma.jmetal.solution.Solution;
 import es.unex.jdisrest.util.Log;
+import es.unex.jdisrest.util.SolutionVariables;
 
 import java.time.Duration;
 import java.util.*;
@@ -96,6 +98,12 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * {@link #submitTasks(List)}.
      */
     private final AtomicInteger discardedInGeneration = new AtomicInteger(0);
+
+    /**
+     * Whether {@link #submitTasks(List)} has checked the solution of a first task (see there).
+     * Only the algorithm thread, which submits the generations, reads and writes it.
+     */
+    private boolean firstSolutionChecked;
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -193,10 +201,29 @@ public abstract class GenerationalMaster<T extends ParallelTask<?>, R> extends A
      * tasks would leave the wait expecting results that never come; either way
      * {@code waitForEvaluatedTasks()} could block until a stop is requested.
      *
+     * <p>The first call that is given a task checks that the vector of its solution, when its
+     * contents are a {@link Solution}, can travel to the workers
+     * ({@link SolutionVariables#layoutOf}), and throws before queueing anything if it cannot: an
+     * unsupported solution type, or a binary variable of no bits. Otherwise every task would fail
+     * when a worker claims it, answered with {@code 500} and counted as a failed evaluation, and
+     * would end up discarded; the generations would then come back empty, and a run with an
+     * evaluation budget would never end. A steady-state master makes the same check when its run
+     * starts. It is made here, on a solution that is about to travel, rather than on a
+     * {@code problem.createSolution()}, which would draw random numbers that a seeded run does not
+     * draw.
+     *
      * @param tasks the batch of unevaluated tasks for the current generation
+     * @throws IllegalArgumentException on the first call, if the solution of the first task cannot
+     *                                  travel to the workers; nothing is queued then
      */
     @Override
     public void submitTasks(List<T> tasks) {
+        if (!firstSolutionChecked && !tasks.isEmpty()) {
+            if (tasks.get(0).getContents() instanceof Solution<?> solution) {
+                SolutionVariables.layoutOf(solution);
+            }
+            firstSolutionChecked = true;
+        }
         discardedInGeneration.set(0);
         pendingTaskQueue.addAll(tasks);
     }

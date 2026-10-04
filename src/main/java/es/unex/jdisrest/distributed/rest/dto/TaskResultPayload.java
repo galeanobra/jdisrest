@@ -34,7 +34,9 @@ import java.util.List;
  * workers, or the worker did not modify the decision) the master keeps the
  * original variables, and only objectives/constraints are updated. The numeric
  * type of each JSON element is irrelevant: the master converts every value to
- * the type of the destination variable ({@code int} or {@code double}).
+ * the type of the destination variable ({@code int} or {@code double}, or a bit of a
+ * binary variable, which must be {@code 0} or {@code 1}; a JSON {@code true} or
+ * {@code false} is not a number, and the body is rejected).
  *
  * @param workerId         identifier of the worker that performed the evaluation;
  *                         a result without it is still accepted

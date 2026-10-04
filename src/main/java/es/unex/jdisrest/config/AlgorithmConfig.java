@@ -5,6 +5,7 @@ import es.unex.jdisrest.distributed.algorithms.steadystate.MOEADWeights;
 import es.unex.jdisrest.distributed.algorithms.steadystate.PAES;
 import org.uma.jmetal.operator.crossover.CrossoverOperator;
 import org.uma.jmetal.operator.mutation.MutationOperator;
+import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.doubleproblem.DoubleProblem;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 
@@ -16,8 +17,8 @@ import java.util.Locale;
 import java.util.Objects;
 
 /**
- * Settings of an NSGA-II, PAES or MOEA/D run on a real-coded problem ({@link DoubleProblem},
- * whose solutions are {@link DoubleSolution}s), read from a properties file:
+ * Settings of an NSGA-II, PAES or MOEA/D run, read from a properties file. For a real-coded
+ * problem ({@link DoubleProblem}, whose solutions are {@link DoubleSolution}s):
  *
  * <pre>
  * algorithm = nsgaii                # nsgaii, paes or moead
@@ -44,23 +45,53 @@ import java.util.Objects;
  * normalizeObjectives = false            # MOEA/D only (see MOEADAggregation)
  * </pre>
  *
- * <p>The repository's {@code examples} folder holds a self-documenting file for each algorithm.
+ * <p>The repository's {@code examples} folder holds a self-documenting file for each algorithm,
+ * with the operators of real variables, and one for the operators of each other encoding:
+ * {@code integer.properties}, {@code binary.properties} and {@code composite.properties}.
  *
  * <h2>Scope</h2>
- * <p>Real-coded problems only: the operators come from the {@link CrossoverType} and
- * {@link MutationType} catalogues, which build {@link DoubleSolution} operators. The algorithms
- * are exactly {@code nsgaii}, {@code paes} and {@code moead}, one record each
- * ({@link NSGAIIConfig}, {@link PAESConfig}, {@link MOEADConfig}).
+ * <p>The algorithms are exactly {@code nsgaii}, {@code paes} and {@code moead}, one record each
+ * ({@link NSGAIIConfig}, {@link PAESConfig}, {@link MOEADConfig}). The problem's solutions may be
+ * {@link DoubleSolution}s, {@code IntegerSolution}s, {@code BinarySolution}s or
+ * {@code CompositeSolution}s of those, which {@link SolutionLayout} describes as segments. The
+ * operators of each segment come from the catalogues of its encoding: {@link CrossoverType} and
+ * {@link MutationType} for real variables, {@link IntegerCrossoverType} and
+ * {@link IntegerMutationType} for integer ones, {@link BinaryCrossoverType} and
+ * {@link BinaryMutationType} for binary ones. A problem that is not composite uses the keys above,
+ * whatever its encoding; the operator keys of a composite one take the name of each segment as
+ * prefix, and the keys without a prefix are then unknown:
+ *
+ * <pre>
+ * # an integer segment named ints
+ * ints.crossover = blxAlpha
+ * ints.crossover.alpha = 0.3
+ * ints.mutation = random
+ * # n is the size of the segment
+ * ints.mutation.probability = 1/n
+ *
+ * # a binary segment named bits
+ * bits.crossover = hux
+ * # n counts its bits
+ * bits.mutation.probability = 2/n
+ * </pre>
+ *
+ * <p>The notes after the values of the first listing only explain them: in a file a comment takes
+ * a line of its own, as in the second, since a {@link java.util.Properties} file reads a
+ * {@code #} after a value as part of the value.
  *
  * <h2>Rules</h2>
  * <ul>
  *   <li>Only {@code algorithm} and {@code maxEvaluations} are required. The others default to the
- *       values above: SBX with probability 0.9 and polynomial mutation with probability 1/n, both
- *       with distribution index 20. With a population smaller than 20, the MOEA/D neighborhood
- *       defaults to the whole population, and the replaced solutions to at most the neighborhood
- *       size.</li>
- *   <li>Every probability can be written as {@code k/n}, k over the number of variables of the
- *       problem, for instance {@code 3/n}; the result must still lie in [0, 1].</li>
+ *       values above: in every segment, a crossover with probability 0.9 and a mutation with
+ *       probability 1/n, SBX and polynomial mutation with distribution index 20 for real and
+ *       integer variables, single-point crossover and bit-flip mutation for binary ones. With a
+ *       population smaller than 20, the MOEA/D neighborhood defaults to the whole population, and
+ *       the replaced solutions to at most the neighborhood size.</li>
+ *   <li>Every probability can be written as {@code k/n}, for instance {@code 3/n}; the result must
+ *       still lie in [0, 1]. In the probability of an operator, n is the size of its segment: its
+ *       variables, or its bits for a binary segment, so 1/n is 1 in a segment of one variable. In
+ *       the other probabilities, n is the sum of those sizes ({@link SolutionLayout}): for a
+ *       real-coded problem, both are the number of variables of the problem.</li>
  *   <li>Names of algorithms and operators are case-insensitive, and spaces around values are
  *       ignored. Numbers are plain decimals ({@code 0.5}, {@code 1e-3}).</li>
  *   <li>A key that the chosen algorithm or operators do not use is an error, so that a misspelt
@@ -78,11 +109,15 @@ import java.util.Objects;
  * <h2>Validation</h2>
  * <p>Every value is checked before anything starts: ranges, the rules of each operator, the
  * operator constructors themselves (each operator is built once while parsing) and, with the
- * methods that take the {@link DoubleProblem}, the MOEA/D lattice size against the number of
- * objectives. A configuration that loads therefore builds its algorithm, and the error of one
- * that does not names the key. The overloads that take only the number of variables check
+ * methods that take the problem, the MOEA/D lattice size against the number of objectives. A
+ * configuration that loads therefore builds its algorithm, and the error of one that does not
+ * names the key. The overloads that take only the number of variables or the layout check
  * everything but the lattice size, which the MOEA/D constructor checks again before its server
  * starts.
+ *
+ * <p>The methods that take a problem read its layout with {@link SolutionLayout#of}: a
+ * {@link DoubleProblem} draws no random number, as in 1.2, while any other problem creates one
+ * solution, which draws the random numbers of its initial values.
  *
  * <h2>API</h2>
  * <p>The public statics are the ones a launcher or a custom
@@ -91,7 +126,9 @@ import java.util.Objects;
  * {@link #fixedDuringRun} to reject changes a running algorithm cannot take, and
  * {@link #writeCopy} to record the configuration in the traces folder. The helpers behind them
  * are package-private. The records are public so that a launcher can build the algorithm from
- * their values; their constructors do no validation, so build them through these methods.
+ * their values, with {@link Variation#createCrossover()} and {@link Variation#createMutation()};
+ * their constructors check no value, only that each segment is given a mutation, so build them
+ * through these methods.
  *
  * @author Francisco Luna (Universidad de Málaga)
  */
@@ -113,20 +150,40 @@ public sealed interface AlgorithmConfig {
     String tracesFolder();
 
     /**
+     * The operators of each segment of the solutions: the crossover (none for PAES) and the
+     * mutation, which build the operators of the run.
+     *
+     * @return the operators
+     */
+    Variation variation();
+
+    /**
+     * The layout the configuration was read for, which decided its operator keys and the
+     * {@code n} of its {@code k/n} probabilities.
+     *
+     * @return the layout of {@link #variation()}
+     */
+    default SolutionLayout layout() {
+        return variation().layout();
+    }
+
+    /**
      * One-line summary for logs and answers, with every value the run uses.
      *
      * @return for instance {@code NSGA-II, 25000 evaluations, population 100, crossover sbx
-     *         (probability 0.9, distributionIndex 20), ...}
+     *         (probability 0.9, distributionIndex 20), ...}, or for a composite problem
+     *         {@code ..., population 100, ints [crossover sbx (...), mutation polynomial (...)],
+     *         bits [...], ...}
      */
     String describe();
 
     // ── Reading ───────────────────────────────────────────────────────────────
 
     /**
-     * Reads a configuration file for a problem, checking everything that depends on it: the
-     * number of variables ({@code k/n} probabilities, the n-point crossover) and the number of
+     * Reads a configuration file for a real-coded problem, checking everything that depends on it:
+     * the number of variables ({@code k/n} probabilities, the n-point crossover) and the number of
      * objectives (the MOEA/D lattice size). This is what a launcher should call, so that a file
-     * it accepts is one the algorithm accepts.
+     * it accepts is one the algorithm accepts. It creates no solution of the problem.
      *
      * @param file      the properties file, read as UTF-8
      * @param overrides {@code key=value} entries that replace or add keys of the file, taken
@@ -161,9 +218,51 @@ public sealed interface AlgorithmConfig {
     }
 
     /**
+     * Reads a configuration file for a problem of any encoding, checking everything that depends
+     * on it: the layout of its solutions ({@link SolutionLayout#of}), which decides the operator
+     * keys, their catalogues, the {@code k/n} probabilities and the operator checks, and the number
+     * of objectives (the MOEA/D lattice size). A {@link DoubleProblem} gives the configuration of
+     * {@link #load(Path, List, DoubleProblem)}; any other problem creates one solution to read its
+     * layout.
+     *
+     * @param file      the properties file, read as UTF-8
+     * @param overrides {@code key=value} entries that replace or add keys of the file, taken
+     *                  literally (no escape sequences)
+     * @param problem   the problem the run optimizes
+     * @return the configuration
+     * @throws InvalidConfigurationException if the file cannot be read, an override is not
+     *                                       {@code key=value}, or a value is missing or wrong
+     * @throws IllegalArgumentException      if the problem's solutions cannot be configured (see
+     *                                       {@link SolutionLayout#of})
+     */
+    static AlgorithmConfig load(Path file, List<String> overrides, Problem<?> problem) {
+        AlgorithmConfig config = load(file, overrides, SolutionLayout.of(problem));
+        AlgorithmConfigParser.checkObjectives(config, problem.numberOfObjectives());
+        return config;
+    }
+
+    /**
+     * Reads a configuration file for the segments of a problem's solutions, checking everything
+     * that depends on them but not the MOEA/D lattice size, which depends on the number of
+     * objectives (see {@link #load(Path, List, Problem)}).
+     *
+     * @param file      the properties file, read as UTF-8
+     * @param overrides {@code key=value} entries that replace or add keys of the file, taken
+     *                  literally (no escape sequences)
+     * @param layout    the segments of the solutions, which decide the operator keys and what
+     *                  {@code k/n} refers to
+     * @return the configuration
+     * @throws InvalidConfigurationException if the file cannot be read, an override is not
+     *                                       {@code key=value}, or a value is missing or wrong
+     */
+    static AlgorithmConfig load(Path file, List<String> overrides, SolutionLayout layout) {
+        return AlgorithmConfigParser.parse(AlgorithmConfigParser.read(file, overrides), layout);
+    }
+
+    /**
      * Reads a configuration from the text of a properties file, for instance the body of
-     * {@code POST /api/v1/config}, checking everything that depends on the problem (see
-     * {@link #load(Path, List, DoubleProblem)}).
+     * {@code POST /api/v1/config}, checking everything that depends on the real-coded problem
+     * (see {@link #load(Path, List, DoubleProblem)}).
      *
      * @param text    the text of a complete properties file: keys left out take their defaults
      * @param problem the problem the run optimizes
@@ -190,6 +289,38 @@ public sealed interface AlgorithmConfig {
      */
     static AlgorithmConfig parseText(String text, int numberOfVariables) {
         return AlgorithmConfigParser.parse(AlgorithmConfigParser.read(text), numberOfVariables);
+    }
+
+    /**
+     * Reads a configuration from the text of a properties file, checking everything that depends
+     * on the problem, whatever its encoding (see {@link #load(Path, List, Problem)}).
+     *
+     * @param text    the text of a complete properties file: keys left out take their defaults
+     * @param problem the problem the run optimizes
+     * @return the configuration
+     * @throws InvalidConfigurationException if a value is missing or wrong
+     * @throws IllegalArgumentException      if the problem's solutions cannot be configured (see
+     *                                       {@link SolutionLayout#of})
+     */
+    static AlgorithmConfig parseText(String text, Problem<?> problem) {
+        AlgorithmConfig config = parseText(text, SolutionLayout.of(problem));
+        AlgorithmConfigParser.checkObjectives(config, problem.numberOfObjectives());
+        return config;
+    }
+
+    /**
+     * Reads a configuration from the text of a properties file for the segments of a problem's
+     * solutions, checking everything that depends on them but not the MOEA/D lattice size (see
+     * {@link #parseText(String, Problem)}).
+     *
+     * @param text   the text of a complete properties file: keys left out take their defaults
+     * @param layout the segments of the solutions, which decide the operator keys and what
+     *               {@code k/n} refers to
+     * @return the configuration
+     * @throws InvalidConfigurationException if a value is missing or wrong
+     */
+    static AlgorithmConfig parseText(String text, SolutionLayout layout) {
+        return AlgorithmConfigParser.parse(AlgorithmConfigParser.read(text), layout);
     }
 
     // ── Runs ──────────────────────────────────────────────────────────────────
@@ -289,20 +420,56 @@ public sealed interface AlgorithmConfig {
      *
      * @param maxEvaluations evaluations after which the run stops
      * @param populationSize number of solutions of the population
-     * @param crossover      the crossover operator
-     * @param mutation       the mutation operator
+     * @param variation      the crossover and the mutation of each segment
      * @param tracesFolder   folder for the trace files, or {@code null} for none
      */
-    record NSGAIIConfig(int maxEvaluations, int populationSize,
-            OperatorConfig<CrossoverOperator<DoubleSolution>> crossover,
-            OperatorConfig<MutationOperator<DoubleSolution>> mutation,
-            String tracesFolder) implements AlgorithmConfig {
+    record NSGAIIConfig(int maxEvaluations, int populationSize, Variation variation, String tracesFolder)
+            implements AlgorithmConfig {
+
+        /**
+         * The settings of a real-coded problem that is not composite, with the components of 1.2.
+         * The record does not know the number of variables the operators were chosen for, so its
+         * {@link #layout()} has a real segment of size 1; the methods that take a
+         * {@link DoubleProblem} read the number from the problem, as in 1.2.
+         *
+         * @param maxEvaluations evaluations after which the run stops
+         * @param populationSize number of solutions of the population
+         * @param crossover      the crossover operator
+         * @param mutation       the mutation operator
+         * @param tracesFolder   folder for the trace files, or {@code null} for none
+         */
+        public NSGAIIConfig(int maxEvaluations, int populationSize,
+                OperatorConfig<CrossoverOperator<DoubleSolution>> crossover,
+                OperatorConfig<MutationOperator<DoubleSolution>> mutation, String tracesFolder) {
+            this(maxEvaluations, populationSize, Variation.real(crossover, mutation), tracesFolder);
+        }
+
+        /**
+         * The crossover of a real-coded problem that is not composite, as in 1.2.
+         *
+         * @return the crossover operator
+         * @throws IllegalStateException if the problem is composite or its variables are not real:
+         *                               use {@link #variation()}
+         */
+        public OperatorConfig<CrossoverOperator<DoubleSolution>> crossover() {
+            return variation.realCrossover();
+        }
+
+        /**
+         * The mutation of a real-coded problem that is not composite, as in 1.2.
+         *
+         * @return the mutation operator
+         * @throws IllegalStateException if the problem is composite or its variables are not real:
+         *                               use {@link #variation()}
+         */
+        public OperatorConfig<MutationOperator<DoubleSolution>> mutation() {
+            return variation.realMutation();
+        }
 
         @Override
         public String describe() {
             return "NSGA-II, " + maxEvaluations + " evaluations, population " + populationSize
-                    + ", crossover " + crossover.describe() + ", mutation " + mutation.describe()
-                    + traces(tracesFolder);
+                    + ", " + variation.describe() + traces(tracesFolder);
         }
     }
 
@@ -312,21 +479,53 @@ public sealed interface AlgorithmConfig {
      *
      * @param maxEvaluations              evaluations after which the run stops
      * @param archiveSize                 maximum number of solutions of the PAES archive
-     * @param mutation                    the mutation operator, the only variation of PAES
+     * @param variation                   the mutation of each segment, the only variation of PAES
+     *                                    (the segments have no crossover)
      * @param archiveSelectionProbability probability of mutating a random archive member instead
      *                                    of the current solution (0 for the classic rule)
      * @param resultSource                the archive the run returns
      * @param tracesFolder                folder for the trace files, or {@code null} for none
      */
-    record PAESConfig(int maxEvaluations, int archiveSize,
-            OperatorConfig<MutationOperator<DoubleSolution>> mutation,
+    record PAESConfig(int maxEvaluations, int archiveSize, Variation variation,
             double archiveSelectionProbability, PAES.ResultSource resultSource,
             String tracesFolder) implements AlgorithmConfig {
+
+        /**
+         * The settings of a real-coded problem that is not composite, with the components of 1.2.
+         * The record does not know the number of variables the mutation was chosen for, so its
+         * {@link #layout()} has a real segment of size 1; the methods that take a
+         * {@link DoubleProblem} read the number from the problem, as in 1.2.
+         *
+         * @param maxEvaluations              evaluations after which the run stops
+         * @param archiveSize                 maximum number of solutions of the PAES archive
+         * @param mutation                    the mutation operator, the only variation of PAES
+         * @param archiveSelectionProbability probability of mutating a random archive member
+         *                                    instead of the current solution (0 for the classic
+         *                                    rule)
+         * @param resultSource                the archive the run returns
+         * @param tracesFolder                folder for the trace files, or {@code null} for none
+         */
+        public PAESConfig(int maxEvaluations, int archiveSize, OperatorConfig<MutationOperator<DoubleSolution>> mutation,
+                double archiveSelectionProbability, PAES.ResultSource resultSource, String tracesFolder) {
+            this(maxEvaluations, archiveSize, Variation.real(null, mutation), archiveSelectionProbability,
+                    resultSource, tracesFolder);
+        }
+
+        /**
+         * The mutation of a real-coded problem that is not composite, as in 1.2.
+         *
+         * @return the mutation operator
+         * @throws IllegalStateException if the problem is composite or its variables are not real:
+         *                               use {@link #variation()}
+         */
+        public OperatorConfig<MutationOperator<DoubleSolution>> mutation() {
+            return variation.realMutation();
+        }
 
         @Override
         public String describe() {
             return "PAES, " + maxEvaluations + " evaluations, archive " + archiveSize
-                    + ", mutation " + mutation.describe()
+                    + ", " + variation.describe()
                     + ", archive selection probability " + OperatorConfig.format(archiveSelectionProbability)
                     + ", result " + (resultSource == PAES.ResultSource.PAES_ARCHIVE ? "paes" : "external")
                     + traces(tracesFolder);
@@ -351,16 +550,67 @@ public sealed interface AlgorithmConfig {
      * @param aggregation                      how a subproblem compares solutions
      * @param normalizeObjectives              whether the aggregation normalizes the objectives
      *                                         with the ideal and nadir points
-     * @param crossover                        the crossover operator
-     * @param mutation                         the mutation operator
+     * @param variation                        the crossover and the mutation of each segment
      * @param tracesFolder                     folder for the trace files, or {@code null} for none
      */
     record MOEADConfig(int maxEvaluations, int populationSize, MOEADWeights.Method weights, int neighborSize,
             double neighborhoodSelectionProbability, int maximumNumberOfReplacedSolutions,
-            MOEAD.AggregationFunction aggregation, boolean normalizeObjectives,
-            OperatorConfig<CrossoverOperator<DoubleSolution>> crossover,
-            OperatorConfig<MutationOperator<DoubleSolution>> mutation,
+            MOEAD.AggregationFunction aggregation, boolean normalizeObjectives, Variation variation,
             String tracesFolder) implements AlgorithmConfig {
+
+        /**
+         * The settings of a real-coded problem that is not composite, with the components of 1.2.
+         * The record does not know the number of variables the operators were chosen for, so its
+         * {@link #layout()} has a real segment of size 1; the methods that take a
+         * {@link DoubleProblem} read the number from the problem, as in 1.2.
+         *
+         * @param maxEvaluations                   evaluations after which the run stops
+         * @param populationSize                   number of subproblems, one solution each
+         * @param weights                          how the weight vectors are generated
+         * @param neighborSize                     subproblems of each neighborhood
+         * @param neighborhoodSelectionProbability probability of taking the parents from the
+         *                                         neighborhood instead of the whole population
+         * @param maximumNumberOfReplacedSolutions solutions of the neighborhood that one offspring
+         *                                         can replace at most
+         * @param aggregation                      how a subproblem compares solutions
+         * @param normalizeObjectives              whether the aggregation normalizes the
+         *                                         objectives with the ideal and nadir points
+         * @param crossover                        the crossover operator
+         * @param mutation                         the mutation operator
+         * @param tracesFolder                     folder for the trace files, or {@code null} for
+         *                                         none
+         */
+        public MOEADConfig(int maxEvaluations, int populationSize, MOEADWeights.Method weights, int neighborSize,
+                double neighborhoodSelectionProbability, int maximumNumberOfReplacedSolutions,
+                MOEAD.AggregationFunction aggregation, boolean normalizeObjectives,
+                OperatorConfig<CrossoverOperator<DoubleSolution>> crossover,
+                OperatorConfig<MutationOperator<DoubleSolution>> mutation, String tracesFolder) {
+            this(maxEvaluations, populationSize, weights, neighborSize, neighborhoodSelectionProbability,
+                    maximumNumberOfReplacedSolutions, aggregation, normalizeObjectives,
+                    Variation.real(crossover, mutation), tracesFolder);
+        }
+
+        /**
+         * The crossover of a real-coded problem that is not composite, as in 1.2.
+         *
+         * @return the crossover operator
+         * @throws IllegalStateException if the problem is composite or its variables are not real:
+         *                               use {@link #variation()}
+         */
+        public OperatorConfig<CrossoverOperator<DoubleSolution>> crossover() {
+            return variation.realCrossover();
+        }
+
+        /**
+         * The mutation of a real-coded problem that is not composite, as in 1.2.
+         *
+         * @return the mutation operator
+         * @throws IllegalStateException if the problem is composite or its variables are not real:
+         *                               use {@link #variation()}
+         */
+        public OperatorConfig<MutationOperator<DoubleSolution>> mutation() {
+            return variation.realMutation();
+        }
 
         @Override
         public String describe() {
@@ -371,8 +621,7 @@ public sealed interface AlgorithmConfig {
                     + maximumNumberOfReplacedSolutions + " replaced), aggregation "
                     + aggregation.name().toLowerCase(Locale.ROOT)
                     + (normalizeObjectives ? " of normalized objectives" : "")
-                    + ", crossover " + crossover.describe() + ", mutation " + mutation.describe()
-                    + traces(tracesFolder);
+                    + ", " + variation.describe() + traces(tracesFolder);
         }
 
         /** The value of the {@code weights} key for a method. */

@@ -7,7 +7,6 @@ import es.unex.jdisrest.distributed.rest.dto.TaskResultPayload;
 import es.unex.jdisrest.util.SolutionVariables;
 import org.uma.jmetal.parallel.asynchronous.task.ParallelTask;
 import org.uma.jmetal.solution.Solution;
-import org.uma.jmetal.solution.compositesolution.CompositeSolution;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.HandlerMapping;
@@ -20,7 +19,6 @@ import es.unex.jdisrest.util.Timings;
 
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * REST controller that manages the task lifecycle between the master algorithm
@@ -60,7 +58,8 @@ import java.util.stream.Collectors;
  *
  * <p>Variable encodings: the decision vector travels as a flat list of JSON
  * numbers whatever the jMetal solution type ({@code IntegerSolution},
- * {@code DoubleSolution} or a {@code CompositeSolution} mixing both). The
+ * {@code DoubleSolution}, {@code BinarySolution}, whose variables take one
+ * {@code 0} or {@code 1} per bit, or a {@code CompositeSolution} mixing them). The
  * conversion in both directions is delegated to {@link SolutionVariables},
  * which always converts by the type of the destination variable rather than
  * trusting the numeric type found in the JSON.
@@ -112,9 +111,10 @@ public class TaskController {
      *   <li>{@code 410 Gone} — the algorithm has finished; worker should shut
      *       down.</li>
      *   <li>{@code 500 Internal Server Error} — the claimed task could not be serialized
-     *       (an unsupported solution type, or a variable that is {@code null}, {@code NaN}
-     *       or infinite); the task has been handled as a failed evaluation (requeued, or
-     *       discarded after too many failures), and the worker may ask again.</li>
+     *       (an unsupported solution type, a variable that is {@code null}, {@code NaN}
+     *       or infinite, or a binary variable of no bits); the task has been handled as a
+     *       failed evaluation (requeued, or discarded after too many failures), and the
+     *       worker may ask again.</li>
      *   <li>{@code 503 Service Unavailable} — the master shut down while the request waited in
      *       the long-poll ({@code 410} if the run had finished by then). The server is closing,
      *       so the worker usually sees a closed connection instead; nothing is logged.</li>
@@ -350,11 +350,16 @@ public class TaskController {
     // ── Payload helpers ───────────────────────────────────────────────────────
 
     /**
-     * Builds the {@link TaskPayload} for a solution.
+     * Builds the {@link TaskPayload} for a solution, with the fields of its layout
+     * ({@link SolutionVariables#layoutOf}).
      *
-     * <p>{@code encoding} and {@code segmentEncodings} are set only when at least
-     * one variable is real-encoded, so integer problems (flat or composite) keep
-     * producing exactly the JSON emitted by earlier versions.
+     * <p>{@code segmentSizes} is set for a composite, and counts the bits of a binary
+     * segment. {@code encoding} and {@code segmentEncodings} are set only when at least one
+     * variable is not an integer one, so integer problems (flat or composite) keep producing
+     * exactly the JSON emitted by earlier versions, and {@code bitsPerVariable} only when a
+     * variable is binary, so problems without binary variables keep producing the JSON of
+     * 1.1 and 1.2. A binary variable therefore always comes with an {@code encoding}: without
+     * it a worker of an integer problem of the same length would take the bits for integers.
      *
      * <p>Every variable must be finite: a JSON number cannot carry {@code NaN} or an
      * infinity (the JSON encoder would write it as a string, which no worker can apply),
@@ -364,22 +369,24 @@ public class TaskController {
      * @param solution the solution to serialize
      * @return the payload to send to the worker
      * @throws IllegalArgumentException if the solution type is unsupported, or a variable is
-     *                                  {@code null}, not a number, {@code NaN} or infinite
+     *                                  {@code null}, not a number, {@code NaN}, infinite or a
+     *                                  binary variable of no bits
      */
     static TaskPayload toPayload(long taskId, Solution<?> solution) {
+        SolutionVariables.VectorLayout layout = SolutionVariables.layoutOf(solution);
         List<Number> variables = SolutionVariables.flatten(solution);
         String notFinite = SolutionVariables.checkFinite(variables);
         if (notFinite != null) {
             throw new IllegalArgumentException(notFinite + " — a JSON number cannot carry it");
         }
-        List<Integer> segSizes = segmentSizes(solution);
-        String encoding = SolutionVariables.wireEncoding(solution);
+        String encoding = layout.wireName();
         if (SolutionVariables.Encoding.INT.wireName().equals(encoding)) {
-            // Legacy format: omit both encoding fields for integer-only problems.
-            return new TaskPayload(taskId, variables, segSizes, null, null);
+            // Legacy format: omit the encoding fields for integer-only problems, which have no bits.
+            return new TaskPayload(taskId, variables, layout.segmentSizes(), null, null, null);
         }
-        List<String> segEncodings = SolutionVariables.wireNames(SolutionVariables.segmentEncodings(solution));
-        return new TaskPayload(taskId, variables, segSizes, encoding, segEncodings);
+        List<Integer> bits = layout.bitsPerVariable();
+        return new TaskPayload(taskId, variables, layout.segmentSizes(), encoding, layout.wireSegmentEncodings(),
+            bits.isEmpty() ? null : bits);
     }
 
     /**
@@ -497,32 +504,5 @@ public class TaskController {
         while (root.getCause() != null && root.getCause() != root) root = root.getCause();
         String msg = root.getMessage() != null ? root.getMessage() : root.getClass().getSimpleName();
         return msg.replaceAll("\\s+", " ").trim();
-    }
-
-    /**
-     * Returns per-segment variable counts for a {@link CompositeSolution}, or
-     * {@code null} for a flat (non-composite) solution.
-     *
-     * <p>When the value is {@code null}, Jackson omits the {@code segmentSizes}
-     * field from the JSON response entirely (via {@code @JsonInclude(NON_NULL)}
-     * on {@link es.unex.jdisrest.distributed.rest.dto.TaskPayload}), keeping the payload
-     * backwards-compatible with workers that were built before composite
-     * encoding was introduced.
-     *
-     * <p>Example: a {@link CompositeSolution} with an integer component of 4
-     * variables and a real one of 2 produces {@code [4, 2]}.
-     *
-     * @param solution the jMetal solution to inspect
-     * @return a list whose {@code i}-th element is the number of variables in
-     *         component {@code i}, or {@code null} for non-composite solutions
-     */
-    static List<Integer> segmentSizes(Solution<?> solution) {
-        if (solution instanceof CompositeSolution composite) {
-            return composite.variables().stream()
-                .map(c -> ((Solution<?>) c).variables().size())
-                .collect(Collectors.toList());
-        }
-        // Returning null causes Jackson to omit the field from the JSON output.
-        return null;
     }
 }

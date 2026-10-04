@@ -23,6 +23,18 @@ Minimal usage
     Worker.wait_for_endpoint(".master-endpoint", timeout=300).run(evaluate)
 
 
+Layout of the decision vector
+-----------------------------
+::
+
+    def evaluate(variables):
+        # A DecisionVector: the list of values, which also says how it is laid out. For a
+        # composite of an integer segment and a binary one with variables of 4 and 6 bits:
+        integers, bits = variables.segments()         # [3, 7, 1], [1, 0, 0, 1, 0, 1, 1, 0, 0, 1]
+        first, second = variables.binary_variables()  # [1, 0, 0, 1], [0, 1, 1, 0, 0, 1]
+        ...
+
+
 Stateful evaluator
 ------------------
 ::
@@ -66,8 +78,9 @@ Monitor progress (from a separate terminal)
 from ._cli import add_worker_arguments, configure_logging, run_worker
 from ._loader import FunctionEvaluator, load_function
 from ._types import EvalResult, Evaluator, Variables
+from ._vector import DecisionVector
 from ._worker import Worker
 
-__all__ = ["Worker", "EvalResult", "Evaluator", "Variables", "FunctionEvaluator", "load_function",
-           "add_worker_arguments", "configure_logging", "run_worker"]
-__version__ = "1.2.1"
+__all__ = ["Worker", "EvalResult", "Evaluator", "Variables", "DecisionVector", "FunctionEvaluator",
+           "load_function", "add_worker_arguments", "configure_logging", "run_worker"]
+__version__ = "1.3.0"

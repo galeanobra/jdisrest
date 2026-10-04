@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from ._loader import FunctionEvaluator, load_function
 from ._types import EvalResult, Evaluator, Variables
+from ._vector import ENCODINGS
 from ._worker import Worker
 
 log = logging.getLogger("jdisrest")
@@ -96,15 +97,15 @@ def run_worker(args: argparse.Namespace, evaluate: Evaluator | Callable[[Variabl
 
 
 def _load_evaluator(spec: str, code_dir: str | None = None, number_of_variables: int | None = None,
-                    number_of_objectives: int | None = None,
-                    non_finite_penalty: float | None = None) -> FunctionEvaluator:
+                    number_of_objectives: int | None = None, non_finite_penalty: float | None = None,
+                    encoding: str | None = None) -> FunctionEvaluator:
     """
     The evaluator named ``MODULE:ATTR``, wrapped in a :class:`FunctionEvaluator` with the given
     checks. ``ATTR`` may be a function, an :class:`Evaluator` subclass, which is instantiated
     without arguments, or an :class:`Evaluator` instance.
 
     Raises:
-        ValueError: if ``spec`` is not ``MODULE:ATTR``, or for a bad count or penalty.
+        ValueError: if ``spec`` is not ``MODULE:ATTR``, or for a bad count, penalty or encoding.
         TypeError: if ``ATTR`` is none of the three.
         FileNotFoundError, ImportError, AttributeError: as :func:`load_function`.
     """
@@ -122,7 +123,7 @@ def _load_evaluator(spec: str, code_dir: str | None = None, number_of_variables:
         function = target
     else:
         raise TypeError(f"{spec} is not a function, an Evaluator subclass or an Evaluator instance")
-    return FunctionEvaluator(function, number_of_variables, number_of_objectives, non_finite_penalty)
+    return FunctionEvaluator(function, number_of_variables, number_of_objectives, non_finite_penalty, encoding)
 
 
 def main(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
@@ -142,7 +143,7 @@ def main(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
     configure_logging(args.log_level)
     try:
         evaluator = _load_evaluator(args.evaluator, args.code_dir, args.variables, args.objectives,
-                                    args.non_finite_penalty)
+                                    args.non_finite_penalty, args.encoding)
     except (ImportError, OSError, AttributeError, TypeError, ValueError) as error:
         log.error(f"Cannot load evaluator {args.evaluator}: {error}")
         return 1
@@ -180,7 +181,10 @@ def _parser(prog: str | None) -> argparse.ArgumentParser:
                              "sys.path: the installed packages and, with python -m, the current folder)")
     add_worker_arguments(parser)
     parser.add_argument("--variables", type=_positive_int, metavar="N",
-                        help="number of variables every task must have (default: not checked)")
+                        help="number of values every task must have, one per bit of a binary variable "
+                             "(default: not checked)")
+    parser.add_argument("--encoding", choices=ENCODINGS,
+                        help="encoding every task must have (default: not checked)")
     parser.add_argument("--objectives", type=_positive_int, metavar="N",
                         help="number of objectives the evaluator must return (default: not checked here; "
                              "the master rejects a wrong count)")

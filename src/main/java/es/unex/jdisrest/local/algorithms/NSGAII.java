@@ -37,7 +37,9 @@ import java.util.stream.Collectors;
  *       non-dominated archive, and {@code VAR_<evals>.csv} / {@code FUN_<evals>.csv}
  *       from the current population. Both pairs unfiltered (feasibility
  *       filtering is reserved for the final result). A final snapshot is written
- *       when the run ends, whatever the trace cadence (see {@link #saveTrace()}).</li>
+ *       when the run ends, whatever the trace cadence (see {@link #saveTrace()}). A
+ *       problem whose solutions the traces cannot hold fails before the first
+ *       evaluation (see {@link #createInitialPopulation()}).</li>
  *   <li>{@code iVAR.csv} warm-start when the problem implements
  *       {@link WarmStartCapable}, with a copy of the file in {@code tracesFolder}
  *       (see {@link WarmStart}). A list of another size than {@code populationSize}
@@ -167,13 +169,27 @@ public class NSGAII<S extends Solution<?>> extends org.uma.jmetal.algorithm.mult
      * Starts from the warm-start population of {@link WarmStart#load} when there is one, fitted
      * to the population size ({@link #fitted}), and from jMetal's random initial population
      * otherwise.
+     *
+     * <p>With a traces folder, it then checks that the traces can hold the first solution
+     * ({@link TraceWriter#check}), so that a problem whose solutions cannot be traced fails before
+     * the initial population is evaluated, not at the first snapshot after it. The check draws no
+     * random number, so a seeded run draws as without it. It runs after the warm start, so a run
+     * it rejects may already have copied {@code iVAR.csv} into the traces folder.
+     *
+     * @throws IllegalArgumentException if the traces cannot hold the first solution
      */
     @Override
     protected List<S> createInitialPopulation() {
         List<S> loaded = WarmStart.load(getProblem(), populationSize, WarmStart.FILE,
                 tracesFolder == null ? null : tracesFolder.toPath());
-        return loaded != null ? fitted(loaded, populationSize, getProblem()::createSolution)
+        List<S> population = loaded != null ? fitted(loaded, populationSize, getProblem()::createSolution)
                 : super.createInitialPopulation();
+        String reason = tracesFolder == null || population.isEmpty() ? null : TraceWriter.check(population.get(0));
+        if (reason != null) {
+            throw new IllegalArgumentException("The traces cannot hold the solutions of " + getProblem().name()
+                    + " (" + reason + "); run without a traces folder to evaluate them anyway");
+        }
+        return population;
     }
 
     /**

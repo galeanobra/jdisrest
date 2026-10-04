@@ -1,16 +1,26 @@
 package es.unex.jdisrest.config;
 
 import es.unex.jdisrest.config.ConfiguredMaster.Launch;
+import es.unex.jdisrest.config.TestProblems.FromFactory;
 import es.unex.jdisrest.distributed.rest.MasterFacade;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.doubleproblem.DoubleProblem;
 import org.uma.jmetal.problem.doubleproblem.impl.AbstractDoubleProblem;
+import org.uma.jmetal.problem.multiobjective.MixedIntegerDoubleProblem;
+import org.uma.jmetal.problem.multiobjective.NMMin;
 import org.uma.jmetal.problem.multiobjective.dtlz.DTLZ2;
 import org.uma.jmetal.problem.multiobjective.zdt.ZDT1;
+import org.uma.jmetal.problem.multiobjective.zdt.ZDT5;
+import org.uma.jmetal.solution.doublesolution.DoubleSolution;
+import org.uma.jmetal.solution.integersolution.IntegerSolution;
+import org.uma.jmetal.solution.permutationsolution.impl.IntegerPermutationSolution;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -22,13 +32,23 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
+import static es.unex.jdisrest.config.TestProblems.bits;
+import static es.unex.jdisrest.config.TestProblems.composite;
+import static es.unex.jdisrest.config.TestProblems.flatIntegers;
+import static es.unex.jdisrest.config.TestProblems.integers;
+import static es.unex.jdisrest.config.TestProblems.mixed;
+import static es.unex.jdisrest.config.TestProblems.reals;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * The generic launcher without starting a master: the command line, {@code --check} with its
  * status and messages, the checks against the problem (variables, objectives, operators), the
- * failures that must happen before the server starts, and the problem class of {@code main}.
+ * failures that must happen before the server starts, and the problem class of {@code main}; for
+ * problems of every encoding, the examples of each, the second line of {@code --check}, the
+ * problems whose solutions cannot be configured, the solutions and random numbers the launcher
+ * takes, and the layout {@link ConfiguredMaster#createAlgorithm} checks.
  */
 class ConfiguredMasterTest {
 
@@ -46,7 +66,7 @@ class ConfiguredMasterTest {
     }
 
     /** Runs {@link ConfiguredMaster#run} with {@link #COMMAND} and {@link #TITLE}. */
-    static Outcome run(Supplier<? extends DoubleProblem> problem, String... args) {
+    static Outcome run(Supplier<? extends Problem<?>> problem, String... args) {
         var out = new ByteArrayOutputStream();
         var err = new ByteArrayOutputStream();
         int status = ConfiguredMaster.run(problem, TITLE, List.of(args), COMMAND,
@@ -95,6 +115,24 @@ class ConfiguredMasterTest {
 
     /** A real-coded problem that cannot be instantiated. */
     public abstract static class UnfinishedProblem extends AbstractDoubleProblem {
+    }
+
+    /** A problem whose solutions are permutations, which no catalogue operator changes. */
+    public static final class PermutationProblem extends FromFactory<IntegerPermutationSolution> {
+        public PermutationProblem() {
+            super("PermutationProblem", () -> new IntegerPermutationSolution(4, 2, 0));
+        }
+    }
+
+    /** ZDT1, counting the solutions it creates. */
+    static final class CountedZDT1 extends ZDT1 {
+        final AtomicInteger created = new AtomicInteger();
+
+        @Override
+        public DoubleSolution createSolution() {
+            created.incrementAndGet();
+            return super.createSolution();
+        }
     }
 
     // ── Command line of a run ─────────────────────────────────────────────────
@@ -372,7 +410,7 @@ class ConfiguredMasterTest {
     @ParameterizedTest
     @CsvSource(delimiter = '|', value = {
             "com.example.MissingProblem|problem class com.example.MissingProblem is not on the class path",
-            "java.lang.String|java.lang.String is not a org.uma.jmetal.problem.doubleproblem.DoubleProblem",
+            "java.lang.String|java.lang.String is not a org.uma.jmetal.problem.Problem",
             "es.unex.jdisrest.config.ConfiguredMasterTest$SizedProblem|"
                     + "es.unex.jdisrest.config.ConfiguredMasterTest$SizedProblem has no public constructor without arguments",
             "es.unex.jdisrest.config.ConfiguredMasterTest$UnfinishedProblem|"
@@ -385,5 +423,215 @@ class ConfiguredMasterTest {
                 () -> assertEquals(1, outcome.status(), "a usage error"),
                 () -> assertTrue(outcome.err().startsWith("Invalid arguments: " + reason), outcome.err()),
                 () -> assertTrue(outcome.err().contains("Usage: ConfiguredMaster <problemClass>"), outcome.err()));
+    }
+
+    // ── Problems of every encoding ────────────────────────────────────────────
+
+    static Stream<Arguments> examplesOfEachEncoding() {
+        return Stream.of(
+                Arguments.of(NMMin.class, "integer.properties", "NMMin: MOEA/D, 25000 evaluations, population 100, "
+                        + "weights spread, neighborhood 20 (selection probability 0.9, at most 2 replaced), aggregation "
+                        + "tchebycheff, crossover sbx (probability 0.9, distributionIndex 20), mutation polynomial "
+                        + "(probability 0.05, distributionIndex 20), traces in traces",
+                        "Variables: 20 integer variables; operator keys crossover, mutation"),
+                Arguments.of(ZDT5.class, "binary.properties", "ZDT5: NSGA-II, 25000 evaluations, population 100, "
+                        + "crossover singlePoint (probability 0.9), mutation bitFlip (probability 0.0125), traces in traces",
+                        "Variables: 80 bits; operator keys crossover, mutation"),
+                Arguments.of(MixedIntegerDoubleProblem.class, "composite.properties", "MixedIntegerDoubleProblem: PAES, "
+                        + "25000 evaluations, archive 100, integer [mutation random (probability 0.2)], real [mutation "
+                        + "polynomial (probability 0.1, distributionIndex 20)], archive selection probability 0, result "
+                        + "paes, traces in traces",
+                        "Variables: integer (10 integer variables), real (10 real variables); operator keys "
+                                + "integer.mutation, real.mutation"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("examplesOfEachEncoding")
+    void theExampleOfEachEncodingPassesTheCheckForItsProblem(Class<?> problem, String example, String summary,
+            String variables) {
+        Outcome outcome = launch(problem.getName(), "--check", Path.of("examples", example).toString());
+
+        assertAll(
+                () -> assertEquals(0, outcome.status(), "the check passes: " + outcome.err()),
+                () -> assertEquals(List.of("Configuration OK for " + summary, variables), outcome.out().lines().toList(),
+                        "the summary, k/n over the values of the problem, then its variables and their keys"),
+                () -> assertEquals("", outcome.err(), "nothing to complain about"));
+    }
+
+    @Test
+    void theCheckOfARealCodedProblemPrintsTheSingleLineOf12() {
+        Outcome outcome = launch(ZDT1_CLASS, "--check", Path.of("examples", "nsgaii.properties").toString());
+
+        assertEquals(List.of("Configuration OK for ZDT1: NSGA-II, 25000 evaluations, population 100, crossover sbx "
+                        + "(probability 0.9, distributionIndex 20), mutation polynomial (probability 0.03333, "
+                        + "distributionIndex 20), traces in traces"), outcome.out().lines().toList(),
+                "no line about the variables, which are those of 1.2");
+    }
+
+    @Test
+    void theCheckOfACompositeNamesItsSegmentsWithTheirSizesAndKeys() throws IOException {
+        Outcome outcome = run(TestProblems::mixed, "--check", nsgaii("ints.mutation = random",
+                "bits.mutation.probability = 2/n"));
+
+        assertAll(
+                () -> assertEquals(0, outcome.status(), "the check passes: " + outcome.err()),
+                () -> assertTrue(outcome.out().contains(", ints [crossover sbx (probability 0.9, distributionIndex 20), "
+                        + "mutation random (probability 0.3333)], reals [crossover sbx (probability 0.9, distributionIndex "
+                        + "20), mutation polynomial (probability 0.5, distributionIndex 20)], bits [crossover singlePoint "
+                        + "(probability 0.9), mutation bitFlip (probability 0.25)], "),
+                        "the operators of each segment, k/n over its size: " + outcome.out()),
+                () -> assertEquals("Variables: ints (3 integer variables), reals (2 real variables), bits (8 bits); "
+                        + "operator keys ints.crossover, ints.mutation, reals.crossover, reals.mutation, bits.crossover, "
+                        + "bits.mutation", outcome.out().lines().toList().getLast(), "the names the problem gives"));
+    }
+
+    @Test
+    void aSegmentOfOneValueCountsItInTheSingular() throws IOException {
+        Outcome outcome = run(() -> new FromFactory<>("Small", () -> composite(integers(1, 0, 5), bits(1))),
+                "--check", nsgaii());
+
+        assertEquals("Variables: integer (1 integer variable), binary (1 bit); operator keys integer.crossover, "
+                + "integer.mutation, binary.crossover, binary.mutation", outcome.out().lines().toList().getLast(),
+                "the default names of the segments");
+    }
+
+    @Test
+    void anOverrideTakesThePrefixOfItsSegment() {
+        Outcome outcome = launch(MixedIntegerDoubleProblem.class.getName(), "--check",
+                Path.of("examples", "composite.properties").toString(), "integer.mutation=gaussian");
+
+        assertTrue(outcome.out().contains(", integer [mutation gaussian (probability 0.2)], "),
+                "the override replaces the mutation of the integer segment: " + outcome.out());
+    }
+
+    @Test
+    void aKeyWithoutThePrefixOfItsSegmentFailsTheCheckOfAComposite() {
+        Outcome outcome = launch(MixedIntegerDoubleProblem.class.getName(), "--check",
+                Path.of("examples", "composite.properties").toString(), "mutation.probability=0.5");
+
+        assertAll(
+                () -> assertEquals(1, outcome.status(), "the check fails"),
+                () -> assertTrue(outcome.err().startsWith("Invalid configuration: unknown keys for paes with these "
+                        + "operators: mutation.probability. Valid keys: algorithm, maxEvaluations, archiveSize, "
+                        + "integer.mutation, integer.mutation.probability, real.mutation, "), outcome.err()),
+                () -> assertEquals("", outcome.out(), "no summary"));
+    }
+
+    @Test
+    void theOperatorsOfAnotherEncodingFailTheCheck() {
+        Outcome outcome = launch(ZDT5.class.getName(), "--check", Path.of("examples", "nsgaii.properties").toString());
+
+        assertAll(
+                () -> assertEquals(1, outcome.status(), "the check fails"),
+                () -> assertEquals("Invalid configuration: crossover must be one of singlePoint, hux, uniform (binary "
+                        + "variables), got 'sbx'", outcome.err().strip(), "the catalogue of the binary variables"));
+    }
+
+    // ── Problems that cannot be configured ────────────────────────────────────
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aProblemWhoseSolutionsCannotBeConfiguredIsReportedWithoutUsageNorStackTrace(boolean check) throws IOException {
+        String file = nsgaii();
+
+        Outcome outcome = check ? run(PermutationProblem::new, "--check", file)
+                : run(PermutationProblem::new, "localhost", "8080", file);
+
+        assertAll(
+                () -> assertEquals(1, outcome.status(), "an unsupported problem"),
+                () -> assertEquals("Unsupported problem: cannot configure the operators of PermutationProblem: its "
+                        + "solutions are " + IntegerPermutationSolution.class.getName() + ", where the configuration "
+                        + "files take a DoubleSolution, an IntegerSolution, a BinarySolution or a CompositeSolution of "
+                        + "those", outcome.err().strip(), "the reason, on one line"),
+                () -> assertEquals("", outcome.out(), "no summary"),
+                () -> assertNull(MasterFacade.configurationHandler(), "no handler registered"));
+    }
+
+    @Test
+    void theLauncherAcceptsTheClassOfAnUnsupportedProblemAndThenReportsIt() throws IOException {
+        Outcome outcome = launch(PermutationProblem.class.getName(), "--check", nsgaii());
+
+        assertAll(
+                () -> assertEquals(1, outcome.status(), "an unsupported problem"),
+                () -> assertTrue(outcome.err().startsWith("Unsupported problem: cannot configure the operators of "
+                        + "PermutationProblem: "), "not a usage error: " + outcome.err()),
+                () -> assertFalse(outcome.err().contains("Usage:"), "no usage text: " + outcome.err()));
+    }
+
+    @Test
+    void aFailureOfTheProblemWhileCreatingASolutionIsNoUnsupportedProblem() throws IOException {
+        var problem = new FromFactory<IntegerSolution>("Broken", () -> {
+            throw new IllegalArgumentException("the model file is missing");
+        });
+
+        Outcome outcome = run(() -> problem, "--check", nsgaii());
+
+        assertAll(
+                () -> assertEquals(1, outcome.status(), "a failure"),
+                () -> assertEquals("", outcome.err(), "logged with its stack trace, not printed as the reason of an "
+                        + "unsupported problem"));
+    }
+
+    // ── Solutions and random numbers ──────────────────────────────────────────
+
+    @Test
+    void aRealCodedProblemIsReadWithoutCreatingASolutionOrDrawingARandomNumber() throws IOException {
+        var problem = new CountedZDT1();
+        String file = nsgaii();
+        String invalid = file("invalid.properties", "algorithm = nsgaii", "maxEvaluations = 25000", "populationSize = 0");
+
+        assertAll(
+                () -> assertTrue(TestProblems.drawsNoRandomNumber(() -> run(() -> problem, "--check", file)),
+                        "the check"),
+                () -> assertTrue(TestProblems.drawsNoRandomNumber(() -> run(() -> problem, "localhost", "8080", invalid)),
+                        "a run, which reads its file as the check does before the master starts"),
+                () -> assertEquals(0, problem.created.get(), "the layout of a DoubleProblem comes from its variables"));
+    }
+
+    @Test
+    void aProblemOfAnotherEncodingCreatesOneSolutionToReadItsLayout() throws IOException {
+        FromFactory<IntegerSolution> problem = flatIntegers();
+        String invalid = file("invalid.properties", "algorithm = nsgaii", "maxEvaluations = 25000", "populationSize = 0");
+
+        Outcome check = run(() -> problem, "--check", nsgaii());
+        int created = problem.created.get();
+        run(() -> problem, "localhost", "8080", invalid);
+
+        assertAll(
+                () -> assertEquals(0, check.status(), "the check passes: " + check.err()),
+                () -> assertEquals(1, created, "one solution for the check"),
+                () -> assertEquals(2, problem.created.get(), "and one for the run, which fails before the master starts"));
+    }
+
+    // ── The layout createAlgorithm checks ─────────────────────────────────────
+
+    @Test
+    void createAlgorithmRefusesAConfigurationReadForAnotherLayoutBeforeBuildingAnything() {
+        AlgorithmConfig binary = AlgorithmConfig.parseText("algorithm = nsgaii\nmaxEvaluations = 100\n", new ZDT5());
+        AlgorithmConfig integer = AlgorithmConfig.parseText("algorithm = paes\nmaxEvaluations = 100\n", new NMMin());
+        AlgorithmConfig composite = AlgorithmConfig.parseText("algorithm = moead\nmaxEvaluations = 100\n",
+                new MixedIntegerDoubleProblem());
+        AlgorithmConfig realFirst = AlgorithmConfig.parseText("algorithm = nsgaii\nmaxEvaluations = 100\n",
+                new FromFactory<>("RealFirst", () -> composite(reals(30, 0.0, 1.0), integers(2, 0, 10))));
+
+        assertAll(
+                () -> assertEquals("the configuration was read for binary (80 bits), but the solutions of NMMin are "
+                        + "integer (20 variables)", assertThrows(IllegalArgumentException.class,
+                        () -> ConfiguredMaster.createAlgorithm("localhost", 0, new NMMin(), binary)).getMessage(),
+                        "a flat problem of another encoding"),
+                () -> assertEquals("the configuration was read for integer (20 variables), but the solutions of ZDT1 are "
+                        + "real (30 variables)", assertThrows(IllegalArgumentException.class,
+                        () -> ConfiguredMaster.createAlgorithm("localhost", 0, new ZDT1(), integer)).getMessage(),
+                        "the overload for a DoubleProblem"),
+                () -> assertEquals("the configuration was read for a composite of real (30 variables), integer (2 "
+                        + "variables), but the solutions of ZDT1 are real (30 variables)", assertThrows(
+                        IllegalArgumentException.class,
+                        () -> ConfiguredMaster.createAlgorithm("localhost", 0, new ZDT1(), realFirst)).getMessage(),
+                        "a composite whose first segment is real, for the overload for a DoubleProblem"),
+                () -> assertEquals("the configuration was read for a composite of integer (10 variables), real (10 "
+                        + "variables), but the solutions of Mixed are a composite of integer (3 variables), real (2 "
+                        + "variables), binary (8 bits)", assertThrows(IllegalArgumentException.class,
+                        () -> ConfiguredMaster.createAlgorithm("localhost", 0, mixed(), composite)).getMessage(),
+                        "a composite of other segments"));
     }
 }

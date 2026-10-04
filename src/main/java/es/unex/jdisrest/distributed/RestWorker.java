@@ -43,22 +43,27 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * while it is busy evaluating, however long one evaluation takes.
  *
  * <h2>Tasks</h2>
- * Each task is evaluated on a fresh {@code problem.createSolution()}. Before the variables are
- * written into it, the layout the master announces ({@code segmentSizes}, {@code encoding},
- * {@code segmentEncodings}) is compared with that solution: a worker whose problem builds a
- * different solution (other segment boundaries, a flat solution where the master has a
- * composite, real variables where the master has integers) would otherwise be filled with
- * misaligned values whenever the total length happens to agree, and evaluate them silently.
+ * Each task is evaluated on a fresh {@code problem.createSolution()}, an {@code IntegerSolution},
+ * a {@code DoubleSolution}, a {@code BinarySolution} whose variables have the lengths the problem
+ * gives them, or a {@code CompositeSolution} of those. Before the variables are written into it,
+ * the layout the master announces ({@code segmentSizes}, {@code encoding},
+ * {@code segmentEncodings}, {@code bitsPerVariable}) is compared with that solution: a worker
+ * whose problem builds a different solution (other segment boundaries, a flat solution where the
+ * master has a composite, real variables where the master has integers, binary variables split
+ * into other lengths) would otherwise be filled with misaligned values whenever the total length
+ * happens to agree, and evaluate them silently. The evaluation must not change that layout
+ * either, for instance by replacing a binary variable with one of another length: the task is
+ * then reported instead of its result, whose vector the master would split as before.
  *
  * <p>Once the task id is known, everything that keeps one task from being evaluated is
  * reported through {@code POST /error}, so the master gets the task back at once (it requeues
  * it, or discards it after the failure limit) instead of leaving it in flight until the worker
  * dies: an unreadable {@code variables} list, a layout mismatch, a vector that does not fit the
- * solution, an exception from {@code createSolution()} or {@code evaluate()}, and a non-finite
- * objective, constraint or variable in the result. The worker then moves on to the next task;
- * after two or more failed tasks in a row it first pauses briefly (as after a {@code 204}), so a
- * worker that cannot evaluate anything does not burn through the master's tasks at network
- * speed.
+ * solution, an exception from {@code createSolution()} or {@code evaluate()}, a layout changed by
+ * the evaluation, and a non-finite objective, constraint or variable in the result. The worker
+ * then moves on to the next task; after two or more failed tasks in a row it first pauses briefly
+ * (as after a {@code 204}), so a worker that cannot evaluate anything does not burn through the
+ * master's tasks at network speed.
  *
  * <p>Lamarckian results: when {@code evaluate()} changes the decision variables (a repair, a
  * local search), the result carries the changed vector in its {@code variables} field and the
@@ -385,11 +390,13 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
         if (mismatch != null) {
             return unusable(taskId, "the task does not match the worker's problem: " + mismatch);
         }
+        SolutionVariables.VectorLayout layout;
         List<Number> sent;
         try {
             // Splits by component for a CompositeSolution and converts every value to the type
             // of its destination variable, so the numeric type Jackson chose is irrelevant.
             SolutionVariables.apply(solution, variables);
+            layout = SolutionVariables.layoutOf(solution);
             sent = SolutionVariables.flatten(solution);
         } catch (IllegalArgumentException e) {
             return unusable(taskId, e.getMessage());
@@ -413,6 +420,8 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
 
         Map<String, Object> body;
         try {
+            String changed = layoutChange(layout, solution);
+            if (changed != null) return unusable(taskId, changed);
             body = resultBody(workerId, solution, sent, elapsed);
         } catch (IllegalArgumentException e) {
             return unusable(taskId, e.getMessage());
@@ -486,11 +495,15 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
      *
      * <p>The fields are the ones the master derives from its own solution
      * ({@code TaskController.toPayload}): {@code segmentSizes} only for a
-     * {@link CompositeSolution}; {@code encoding} {@code "double"} or {@code "mixed"}, absent when
-     * every variable is an integer; {@code segmentEncodings} for composites that are not
-     * all-integer. The local solution must produce the same three values; a field the payload
-     * leaves out is checked through its default (flat, all-integer), except
-     * {@code segmentEncodings}, which is compared only when sent.
+     * {@link CompositeSolution}, a binary segment counting its bits; {@code encoding}
+     * {@code "double"}, {@code "binary"} or {@code "mixed"}, absent when every variable is an
+     * integer; {@code segmentEncodings} for composites that are not all-integer;
+     * {@code bitsPerVariable}, the lengths of the binary variables, only when there are any. The
+     * local solution must produce the same values ({@link SolutionVariables#layoutOf}); a field
+     * the payload leaves out is checked through its default (flat, all-integer, no binary
+     * variable), except {@code segmentEncodings}, which is compared only when sent. A master
+     * that announces binary variables without their lengths therefore does not match a local
+     * solution that has some.
      *
      * @param task  the decoded body
      * @param local the solution the worker's problem built
@@ -500,6 +513,7 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
         Object rawSizes = task.get("segmentSizes");
         Object rawEncoding = task.get("encoding");
         Object rawSegmentEncodings = task.get("segmentEncodings");
+        Object rawBits = task.get("bitsPerVariable");
 
         List<Integer> sizes = null;
         if (rawSizes != null) {
@@ -516,16 +530,24 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
                 || !list.stream().allMatch(String.class::isInstance))) {
             return "segmentEncodings is not a list of strings: " + describe(rawSegmentEncodings);
         }
+        List<Integer> bits = List.of();
+        if (rawBits != null) {
+            if (!(rawBits instanceof List<?> list) || !list.stream().allMatch(b -> b instanceof Integer i && i > 0)) {
+                return "bitsPerVariable is not a list of positive integers: " + describe(rawBits);
+            }
+            bits = list.stream().map(Integer.class::cast).toList();
+        }
 
-        List<Integer> localSizes = null;
+        List<Integer> localSizes;
         String localEncoding;
         List<String> localSegmentEncodings;
+        List<Integer> localBits;
         try {
-            if (local instanceof CompositeSolution composite) {
-                localSizes = composite.variables().stream().map(c -> c.variables().size()).toList();
-            }
-            localEncoding = SolutionVariables.wireEncoding(local);
-            localSegmentEncodings = SolutionVariables.wireNames(SolutionVariables.segmentEncodings(local));
+            SolutionVariables.VectorLayout layout = SolutionVariables.layoutOf(local);
+            localSizes = layout.segmentSizes();
+            localEncoding = layout.wireName();
+            localSegmentEncodings = layout.wireSegmentEncodings();
+            localBits = layout.bitsPerVariable();
         } catch (IllegalArgumentException e) {
             // A solution type the wire format does not support. Never return a null message:
             // null means "the layouts agree".
@@ -546,7 +568,46 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
             return "segmentEncodings " + rawSegmentEncodings + " from the master, but the local solution has "
                     + localSegmentEncodings;
         }
+        if (!bits.equals(localBits)) {
+            return "bitsPerVariable " + describeBits(bits) + " from the master, but the local solution has "
+                    + describeBits(localBits);
+        }
         return null;
+    }
+
+    /**
+     * Tells whether the evaluation changed the layout of the solution, which must keep the one
+     * the master announced, so that the vector of the result is split as the task's was: an
+     * evaluation that replaces a binary variable with one of another length, for instance, could
+     * keep the total length and send back bits that the master would write into the wrong
+     * variables.
+     *
+     * @param before    the layout of the solution before the evaluation
+     * @param evaluated the solution after the evaluation
+     * @return {@code null} if the layout is the same, otherwise what changed
+     * @throws IllegalArgumentException if the layout of the evaluated solution cannot be read
+     *                                  ({@link SolutionVariables#layoutOf}), for instance after the
+     *                                  evaluation set a variable to {@code null}
+     */
+    static String layoutChange(SolutionVariables.VectorLayout before, Solution<?> evaluated) {
+        SolutionVariables.VectorLayout after = SolutionVariables.layoutOf(evaluated);
+        if (after.equals(before)) return null;
+        String change;
+        if (!Objects.equals(before.segmentSizes(), after.segmentSizes())) {
+            change = "segmentSizes " + describeSizes(before.segmentSizes()) + " before it, "
+                    + describeSizes(after.segmentSizes()) + " after";
+        } else if (!before.wireName().equals(after.wireName())) {
+            change = "encoding \"" + before.wireName() + "\" before it, \"" + after.wireName() + "\" after";
+        } else if (!Objects.equals(before.wireSegmentEncodings(), after.wireSegmentEncodings())) {
+            change = "segmentEncodings " + before.wireSegmentEncodings() + " before it, "
+                    + after.wireSegmentEncodings() + " after";
+        } else if (!before.bitsPerVariable().equals(after.bitsPerVariable())) {
+            change = "bitsPerVariable " + describeBits(before.bitsPerVariable()) + " before it, "
+                    + describeBits(after.bitsPerVariable()) + " after";
+        } else {
+            change = before.width() + " values before it, " + after.width() + " after";
+        }
+        return "the evaluation changed the layout of the solution: " + change;
     }
 
     // ── Result payload ────────────────────────────────────────────────────────
@@ -607,6 +668,10 @@ public class RestWorker<S extends Solution<?>> implements Closeable {
 
     private static String describeSizes(List<Integer> sizes) {
         return sizes == null ? "none (a flat solution)" : sizes.toString();
+    }
+
+    private static String describeBits(List<Integer> bits) {
+        return bits.isEmpty() ? "none (no binary variable)" : bits.toString();
     }
 
     // ── HTTP calls ────────────────────────────────────────────────────────────

@@ -16,7 +16,9 @@ import java.util.function.BiFunction;
 /**
  * Crossover operators for real-coded problems ({@link DoubleSolution}) that a configuration file
  * can name in its {@code crossover} key, with their parameters as {@code crossover.<parameter>}
- * and the application probability as {@code crossover.probability}.
+ * and the application probability as {@code crossover.probability}; for a real segment of a
+ * composite problem, under the same keys with the name of the segment as prefix (see
+ * {@link SolutionLayout}).
  *
  * <p>All of them take two parents and return two children, as the steady-state algorithms of
  * jdisrest expect: they select two parents for each task and use both children. Parameters are
@@ -84,8 +86,9 @@ public enum CrossoverType implements OperatorType<CrossoverOperator<DoubleSoluti
      * N-point crossover ({@link DoubleNPointCrossover}): the children swap the segments between
      * {@code points} random cuts (default 2), which fall only between blocks of {@code blockSize}
      * consecutive variables (default 1, any position). Both must be integers; the rules of
-     * {@link DoubleNPointCrossover#check} apply: the block size divides the number of variables,
-     * there are at least 2 blocks, and there are fewer points than blocks.
+     * {@link DoubleNPointCrossover#check} apply: the block size divides the number of variables
+     * (of the segment, in a composite), there are at least 2 blocks, and there are fewer points
+     * than blocks.
      */
     N_POINT("nPoint", List.of(new Parameter("points", 2.0), new Parameter("blockSize", 1.0)),
             (probability, parameters) -> new DoubleNPointCrossover(probability, parameters.get("points").intValue(),

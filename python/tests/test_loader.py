@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jdisrest import EvalResult, FunctionEvaluator, Worker, load_function
+from jdisrest import DecisionVector, EvalResult, FunctionEvaluator, Worker, load_function
 from jdisrest import _loader
 from jdisrest._worker import _result_body
 
@@ -212,7 +212,35 @@ def test_the_function_receives_the_variables_as_a_list():
 
     FunctionEvaluator(lambda variables: received.append(variables) or [0.0]).evaluate((1, 2))
 
-    assert received == [[1, 2]]
+    assert received == [[1, 2]] and type(received[0]) is list
+
+
+def test_a_numpy_array_reaches_the_function_as_a_list():
+    np = pytest.importorskip("numpy")
+    received = []
+
+    FunctionEvaluator(lambda variables: received.append(variables) or [0.0]).evaluate(np.array([1.5, 2.0]))
+
+    assert received == [[1.5, 2.0]] and type(received[0]) is list
+
+
+def test_the_function_receives_a_copy_of_the_decision_vector_with_its_layout():
+    task = DecisionVector([4, 1, 0, 1], encoding="mixed", segment_sizes=[1, 3], segment_encodings=["int", "binary"],
+                          bits_per_variable=[3])
+    received = []
+
+    def evaluate(variables):
+        received.append(variables)
+        variables[1] = 0  # a repair in place
+        return EvalResult(objectives=[1.0], variables=variables)
+
+    result = FunctionEvaluator(evaluate).evaluate(task)
+
+    assert type(received[0]) is DecisionVector and received[0] is not task
+    assert (received[0].segment_sizes, received[0].bits_per_variable) == ((1, 3), (3,))
+    assert received[0].binary_variables() == [[0, 0, 1]]
+    assert task == [4, 1, 0, 1], "the worker's vector is unchanged"
+    assert result.variables == [4, 0, 0, 1]
 
 
 def test_a_wrong_number_of_variables_is_rejected_before_the_function_is_called():
@@ -221,6 +249,23 @@ def test_a_wrong_number_of_variables_is_rejected_before_the_function_is_called()
 
     with pytest.raises(ValueError, match="variables has 2 values but the evaluator expects 3"):
         FunctionEvaluator(evaluate, number_of_variables=3).evaluate([0.0, 0.0])
+
+
+def test_a_wrong_encoding_is_rejected_before_the_function_is_called():
+    def evaluate(variables):
+        raise AssertionError("must not be called")
+
+    task = DecisionVector([4, 1], encoding="mixed", segment_sizes=[1, 1], segment_encodings=["int", "binary"],
+                          bits_per_variable=[1])
+    with pytest.raises(ValueError, match="variables has encoding mixed but the evaluator expects binary"):
+        FunctionEvaluator(evaluate, encoding="binary").evaluate(task)
+
+
+def test_the_encoding_is_checked_on_a_decision_vector_only():
+    evaluator = FunctionEvaluator(lambda v: [float(sum(v))], encoding="binary")
+
+    assert evaluator.evaluate(DecisionVector([1, 0, 1], encoding="binary", bits_per_variable=[3])).objectives == [2.0]
+    assert evaluator.evaluate([1, 2]).objectives == [3.0], "a plain list carries no encoding"
 
 
 def test_a_wrong_number_of_objectives_is_rejected():
@@ -275,6 +320,8 @@ def test_a_return_value_that_is_not_a_result_is_rejected(returned):
     {"non_finite_penalty": math.nan},
     {"non_finite_penalty": math.inf},
     {"non_finite_penalty": "1e6"},
+    {"encoding": "bits"},
+    {"encoding": "Binary"},
 ])
 def test_bad_checks_are_rejected_when_the_evaluator_is_built(arguments):
     with pytest.raises(ValueError, match=next(iter(arguments))):

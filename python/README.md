@@ -32,8 +32,8 @@ you, with no worker script to write:
 
 ```bash
 python -m jdisrest --evaluator MODULE:ATTR [--code-dir DIR] [--master URL | --endpoint FILE]
-                   [--timeout SECONDS] [--worker-id ID] [--variables N] [--objectives N]
-                   [--non-finite-penalty X] [--log-level LEVEL]
+                   [--timeout SECONDS] [--worker-id ID] [--variables N] [--encoding ENCODING]
+                   [--objectives N] [--non-finite-penalty X] [--log-level LEVEL]
 ```
 
 `pip install` also installs it as the console script `jdisrest-worker`, which takes the same options.
@@ -69,15 +69,19 @@ worker is interrupted, then exits.
 | `--endpoint FILE` | Endpoint file written by the master (`.master-endpoint`), waited for if it does not exist yet. The file is accepted as soon as it exists, so a file left by an earlier run makes the worker connect to a master that is gone: delete it before starting the master. |
 | `--timeout SECONDS` | How long to wait for the endpoint file, checked every 5 seconds (300). |
 | `--worker-id ID` | Name of the worker in the master's logs and in `GET /api/v1/workers/status` (a random `worker-py-xxxxxxxx`). It must be unique among the workers of a run: the master tracks one task in flight per id, and workers that share one keep taking each other's tasks back. |
-| `--variables N` | Number of variables every task must have. A task with another number is reported to the master as a failed evaluation without calling the function (not checked). |
+| `--variables N` | Number of values every task must have: the length of the flat vector, with one value per bit of a binary variable. A task with another number is reported to the master as a failed evaluation without calling the function (not checked). |
+| `--encoding ENCODING` | `int`, `double`, `binary` or `mixed` (a composite whose segments differ): the encoding every task must have. A task of another encoding is reported to the master as a failed evaluation without calling the function (not checked). |
 | `--objectives N` | Number of objectives the function must return. A result with another number is reported to the master as a failed evaluation (not checked here; the master then rejects a result with a wrong count with `422`, which also counts as a failed evaluation). |
 | `--non-finite-penalty X` | Opt-in. Replaces every objective of a result that has a NaN or infinite objective with the finite value `X`, and logs a warning (none). |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING` or `ERROR`, in any case (`INFO`). |
 
-The function receives the variables as a list (ints for an integer-encoded problem, floats for a
-real-encoded one) and may return an `EvalResult`, a number (a single objective), a sequence of
-objectives such as a list, a tuple or a numpy array, a dict with `"objectives"` and optional
-`"constraints"` and `"variables"`, or an object with those attributes.
+The function receives the variables as a list, a [`DecisionVector`](#the-decision-vector) that
+also gives their layout: ints for an integer-encoded problem, floats for a real-encoded one, the
+ints 0 and 1 for each bit of a binary variable, and the segments of a composite one after the
+other. It may return an `EvalResult`, a number (a single objective), a sequence of objectives such
+as a list, a tuple or a numpy array, a dict with `"objectives"` and optional `"constraints"` and
+`"variables"`, or an object with those attributes. Repaired `"variables"` are the whole flat
+vector again, with bits as 0 and 1 or as booleans.
 
 **Non-finite objectives.** Without `--non-finite-penalty`, a result with a NaN or infinite
 objective is reported to the master as a failed evaluation (`POST /api/v1/tasks/{id}/error`).
@@ -135,13 +139,18 @@ The package exports:
   `variables`, when given, replaces the decision vector on the master (Lamarckian search). The
   master rejects a vector with a value outside the bounds of its variable (`422`, a failed
   evaluation): the bounds are inclusive and checked without tolerance, so clip exactly to them.
-- `Variables`: the type of the decision vector a task carries (a list of ints, floats or both).
+- `DecisionVector`: the decision vector an evaluator receives, a list that also carries the
+  layout of its task (see [below](#the-decision-vector)).
+- `Variables`: the type of the decision vector a task carries (a list of ints, floats or both,
+  with the ints 0 and 1 for bits; the worker hands a `DecisionVector`).
 - `load_function(code_dir, module, attribute)`: imports `module`, from the folder `code_dir`
   (or from `sys.path` if it is None), and returns its `attribute`, as `--evaluator` and
   `--code-dir` do.
-- `FunctionEvaluator(function, number_of_variables=None, number_of_objectives=None, non_finite_penalty=None)`:
+- `FunctionEvaluator(function, number_of_variables=None, number_of_objectives=None, non_finite_penalty=None, encoding=None)`:
   an `Evaluator` around a plain function, with the checks and the opt-in penalty of
-  `--variables`, `--objectives` and `--non-finite-penalty`.
+  `--variables`, `--objectives`, `--non-finite-penalty` and `--encoding`. The function gets a
+  copy of the `DecisionVector`, with its layout, or a plain list of any other sequence; the
+  encoding is checked on a `DecisionVector` only.
 - `add_worker_arguments(parser)`, `configure_logging(level="INFO")` and `run_worker(args, evaluate)`:
   the pieces of the command-line worker, for a worker command line of your own. The first adds
   `--master`, `--endpoint`, `--timeout` and `--worker-id` to an `argparse` parser; the second
@@ -186,6 +195,55 @@ if __name__ == "__main__":
 `run_worker` does not install the SIGTERM handling of `python -m jdisrest`; a command line that
 runs under a batch scheduler installs its own.
 
+### The decision vector
+
+The evaluator gets the variables of a task as a `DecisionVector`, a `list` subclass, so an
+evaluator written for a list works unchanged and prints the same. The master sends one flat
+vector whatever the encoding: for a composite problem (a jMetal `CompositeSolution`) the segments
+one after the other, in their declaration order, and for a binary variable one value per bit, bit
+0 first. The vector also carries the layout the task describes, in read-only attributes:
+
+| Attribute or method | Meaning |
+|---|---|
+| `encoding` | `"int"`, `"double"`, `"binary"`, or `"mixed"` for a composite whose segments differ |
+| `composite` | Whether the problem is a composite |
+| `segment_sizes` | The number of values of each segment, the bits of a binary one; `(len(vector),)` for a flat vector |
+| `segment_encodings` | The encoding of each segment, aligned with `segment_sizes` |
+| `bits_per_variable` | The length of each binary variable, in vector order; `()` without binary variables |
+| `segments()` | The values of each segment, as plain lists |
+| `binary_variables()` | The bits of each binary variable, as plain lists: `[[1, 0, 1], [0, 0, 1, 1, 0]]` for `101` and `00110` |
+| `copy()` | A copy with the same layout |
+| `DecisionVector.from_payload(payload)` | The vector of a task payload, or of a request of the local mode (its `vars`) |
+
+For a composite of three integers and two binary variables of 4 and 6 bits:
+
+```python
+def evaluate(variables):
+    integers, bits = variables.segments()          # [3, 7, 1], [1, 0, 0, 1, 0, 1, 1, 0, 0, 1]
+    first, second = variables.binary_variables()   # [1, 0, 0, 1], [0, 1, 1, 0, 0, 1]
+    bits[0] = True                                 # a repair: set the first bit
+    return {"objectives": [...], "variables": integers + bits}
+```
+
+Bits are the ints 0 and 1, not booleans, so arithmetic and numpy arrays behave as with integers.
+A repair returns the whole flat vector in the same layout; at the positions of binary variables a
+`bool` or a `numpy.bool_` is sent as 0 or 1, while anywhere else a boolean is refused, as it was
+before. A value that is not a bit, or a vector of another length (an empty one keeps the variables
+of the master), is reported to the master as a failed evaluation, which counts toward the wait
+after failed evaluations (see [Failures](#failures)); a result the master refuses does not.
+The layout describes the vector as the master sent it: changing the list in place does not change
+it, and `list(variables)` or a slice gives a plain list. `type(variables) is list` is false. A
+`DecisionVector` pickles with its layout, but unpickles only where jdisrest 1.3 or later can be
+imported: send `list(variables)` to a process that may lack it, such as a remote Dask or Ray
+worker.
+
+The worker checks that the layout of a task fits its vector, and reports one that does not as a
+malformed task (see [Failures](#failures)). An encoding it does not know, which a newer master
+could send, is not refused: the evaluator gets the values as they are, `segmentSizes` and
+`bitsPerVariable` are checked for their form only, not against the values, since a newer encoding
+could count something else in them (`segments()` and `binary_variables()` raise `ValueError` if
+they do not fit), and the worker logs a warning the first time it meets that encoding.
+
 ### Failures
 
 An evaluation that raises, or whose result has no objective or a value that is not a finite
@@ -198,7 +256,8 @@ most 60 seconds (`Worker.EVAL_ERROR_DELAY` and `Worker.MAX_EVAL_ERROR_DELAY`), s
 whose evaluator always fails no longer spins through the tasks: once the wait has reached its
 cap, it takes at most one task a minute.
 
-A task whose variables are not a list of finite numbers, and a result that does not get
+A task whose variables are not a list of finite numbers, or whose layout does not fit them (for
+instance `segmentSizes` that do not add up to their number), and a result that does not get
 through (a network error, or an answer such as `500` or `502`), are reported the same way,
 best-effort, so that the master requeues the task at once instead of keeping it in flight; the
 master counts such a report as a failed evaluation of the task if it still has the task in
@@ -227,7 +286,13 @@ evaluations (`archiveSize` for PAES; `setTraceCadence` spaces the snapshots out)
 when the run ends, the archive of non-dominated solutions to `aFUN_<evaluations>.csv`
 (objectives) and `aVAR_<evaluations>.csv` (variables), and the population (for PAES, its
 archive) to `FUN_<evaluations>.csv` and `VAR_<evaluations>.csv`. The local NSGA-II writes the
-same files.
+same files. A `FUN` row holds the objectives of one solution, separated by commas. A `VAR` row
+holds its variables, one value per variable, with a binary variable as its bit string, bit 0
+first: separated by commas for flat solutions (`0.25,1.0E-5`, `3,-7` or `101,00110`), and by spaces
+for composites, followed by the objectives and the constraints
+(`3 -7 0.25 101 00110,[1.0  2.0],[0.0]`). A `VAR` file copied to `iVAR.csv` starts another run
+of the same problem from its solutions when the problem reads it with `WarmStart.initialPopulation`
+(the [warm start](../docs/DEVELOPER_MANUAL.md#warm-start) of the developer manual).
 
 ### `watch_front.py`
 
@@ -252,8 +317,9 @@ It writes, to `--output-dir` (by default the parent of the traces folder):
 - `front_stats.csv`: one row per snapshot with its evaluations, when its `aFUN` was written, its
   number of non-dominated solutions and the mean of each objective.
 - `front_extremes.csv`: the objectives and variables of the extremes of each snapshot, and of its
-  best compromise solution (`compromise` as `extreme_of`). Every value is read as a float, so
-  integer variables appear as `3.0`.
+  best compromise solution (`compromise` as `extreme_of`). The variables written with digits only,
+  integers and the bit strings of binary variables, are saved as they are written (`3`, `00110`),
+  and real ones like the objectives.
 - `front_indicators.csv`, with a reference: the hypervolume, IGD and IGD+ of each snapshot, and
   `front_indicators_reference.txt`, the reference they were computed with.
 - `front_reference.csv`: the aggregated front, the non-dominated solutions of every snapshot saved.
@@ -268,7 +334,7 @@ goes on where it stopped without repeating rows.
 |---|---|
 | `traces` | Traces folder of the run (the current folder). |
 | `--labels NAME ...` | Names of the objectives (`f1`, `f2`, ...). |
-| `--variables` | Also print the variables of each extreme. |
+| `--variables` | Also print the variables of each extreme: integers and bit strings as written, real ones like the objectives. |
 | `--once` | Save and show the latest snapshot, then exit; the exit status is 1 if there is no readable snapshot yet. |
 | `--interval SECONDS` | Seconds between checks of the folder, at least 2 (15). |
 | `--output-dir DIR` | Folder for the output files (the parent of the traces folder). |

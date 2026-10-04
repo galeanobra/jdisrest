@@ -1,5 +1,9 @@
 package es.unex.jdisrest.local;
 
+import es.unex.jdisrest.util.SolutionVariables;
+import es.unex.jdisrest.util.SolutionVariables.Encoding;
+import es.unex.jdisrest.util.SolutionVariables.VectorLayout;
+import es.unex.jdisrest.util.SolutionVariables.VectorLayout.Segment;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -25,9 +29,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /**
  * {@link PythonProcessEvaluator} against a fake child written into a temporary
  * directory: protocol round trip, error replies, lines that are not protocol
- * objects, time-outs, crashes and the clean-up of a failed handshake. Skipped
- * when no Python 3 interpreter is found ({@code python3}/{@code python} on the
- * PATH, or {@code -Djdisrest.test.python=<interpreter>}).
+ * objects, time-outs, crashes and the clean-up of a failed handshake; and against a
+ * child that records its requests, the layout keys of a request and the bits of a
+ * response. Skipped when no Python 3 interpreter is found ({@code python3}/{@code python}
+ * on the PATH, or {@code -Djdisrest.test.python=<interpreter>}).
  */
 class PythonProcessEvaluatorTest {
 
@@ -114,6 +119,37 @@ class PythonProcessEvaluatorTest {
                 subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"], stdout=protocol)
             """;
 
+    /**
+     * A child that appends every request line to the file argv[1] and answers with one
+     * objective, the number of values, and one constraint, -1. With argv[2] {@code bits}, the
+     * answer also returns every value as the JSON boolean {@code value == 1}; with
+     * {@code flip-last}, the values with the last one, a bit, flipped and sent as a boolean.
+     */
+    static final String LAYOUT_CHILD = """
+            import json, sys
+
+            requests, mode = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "echo"
+            print(json.dumps({"ready": True}), flush=True)
+            for line in sys.stdin:
+                with open(requests, "a") as f:
+                    f.write(line)
+                request = json.loads(line)
+                x = request["vars"]
+                answer = {"id": request["id"], "objectives": [float(len(x))], "constraints": [-1.0]}
+                if mode == "bits":
+                    answer["variables"] = [v == 1 for v in x]
+                elif mode == "flip-last":
+                    answer["variables"] = x[:-1] + [x[-1] == 0]
+                print(json.dumps(answer), flush=True)
+            """;
+
+    /**
+     * A Python 3 interpreter: the one {@code jdisrest.test.python} names, else the first of
+     * {@code python3} and {@code python} on the {@code PATH} ({@code python} first on Windows);
+     * {@code null} if none runs. {@code EncodingRunScenario.findPython} tries the same candidates
+     * for Python 3.11 or later with {@code requests}, which the Python worker needs: keep the two
+     * in step.
+     */
     static String findPython() {
         String configured = System.getProperty("jdisrest.test.python");
         List<String> candidates = configured != null ? List.of(configured)
@@ -154,6 +190,23 @@ class PythonProcessEvaluatorTest {
         return start(dir, "ready", null);
     }
 
+    /** Starts {@link #LAYOUT_CHILD} in {@code mode}, recording its requests in {@code dir/requests.jsonl}. */
+    static PythonProcessEvaluator startLayoutChild(Path dir, String mode) throws IOException {
+        assumeTrue(PYTHON != null, "no Python 3 interpreter available");
+        Path script = Files.writeString(dir.resolve("layout_child.py"), LAYOUT_CHILD);
+        return new PythonProcessEvaluator(PYTHON, script.toString(),
+                List.of(dir.resolve("requests.jsonl").toString(), mode), null, null, null);
+    }
+
+    /** The request lines {@link #LAYOUT_CHILD} received, as Java wrote them. */
+    static List<String> requests(Path dir) throws IOException {
+        return Files.readAllLines(dir.resolve("requests.jsonl"));
+    }
+
+    static VectorLayout flatLayout(Encoding encoding, int width, Integer... bitsPerVariable) {
+        return new VectorLayout(false, List.of(new Segment(encoding, width, List.of(bitsPerVariable))));
+    }
+
     /** Fails unless the child whose pid is in {@code dir/child.pid} is gone within 10 s. */
     static void assertChildIsGone(Path dir) throws Exception {
         long pid = Long.parseLong(Files.readString(dir.resolve("child.pid")).trim());
@@ -188,6 +241,72 @@ class PythonProcessEvaluatorTest {
             PythonProcessEvaluator.Result repaired = python.evaluate(new int[] {REPAIR, 1});
             assertArrayEquals(new double[] {9.0}, repaired.objectives);
             assertEquals(List.of(9, 2), repaired.variables);
+        }
+    }
+
+    @Test
+    void realDecisionIsSentAsJsonFloats(@TempDir Path dir) throws IOException {
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "echo")) {
+            assertArrayEquals(new double[] {2.0}, python.evaluate(new double[] {0.25, 3}).objectives);
+        }
+        assertEquals(List.of("{\"id\":0,\"vars\":[0.25,3.0]}"), requests(dir));
+    }
+
+    // ── Layout ────────────────────────────────────────────────────────────────
+
+    @Test
+    void requestCarriesTheLayoutKeysOfTheRestPayloadWithItsOmissionRules(@TempDir Path dir) throws IOException {
+        VectorLayout integerAndBits = new VectorLayout(true, List.of(new Segment(Encoding.INT, 1, List.of()),
+                new Segment(Encoding.DOUBLE, 1, List.of()), new Segment(Encoding.BINARY, 8, List.of(3, 5))));
+        VectorLayout twoIntegerSegments = new VectorLayout(true, List.of(new Segment(Encoding.INT, 1, List.of()),
+                new Segment(Encoding.INT, 1, List.of())));
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "echo")) {
+            python.evaluate(List.of(1, 0, 1, 0, 0, 1, 1, 0), flatLayout(Encoding.BINARY, 8, 3, 5));
+            python.evaluate(List.of(3, 0.25, 1, 0, 1, 0, 0, 1, 1, 0), integerAndBits);
+            python.evaluate(List.of(3, -7), flatLayout(Encoding.INT, 2));
+            python.evaluate(List.of(3, -7), twoIntegerSegments);
+            python.evaluate(List.of(0.5), flatLayout(Encoding.DOUBLE, 1));
+            python.evaluate(List.of(1, 0, 1), null);
+        }
+
+        assertEquals(List.of(
+                "{\"id\":0,\"vars\":[1,0,1,0,0,1,1,0],\"encoding\":\"binary\",\"bitsPerVariable\":[3,5]}",
+                "{\"id\":1,\"vars\":[3,0.25,1,0,1,0,0,1,1,0],\"segmentSizes\":[1,1,8],\"encoding\":\"mixed\","
+                        + "\"segmentEncodings\":[\"int\",\"double\",\"binary\"],\"bitsPerVariable\":[3,5]}",
+                "{\"id\":2,\"vars\":[3,-7]}",
+                "{\"id\":3,\"vars\":[3,-7],\"segmentSizes\":[1,1]}",
+                "{\"id\":4,\"vars\":[0.5],\"encoding\":\"double\"}",
+                "{\"id\":5,\"vars\":[1,0,1]}"), requests(dir),
+                "a flat integer request stays {id, vars}, and so does one without a layout");
+    }
+
+    @Test
+    void decisionThatDoesNotFillItsLayoutIsNotSent(@TempDir Path dir) throws IOException {
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "echo")) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> python.evaluate(List.of(1, 0, 1), flatLayout(Encoding.BINARY, 8, 3, 5)));
+            assertEquals("Cannot send the decision to the Python evaluator: it has 3 values but its layout has 8",
+                    e.getMessage());
+            python.evaluate(List.of(1), null);
+        }
+        assertEquals(List.of("{\"id\":0,\"vars\":[1]}"), requests(dir), "the evaluator stays in step");
+    }
+
+    @Test
+    void jsonBooleansAreBitsOnlyAtTheBinaryPositionsOfALayout(@TempDir Path dir) throws IOException {
+        try (PythonProcessEvaluator python = startLayoutChild(dir, "bits")) {
+            assertEquals(List.of(1, 0, 1), python.evaluate(List.of(1, 0, 1), flatLayout(Encoding.BINARY, 3, 3)).variables,
+                    "json.dumps writes the bits a child repairs as booleans as true and false");
+
+            VectorLayout integerAndBits = new VectorLayout(true, List.of(new Segment(Encoding.INT, 1, List.of()),
+                    new Segment(Encoding.BINARY, 2, List.of(2))));
+            IOException e = assertThrows(IOException.class, () -> python.evaluate(List.of(1, 0, 1), integerAndBits));
+            assertEquals("Python evaluator returned variables[0] = true (not a number)", e.getMessage(),
+                    "an integer variable is no bit");
+
+            e = assertThrows(IOException.class, () -> python.evaluate(List.of(1, 0, 1), null));
+            assertEquals("Python evaluator returned variables[0] = true (not a number)", e.getMessage(),
+                    "without a layout no position is known to hold a bit");
         }
     }
 

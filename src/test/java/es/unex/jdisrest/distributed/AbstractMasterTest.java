@@ -126,6 +126,15 @@ class AbstractMasterTest {
     }
 
     @Test
+    void binaryDecisionVectorIsLoggedAsTheBitsTheWorkerReceived() {
+        CompositeSolution composite = new CompositeSolution(List.of(intSolution(7),
+            SteadyStateEvolutionaryAlgorithmTest.binary("101", "01")));
+
+        assertEquals("[1, 0, 1, 0, 1]", AbstractMaster.variablesOf(SteadyStateEvolutionaryAlgorithmTest.binary("101", "01")));
+        assertEquals("[7, 1, 0, 1, 0, 1]", AbstractMaster.variablesOf(composite));
+    }
+
+    @Test
     void compositeDecisionVectorIsLoggedFlat() {
         CompositeSolution composite = new CompositeSolution(List.of(intSolution(1, 2), doubleSolution(0.5)));
 

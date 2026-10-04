@@ -8,9 +8,12 @@ import java.util.Map;
  * parameters besides the application probability, the rules those parameters must follow, and how
  * to build it.
  *
- * <p>The configuration files offer the real-coded catalogues {@link CrossoverType} and
- * {@link MutationType}. The interface is generic in the operator class so that a catalogue for
- * another encoding could be added without changing the parser.
+ * <p>The configuration files offer a crossover and a mutation catalogue for each encoding, and
+ * the parser looks the operators of a segment up in the catalogues of its encoding (see
+ * {@link SolutionLayout}): {@link CrossoverType} and {@link MutationType} for real variables,
+ * {@link IntegerCrossoverType} and {@link IntegerMutationType} for integer ones,
+ * {@link BinaryCrossoverType} and {@link BinaryMutationType} for binary ones. The interface is
+ * generic in the operator class, so each catalogue builds the operators of its solutions.
  *
  * <h2>Validation</h2>
  * <p>A value read from a file passes three gates before the operator is accepted (see
@@ -18,7 +21,8 @@ import java.util.Map;
  * <ol>
  *   <li>the parser accepts only finite, non-negative decimal numbers;</li>
  *   <li>{@link #check} adds the rules of the operator, such as a strictly positive scale, and those
- *       that depend on the problem, such as a block size that divides the number of variables;</li>
+ *       that depend on the problem, such as a block size that divides the number of variables of
+ *       the segment;</li>
  *   <li>the parser then builds the operator once with {@link #create} and reports any exception of
  *       its constructor as an {@link InvalidConfigurationException} naming the key, so that a value
  *       the constructor rejects never reaches a running master.</li>
@@ -61,7 +65,10 @@ public interface OperatorType<O> {
      * on the operator or on the problem.
      *
      * @param parameters        a value for every parameter in {@link #parameters()}
-     * @param numberOfVariables number of variables of the problem
+     * @param numberOfVariables the size of the segment the operator changes
+     *                          ({@link SolutionLayout.Segment#size()}): the number of variables of
+     *                          a real-coded problem, those of the segment in a composite, the bits
+     *                          of a binary segment
      * @return what is wrong, starting with the parameter name ({@code scale must be greater than 0,
      *         got '0'}), or {@code null} if the values are valid
      */

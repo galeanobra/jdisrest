@@ -8,6 +8,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.uma.jmetal.operator.mutation.MutationOperator;
 import org.uma.jmetal.operator.mutation.impl.PolynomialMutation;
 import org.uma.jmetal.problem.multiobjective.zdt.ZDT1;
+import org.uma.jmetal.problem.multiobjective.zdt.ZDT5;
+import org.uma.jmetal.solution.binarysolution.BinarySolution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 import org.uma.jmetal.solution.doublesolution.impl.DefaultDoubleSolution;
 import org.uma.jmetal.util.archive.BoundedArchive;
@@ -33,9 +35,10 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Selection and replacement rules of {@link PAESState}: argument checks, candidate generation,
- * every branch of the acceptance rule, runtime reconfiguration, and complete searches on ZDT1
- * (sequential and with candidates in flight, as the distributed master runs it).
+ * Selection and replacement rules of {@link PAESState}: argument checks, candidate generation
+ * (on binary variables too), every branch of the acceptance rule, runtime reconfiguration, and
+ * complete searches on ZDT1 (sequential and with candidates in flight, as the distributed master
+ * runs it).
  *
  * <p>The state draws from the shared {@link JMetalRandom}; every test runs with a seeded generator
  * of its own and puts the previous one back afterwards.
@@ -283,6 +286,39 @@ class PAESStateTest {
                 () -> assertEquals(PAESState.MAX_DUPLICATE_RETRIES, mutation.calls(), "the retries are bounded"),
                 () -> assertEquals(first.variables(), candidate.variables(), "the clone is returned rather than nothing"),
                 () -> assertNotSame(first, candidate, "even a clone is a copy"));
+    }
+
+    @Test
+    void mutationIsRetriedUntilABinaryCandidateDiffersFromItsParent() {
+        // A mutation that flips the first bit in place from its third call on, as BitFlipMutation
+        // flips the live BinarySet of the copy it is given.
+        int[] calls = {0};
+        MutationOperator<BinarySolution> mutation = new MutationOperator<>() {
+            @Override
+            public BinarySolution execute(BinarySolution solution) {
+                if (++calls[0] >= 3) solution.variables().get(0).flip(0);
+                return solution;
+            }
+
+            @Override
+            public double mutationProbability() {
+                return 1.0;
+            }
+        };
+        ZDT5 problem = new ZDT5();
+        var comparator = new DominanceWithConstraintsComparator<BinarySolution>();
+        PAESState<BinarySolution> state = new PAESState<>(problem, new CrowdingDistanceArchive<>(10, comparator),
+                mutation, 0.0, comparator);
+        BinarySolution first = problem.evaluate(problem.createSolution());
+        state.integrate(first);
+
+        BinarySolution candidate = state.nextCandidate();
+
+        assertAll(
+                () -> assertEquals(3, calls[0], "two clones of the parent's 80 bits are mutated again"),
+                () -> assertNotEquals(first.variables().get(0).get(0), candidate.variables().get(0).get(0)),
+                () -> assertEquals(first.variables().subList(1, 11), candidate.variables().subList(1, 11)),
+                () -> assertEquals(30, candidate.variables().get(0).getBinarySetLength()));
     }
 
     // ── Acceptance rule ───────────────────────────────────────────────────────

@@ -11,7 +11,9 @@ import es.unex.jdisrest.distributed.rest.ConfigurationHandler;
 import es.unex.jdisrest.distributed.rest.MasterFacade;
 import es.unex.jdisrest.util.Log;
 import org.uma.jmetal.component.catalogue.common.termination.impl.TerminationByEvaluations;
+import org.uma.jmetal.problem.Problem;
 import org.uma.jmetal.problem.doubleproblem.DoubleProblem;
+import org.uma.jmetal.solution.Solution;
 import org.uma.jmetal.solution.doublesolution.DoubleSolution;
 
 import java.io.IOException;
@@ -21,21 +23,23 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Changes the configuration of a running NSGA-II, PAES or MOEA/D on a real-coded problem
- * ({@code POST /api/v1/config}) and records every change in the traces with a
- * {@link ConfigHistory}. {@link ConfiguredMaster} registers one with
- * {@link MasterFacade#setConfigurationHandler}; a program that builds its algorithm from an
- * {@link AlgorithmConfig} by other means can register one too.
+ * Changes the configuration of a running NSGA-II, PAES or MOEA/D ({@code POST /api/v1/config})
+ * and records every change in the traces with a {@link ConfigHistory}. {@link ConfiguredMaster}
+ * registers one with {@link MasterFacade#setConfigurationHandler}; a program that builds its
+ * algorithm from an {@link AlgorithmConfig} by other means can register one too.
  *
  * <h2>What can change</h2>
- * <p>The new text is a complete properties file, read for the problem of the run (the
- * {@code k/n} probabilities, the operator checks and the MOEA/D lattice size, see
- * {@link AlgorithmConfig#parseText(String, DoubleProblem)}). It must describe the same algorithm,
- * with the same population or archive size, MOEA/D weights and neighborhood size, and traces
- * folder (see {@link AlgorithmConfig#fixedDuringRun}), and a {@code maxEvaluations} greater than
- * the evaluations already done. Everything else comes from the new text, so a key left out takes
- * its default value, as when the run starts. The new operators and PAES or MOEA/D settings apply
- * from then on: to the tasks created and, for the MOEA/D replacement, to the results that arrive.
+ * <p>The new text is a complete properties file, read for the layout of the run (the operator
+ * keys of each segment, the {@code k/n} probabilities and the operator checks, see
+ * {@link SolutionLayout}) and checked against the objectives of the problem (the MOEA/D lattice
+ * size). For a composite problem it therefore needs the prefixed keys of each segment, and a key
+ * without a prefix is unknown. It must describe the same algorithm, with the same population or
+ * archive size, MOEA/D weights and neighborhood size, and traces folder (see
+ * {@link AlgorithmConfig#fixedDuringRun}), and a {@code maxEvaluations} greater than the
+ * evaluations already done. Everything else comes from the new text, so a key left out takes its
+ * default value, as when the run starts. The new operators of each segment and PAES or MOEA/D
+ * settings apply from then on: to the tasks created and, for the MOEA/D replacement, to the
+ * results that arrive.
  *
  * <h2>An evaluation budget</h2>
  * <p>Every change installs a {@link TerminationByEvaluations} with the new {@code maxEvaluations}
@@ -65,34 +69,101 @@ import java.util.Objects;
  */
 public final class AlgorithmReconfiguration implements ConfigurationHandler {
 
-    private final SteadyStateEvolutionaryAlgorithm<DoubleSolution> algorithm;
-    private final DoubleProblem problem;
+    private final SteadyStateEvolutionaryAlgorithm<?> algorithm;
+    /** The layout new configurations are read for. */
+    private final SolutionLayout layout;
+    /** The objectives of the problem, which the MOEA/D lattice size of new configurations must fit. */
+    private final int numberOfObjectives;
     private final ConfigHistory history;
     private AlgorithmConfig current;
 
     /**
-     * Creates the handler for a running algorithm and the configuration it started with.
+     * Creates the handler for a running algorithm on a real-coded problem and the configuration
+     * it started with. New configurations are read for the number of variables of the problem,
+     * and no solution of it is created.
      *
      * @param algorithm the running algorithm, built from {@code initial}, for instance by
      *                  {@link ConfiguredMaster#createAlgorithm}: a {@link PAES} or {@link MOEAD}
      *                  for their configurations, and for NSGA-II an {@link NSGAII} or another
      *                  algorithm whose only variation is a crossover and a mutation
-     * @param initial   the configuration the run started with
+     * @param initial   the configuration the run started with, of a problem that is not
+     *                  composite with real variables; as in 1.2, the number of variables it was
+     *                  read for is not compared with the problem's
      * @param problem   the problem of the run, which new configurations are read for
      * @param history   the history of the run, where changes are recorded
      * @throws NullPointerException     if an argument is {@code null}
-     * @throws IllegalArgumentException if the algorithm is not the one the configuration describes
+     * @throws IllegalArgumentException if the algorithm is not the one the configuration describes,
+     *                                  the configuration is not that of a real-coded problem, or
+     *                                  the problem's solutions cannot be configured, for instance
+     *                                  because they have no variables (see {@link SolutionLayout#of})
      */
     public AlgorithmReconfiguration(SteadyStateEvolutionaryAlgorithm<DoubleSolution> algorithm,
             AlgorithmConfig initial, DoubleProblem problem, ConfigHistory history) {
+        this(algorithm, initial, (Problem<DoubleSolution>) problem, history);
+    }
+
+    /**
+     * Creates the handler for a running algorithm on a problem of any encoding and the
+     * configuration it started with. New configurations are read for the layout of
+     * {@code initial}, which is checked once against the problem ({@link SolutionLayout#of}): a
+     * {@link DoubleProblem} is handled as by the constructor for it, without creating a solution,
+     * while any other problem creates one solution, which draws the random numbers of its initial
+     * values.
+     *
+     * @param algorithm the running algorithm, built from {@code initial}: a {@link PAES} or
+     *                  {@link MOEAD} for their configurations, and for NSGA-II an {@link NSGAII}
+     *                  or another algorithm whose only variation is a crossover and a mutation
+     * @param initial   the configuration the run started with, read for the layout of the
+     *                  problem's solutions
+     * @param problem   the problem of the run
+     * @param history   the history of the run, where changes are recorded
+     * @param <S>       the solutions of the problem
+     * @throws NullPointerException     if an argument is {@code null}
+     * @throws IllegalArgumentException if the algorithm is not the one the configuration describes,
+     *                                  the configuration was read for another layout (another
+     *                                  encoding or size of a segment, or a composite where the
+     *                                  solutions are not), or the problem's solutions cannot be
+     *                                  configured
+     */
+    public <S extends Solution<?>> AlgorithmReconfiguration(SteadyStateEvolutionaryAlgorithm<S> algorithm,
+            AlgorithmConfig initial, Problem<S> problem, ConfigHistory history) {
+        this(algorithm, initial, fittedLayout(algorithm, initial, problem), problem.numberOfObjectives(), history);
+    }
+
+    /**
+     * Creates the handler of a run whose initial configuration was read for {@code layout}, the
+     * layout of the problem's solutions, which is not checked again: {@link ConfiguredMaster} has
+     * just read it from the problem, creating one solution unless the problem is a
+     * {@link DoubleProblem}, and need not create another.
+     *
+     * @param layout             the layout new configurations are read for
+     * @param numberOfObjectives the objectives of the problem, which the MOEA/D lattice size of new
+     *                           configurations must fit
+     * @throws IllegalArgumentException if the algorithm is not the one the configuration describes
+     */
+    AlgorithmReconfiguration(SteadyStateEvolutionaryAlgorithm<?> algorithm, AlgorithmConfig initial,
+            SolutionLayout layout, int numberOfObjectives, ConfigHistory history) {
         this.algorithm = Objects.requireNonNull(algorithm, "algorithm must not be null");
         this.current = Objects.requireNonNull(initial, "initial must not be null");
-        this.problem = Objects.requireNonNull(problem, "problem must not be null");
+        this.layout = Objects.requireNonNull(layout, "layout must not be null");
+        this.numberOfObjectives = numberOfObjectives;
         this.history = Objects.requireNonNull(history, "history must not be null");
-        String reason = mismatch(initial);
-        if (reason != null) {
-            throw new IllegalArgumentException(reason);
-        }
+        requireDrives(initial, algorithm);
+    }
+
+    /**
+     * The layout new configurations are read for, once the algorithm is the one {@code initial}
+     * describes: that of {@code initial}, checked against the problem
+     * ({@link SolutionLayout#fittedTo}), which for a {@link DoubleProblem} is the layout of its
+     * number of variables, read without creating a solution, as in 1.2.
+     */
+    private static SolutionLayout fittedLayout(SteadyStateEvolutionaryAlgorithm<?> algorithm, AlgorithmConfig initial,
+            Problem<?> problem) {
+        Objects.requireNonNull(algorithm, "algorithm must not be null");
+        Objects.requireNonNull(initial, "initial must not be null");
+        Objects.requireNonNull(problem, "problem must not be null");
+        requireDrives(initial, algorithm);
+        return initial.layout().fittedTo(problem);
     }
 
     @Override
@@ -117,7 +188,8 @@ public final class AlgorithmReconfiguration implements ConfigurationHandler {
         int done = algorithm.getEvaluations();
         requireOpen(done);
 
-        AlgorithmConfig next = AlgorithmConfig.parseText(properties, problem);
+        AlgorithmConfig next = AlgorithmConfig.parseText(properties, layout);
+        AlgorithmConfigParser.checkObjectives(next, numberOfObjectives);
         List<String> problems = new ArrayList<>(AlgorithmConfig.fixedDuringRun(current, next));
         if (next.maxEvaluations() <= done) {
             problems.add(budgetProblem(done, next));
@@ -189,21 +261,32 @@ public final class AlgorithmReconfiguration implements ConfigurationHandler {
      * it was.
      */
     private void reconfigure(AlgorithmConfig next) {
+        reconfigure(algorithm, next);
+    }
+
+    /**
+     * {@link #reconfigure(AlgorithmConfig)} with the solutions of the running algorithm named, so
+     * that the operators of each segment are built for them: {@code next} was read for the layout
+     * of those solutions.
+     */
+    private static <S extends Solution<?>> void reconfigure(SteadyStateEvolutionaryAlgorithm<S> algorithm,
+            AlgorithmConfig next) {
+        Variation variation = next.variation();
         switch (next) {
-            case NSGAIIConfig nsgaii -> applying(() ->
-                    algorithm.setVariation(nsgaii.crossover().create(), nsgaii.mutation().create()));
+            case NSGAIIConfig _ -> applying(() ->
+                    algorithm.setVariation(variation.createCrossover(), variation.createMutation()));
             case PAESConfig paes -> {
-                if (!(algorithm instanceof PAES<DoubleSolution> running)) {
+                if (!(algorithm instanceof PAES<S> running)) {
                     throw new IllegalStateException("the running algorithm is not PAES");
                 }
-                applying(() -> running.reconfigure(paes.mutation().create(), paes.archiveSelectionProbability(),
+                applying(() -> running.reconfigure(variation.createMutation(), paes.archiveSelectionProbability(),
                         paes.resultSource()));
             }
             case MOEADConfig moead -> {
-                if (!(algorithm instanceof MOEAD<DoubleSolution> running)) {
+                if (!(algorithm instanceof MOEAD<S> running)) {
                     throw new IllegalStateException("the running algorithm is not MOEA/D");
                 }
-                applying(() -> running.reconfigure(moead.crossover().create(), moead.mutation().create(),
+                applying(() -> running.reconfigure(variation.createCrossover(), variation.createMutation(),
                         moead.neighborhoodSelectionProbability(), moead.maximumNumberOfReplacedSolutions(),
                         moead.aggregation(), moead.normalizeObjectives()));
             }
@@ -225,18 +308,20 @@ public final class AlgorithmReconfiguration implements ConfigurationHandler {
     }
 
     /**
-     * Why the algorithm is not one the configuration can drive, or {@code null} if it is: PAES and
-     * MOEA/D need their own class, whose {@code reconfigure} takes their settings; NSGA-II needs
-     * an algorithm whose variation is the crossover and mutation pair of
+     * Throws unless the algorithm is one the configuration can drive: PAES and MOEA/D need their
+     * own class, whose {@code reconfigure} takes their settings; NSGA-II needs an algorithm whose
+     * variation is the crossover and mutation pair of
      * {@link SteadyStateEvolutionaryAlgorithm#setVariation}, which PAES and MOEA/D are not.
      */
-    private String mismatch(AlgorithmConfig config) {
+    private static void requireDrives(AlgorithmConfig config, SteadyStateEvolutionaryAlgorithm<?> algorithm) {
         boolean fits = switch (config) {
             case NSGAIIConfig _ -> !(algorithm instanceof PAES || algorithm instanceof MOEAD);
             case PAESConfig _ -> algorithm instanceof PAES;
             case MOEADConfig _ -> algorithm instanceof MOEAD;
         };
-        return fits ? null : "a " + config.getClass().getSimpleName() + " cannot drive a running "
-                + algorithm.getClass().getName();
+        if (!fits) {
+            throw new IllegalArgumentException("a " + config.getClass().getSimpleName() + " cannot drive a running "
+                    + algorithm.getClass().getName());
+        }
     }
 }

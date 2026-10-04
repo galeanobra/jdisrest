@@ -16,7 +16,9 @@ import java.util.function.BiFunction;
 /**
  * Mutation operators for real-coded problems ({@link DoubleSolution}) that a configuration file
  * can name in its {@code mutation} key, with their parameters as {@code mutation.<parameter>} and
- * the per-variable mutation probability as {@code mutation.probability}.
+ * the per-variable mutation probability as {@code mutation.probability}; for a real segment of a
+ * composite problem, under the same keys with the name of the segment as prefix (see
+ * {@link SolutionLayout}).
  *
  * <p>Every operator mutates each variable independently with the mutation probability and keeps
  * it within its bounds. Parameters are finite non-negative numbers; the constants below state the

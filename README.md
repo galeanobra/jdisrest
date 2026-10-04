@@ -24,9 +24,10 @@ as external simulators, trained models, or legacy code, across a cluster
 implementation to the evaluation language.
 
 Problems may use integer variables (`IntegerSolution`), real variables
-(`DoubleSolution`) or a `CompositeSolution` that mixes both; the decision
-vector travels to the workers as a flat list of JSON numbers whatever the
-encoding.
+(`DoubleSolution`), binary variables (`BinarySolution`) or a
+`CompositeSolution` that mixes them; the decision vector travels to the
+workers as a flat list of JSON numbers whatever the encoding, with each bit
+of a binary variable as `0` or `1`.
 
 The algorithmic core (NSGA-II, MOEA/D, SMS-EMOA, PAES, solution
 encodings, and several operators) is built on top of
@@ -102,14 +103,21 @@ deployment patterns, monitoring and control, and internals.
 ### Java (Maven)
 
 ```
-git clone --branch v1.2.1 https://github.com/galeanobra/jdisrest.git
+git clone --branch v1.3.0 https://github.com/galeanobra/jdisrest.git
 cd jdisrest
 mvn install        # deposits into ~/.m2/repository
 ```
 
 `mvn test` runs the unit tests. `mvn verify`, and so `mvn install`, also
 runs the integration tests (the `*IT` classes), each class in a JVM of its
-own: they start a real master on a free port and talk to it over HTTP.
+own: they start a real master on a free port and talk to it over HTTP,
+some through `RestWorker`s and the Python command-line worker that
+evaluate a whole run of a real, an integer or a binary problem, or of a
+composite of those, with each bundled algorithm, built from the
+configuration files of `examples/` where there is one. The Python worker
+joins them, and `python/tools/watch_front.py` reads the traces of the
+run, when a Python 3.11 or later with `requests` is found; both are
+skipped otherwise.
 
 Consumers reference it via:
 
@@ -117,7 +125,7 @@ Consumers reference it via:
 <dependency>
     <groupId>es.unex</groupId>
     <artifactId>jdisrest</artifactId>
-    <version>1.2.1</version>
+    <version>1.3.0</version>
 </dependency>
 ```
 
@@ -134,8 +142,10 @@ reinstalling.
 
 The Python `jdisrest` package exposes `Worker`, `Evaluator`, and
 `EvalResult` used by worker processes to connect to a running Java master,
-and a command-line worker (`python -m jdisrest`, also installed as
-`jdisrest-worker`) that evaluates with a function of your own module. See
+`DecisionVector`, the list of variables an evaluator receives, which also
+carries the layout of the task, and a command-line worker
+(`python -m jdisrest`, also installed as `jdisrest-worker`) that evaluates
+with a function of your own module. See
 [`python/README.md`](python/README.md) for both and for the trace tools in
 `python/tools`.
 
@@ -172,7 +182,9 @@ A matching Python worker:
 from jdisrest import Worker, EvalResult
 
 def evaluate(variables) -> EvalResult:
-    # ints for an integer-encoded problem, floats for a real-encoded one
+    # ints for an integer-encoded problem, floats for a real-encoded one,
+    # 0 and 1 (ints) for each bit of a binary variable; variables.segments()
+    # and variables.binary_variables() cut a composite or binary vector
     return EvalResult(objectives=[float(sum(x ** 2 for x in variables))])
 
 Worker("http://10.0.0.1:8080").run(evaluate)
@@ -185,13 +197,17 @@ id.
 
 ### With a configuration file
 
-For a real-coded problem (a jMetal `DoubleProblem` with a public
-no-argument constructor) you need not write the master at all:
+For a problem class with a public no-argument constructor, whose
+solutions have real, integer or binary variables or are composites of
+those, you need not write the master at all:
 `es.unex.jdisrest.config.ConfiguredMaster` reads the algorithm (NSGA-II,
 PAES or MOEA/D), the evaluation budget and the operators from a
 properties file. The files in [`examples/`](examples) list every key with
-its default. For instance, jMetal's ZDT1 (30 variables, 2 objectives)
-with `examples/nsgaii.properties`, from a clone of this repository:
+its default, for real-coded problems and for the operators of each other
+encoding (`integer.properties`, `binary.properties` and
+`composite.properties`). For instance, jMetal's ZDT1 (30 variables, 2
+objectives) with `examples/nsgaii.properties`, from a clone of this
+repository:
 
 ```bash
 mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
@@ -240,20 +256,20 @@ them.
 
 ```
 jdisrest/
-├── pom.xml                       # Maven library (es.unex:jdisrest:1.2.1)
+├── pom.xml                       # Maven library (es.unex:jdisrest:1.3.0)
 ├── src/main/java/es/unex/jdisrest/
 │   ├── config/                   # Configuration files, launcher, runtime reconfiguration
 │   ├── distributed/              # Master, algorithms, REST controllers
 │   ├── local/                    # Sequential (non-REST) mode for debugging
 │   ├── operator/                 # Custom jMetal operators
-│   └── util/                     # Logging, timings, variable encodings, trace output
+│   └── util/                     # Logging, timings, variable encodings, trace files
 ├── src/test/java/                # JUnit unit tests, and *IT integration tests (mvn verify)
-├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D
+├── examples/                     # Configuration files for NSGA-II, PAES and MOEA/D, every encoding
 ├── python/
 │   ├── pyproject.toml            # PEP 621 metadata
 │   ├── jdisrest/                 # Worker-side Python package and command-line worker
 │   ├── tools/                    # Trace tools (watch_front.py, plot_front_evolution.py)
-│   └── tests/                    # pytest suite for the client and the tools
+│   └── tests/                    # pytest suite for the client and the tools; golden traces in data/
 └── docs/
     └── DEVELOPER_MANUAL.md       # Developer manual
 ```
@@ -276,10 +292,15 @@ jdisrest/
 - `es.unex.jdisrest.distributed.WarmStartCapable`: optional interface implemented
   by problems that can seed the initial population from disk (`iVAR.csv`,
   which `WarmStart` also copies into the traces folder).
+  `WarmStart.initialPopulation` implements it in one line for a file of rows
+  like those of the `VAR` traces, which `es.unex.jdisrest.util.TraceReader`
+  reads back into solutions, so a run can start from the variables another
+  run of the same problem wrote.
 - `es.unex.jdisrest.util.SolutionVariables`: flattens `IntegerSolution`,
-  `DoubleSolution` and `CompositeSolution` variables into the wire vector and
-  writes results back, converting each value to the type of the destination
-  variable.
+  `DoubleSolution`, `BinarySolution` (one `0` or `1` per bit) and
+  `CompositeSolution` variables into the wire vector, describes its layout
+  (`layoutOf`), and writes results back, converting each value to the type
+  of the destination variable.
 - `es.unex.jdisrest.distributed.rest.MasterSpringApp`: embedded Spring Boot entry
   point (auto-loaded by the master).
 - `es.unex.jdisrest.local.algorithms.NSGAII`: sequential local variant (no REST)
@@ -290,11 +311,12 @@ jdisrest/
 - `es.unex.jdisrest.config.AlgorithmConfig`: reads NSGA-II, PAES and MOEA/D
   settings (budget, population or archive size, operators with their
   probabilities and parameters, traces folder) from a properties file, and
-  checks them before anything starts. Real-coded problems (`DoubleProblem`)
-  only.
+  checks them before anything starts. Problems of every encoding: real,
+  integer and binary variables, and composites of them, with the operators
+  of each segment under its name (`SolutionLayout`, `Variation`).
 - `es.unex.jdisrest.config.ConfiguredMaster`: launcher that runs a master
-  for a `DoubleProblem` class with such a file, or only validates the file
-  (`--check`). A program that builds its problem itself calls
+  for a problem class of any encoding with such a file, or only validates
+  the file (`--check`). A program that builds its problem itself calls
   `ConfiguredMaster.run` from its own `main`.
 
 Every master also answers `POST /api/v1/stop`, which ends the run as if
@@ -313,7 +335,8 @@ implementations in Java/Python/MATLAB, master wiring and shutdown with
 the available algorithms and operators, the local mode and its Python
 child protocol, configuration files and the `ConfiguredMaster` launcher,
 SLURM deployment patterns, monitoring and control (status, stop and
-configuration endpoints), internals, and what changed in 1.2 and 1.2.1.
+configuration endpoints), internals, and what changed in 1.2, 1.2.1
+and 1.3.
 [`python/README.md`](python/README.md) covers the Python client, its
 command-line worker and the trace tools.
 
